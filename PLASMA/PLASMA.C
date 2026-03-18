@@ -6,7 +6,10 @@
  *   - Classic 4-component plasma (horizontal, vertical, diagonal, radial waves)
  *   - VBE 2.0+ linear frame buffer in 1024x768 8bpp
  *   - VBE 4F09h palette programming (works on Radeon in VESA modes)
- *   - Double buffering: render to system RAM, blit to LFB
+ *   - VBE 2.0 hardware double buffering via INT 10h AX=4F07h page flip
+ *     (renders directly into back VRAM page; works in 32-bit protected
+ *      mode via DPMI INT 31h AX=0300h real-mode call emulation)
+ *   - Falls back to single-buffer + blit if VRAM < 2 pages or 4F07h fails
  *   - Vertical retrace sync to eliminate frame tearing
  *
  * Controls:
@@ -227,6 +230,31 @@ static void vbe_set_text_mode(void)
     dpmi_real_int(0x10, &rmi);
 }
 
+/*
+ * VBE 4F07h — Set Display Start (page flip).
+ * cx  = first displayed pixel in scan line (0 = left)
+ * dy  = first displayed scan line (= page_index * HEIGHT for page flip)
+ * wait = 1 → BL=80h: block until next vsync, then flip (no tearing)
+ *        0 → BL=00h: flip immediately (may tear)
+ * Returns 1 on success.
+ *
+ * Works in 32-bit protected mode: the INT 10h call is issued via DPMI
+ * INT 31h AX=0300h (simulate real-mode interrupt), exactly the same
+ * mechanism used for all other VBE calls in this program.
+ */
+static int vbe_set_display_start(unsigned short cx, unsigned short dy,
+                                 int wait)
+{
+    RMI rmi;
+    memset(&rmi, 0, sizeof(rmi));
+    rmi.eax = 0x4F07;
+    rmi.ebx = wait ? 0x0080UL : 0x0000UL;  /* BH=0, BL=80h=vsync or 0 */
+    rmi.ecx = (unsigned long)cx;
+    rmi.edx = (unsigned long)dy;
+    if (!dpmi_real_int(0x10, &rmi)) return 0;
+    return ((rmi.eax & 0xFFFF) == 0x004F);
+}
+
 /* --------------------------------------------------------------------------
  * DAC width + VBE 4F09h palette
  * -------------------------------------------------------------------------- */
@@ -407,7 +435,7 @@ static void init_plasma_tables(void)
  * Each component uses a slightly different speed multiplier so the waves
  * drift independently and produce interesting interference patterns.
  */
-static void render_plasma(unsigned char *buf, unsigned int t)
+static void render_plasma(unsigned char *buf, int pitch, unsigned int t)
 {
     int x, y;
     unsigned int t1 = (t)         & 0xFF;   /* base speed                  */
@@ -417,7 +445,7 @@ static void render_plasma(unsigned char *buf, unsigned int t)
     const unsigned char *dist_row = g_dist;
 
     for (y = 0; y < HEIGHT; y++) {
-        unsigned char *dst = buf + (unsigned long)y * WIDTH;
+        unsigned char *dst = buf + (unsigned long)y * pitch;
         int vy = (int)g_sintab[((unsigned int)(y >> 1) + t1) & 0xFF];
         int dbase = (y >> 1) & 0xFF;
 
@@ -485,12 +513,15 @@ int main(void)
     int            lfb_pitch;
     unsigned long  lfb_phys;
     unsigned char *lfb;
-    unsigned char *frame_buf;
+    unsigned char *frame_buf;       /* system-RAM fallback buffer       */
     unsigned char  pal[256*4];
     unsigned char *font;
     char           msg[96];
     unsigned int   t;
     int            vsync_on, running;
+    int            use_doublebuf;   /* 1 = VBE 4F07h page flip active   */
+    int            back_page;       /* 0 or 1                           */
+    unsigned long  page_size;       /* bytes per VRAM page              */
     unsigned long  frame_count, last_ticks, now, elapsed;
     float          fps;
     volatile unsigned long *bios_ticks;
@@ -563,25 +594,50 @@ int main(void)
     printf("Found mode 0x%03X  LFB at 0x%08lX  pitch=%d\n",
            target_mode, lfb_phys, lfb_pitch);
 
-    /* ---- Allocate buffers --------------------------------------------- */
-    printf("Allocating frame buffer and distance table...\n");
-    frame_buf = (unsigned char *)malloc(PIXELS);
-    g_dist    = (unsigned char *)malloc(PIXELS);
-    if (!frame_buf || !g_dist) {
-        free(frame_buf);
-        free(g_dist);
+    /* ---- Check VRAM for double buffering ------------------------------ */
+    page_size     = (unsigned long)lfb_pitch * HEIGHT;
+    use_doublebuf = 0;
+    back_page     = 0;
+
+    {
+        unsigned long total_vram = (unsigned long)vbi.total_memory * 65536UL;
+        printf("VRAM: %luKB  page: %luKB  ",
+               total_vram / 1024UL, page_size / 1024UL);
+        if (total_vram >= page_size * 2UL) {
+            printf("-> double-buffer candidate\n");
+            use_doublebuf = 1;   /* confirmed after 4F07h test below    */
+        } else {
+            printf("-> single-buffer (insufficient VRAM)\n");
+        }
+    }
+
+    /* ---- Allocate distance table (always needed) ---------------------- */
+    g_dist = (unsigned char *)malloc(PIXELS);
+    if (!g_dist) {
         dpmi_free_dos();
-        printf("Out of memory\n");
+        printf("Out of memory (distance table)\n");
         return 1;
+    }
+
+    /* ---- Allocate system-RAM frame buffer (fallback only) ------------- */
+    frame_buf = NULL;
+    if (!use_doublebuf) {
+        frame_buf = (unsigned char *)malloc(PIXELS);
+        if (!frame_buf) {
+            free(g_dist);
+            dpmi_free_dos();
+            printf("Out of memory (frame buffer)\n");
+            return 1;
+        }
     }
 
     printf("Initialising plasma tables...\n");
     init_plasma_tables();
     printf("Done.                          \n");
 
-    /* ---- Map LFB ------------------------------------------------------- */
+    /* ---- Map LFB (1 page for single-buf, 2 pages for double-buf) ------ */
     {
-        unsigned long map_size = (unsigned long)lfb_pitch * HEIGHT;
+        unsigned long map_size = use_doublebuf ? page_size * 2UL : page_size;
         lfb = (unsigned char *)dpmi_map_physical(lfb_phys, map_size);
     }
     if (!lfb) {
@@ -602,6 +658,26 @@ int main(void)
         return 1;
     }
 
+    /* ---- Test VBE 4F07h support (must be after set mode) -------------- */
+    if (use_doublebuf) {
+        if (!vbe_set_display_start(0, 0, 0)) {
+            printf("4F07h not supported - falling back to single-buffer\n");
+            use_doublebuf = 0;
+            /* re-alloc system RAM frame buffer */
+            frame_buf = (unsigned char *)malloc(PIXELS);
+            if (!frame_buf) {
+                vbe_set_text_mode();
+                dpmi_unmap_physical(lfb);
+                free(g_dist);
+                dpmi_free_dos();
+                printf("Out of memory (frame buffer fallback)\n");
+                return 1;
+            }
+        } else {
+            back_page = 1;   /* start rendering into page 1 */
+        }
+    }
+
     /* ---- Palette ------------------------------------------------------- */
     init_dac();
     build_plasma_palette(pal);
@@ -620,6 +696,18 @@ int main(void)
 
     while (running) {
 
+        unsigned char *back_fb;
+        int            back_pitch;
+
+        /* Pointer and pitch for the buffer we render into this frame */
+        if (use_doublebuf) {
+            back_fb    = lfb + (unsigned long)back_page * page_size;
+            back_pitch = lfb_pitch;
+        } else {
+            back_fb    = frame_buf;
+            back_pitch = WIDTH;
+        }
+
         /* --- Keyboard --------------------------------------------------- */
         while (kbhit()) {
             int k = getch();
@@ -630,37 +718,47 @@ int main(void)
             }
         }
 
-        /* --- Render plasma to system-RAM buffer ------------------------- */
-        render_plasma(frame_buf, t);
+        /* --- Render plasma directly into back buffer -------------------- */
+        render_plasma(back_fb, back_pitch, t);
 
         /* --- HUD overlay ------------------------------------------------ */
         {
             const char *sync_str = vsync_on ? "ON " : "OFF";
-            sprintf(msg, "VSYNC: %s   FPS:%5.1f   [V]=toggle   [ESC]=quit",
-                    sync_str, fps);
-            /* small status bar at top */
-            draw_str_bg(frame_buf, WIDTH, 4, 4, msg, 255, 0, font);
+            const char *buf_str  = use_doublebuf ? "DBL" : "SGL";
+            sprintf(msg, "VSYNC:%s BUF:%s FPS:%5.1f  [V]=toggle [ESC]=quit",
+                    sync_str, buf_str, fps);
+            draw_str_bg(back_fb, back_pitch, 4, 4, msg, 255, 0, font);
         }
 
         if (vsync_on) {
-            draw_str_2x(frame_buf, WIDTH, 4, 16,
+            draw_str_2x(back_fb, back_pitch, 4, 16,
                         "VSYNC ON  - tearing suppressed   ",
                         200, 0, font);
         } else {
-            draw_str_2x(frame_buf, WIDTH, 4, 16,
+            draw_str_2x(back_fb, back_pitch, 4, 16,
                         "VSYNC OFF - watch for tear line! ",
                         240, 0, font);
         }
 
-        /* --- Sync to vertical retrace (optional) ------------------------ */
-        if (vsync_on)
-            wait_vsync();
-
-        /* --- Blit frame buffer to LFB ----------------------------------- */
-        blit_to_lfb(lfb, lfb_pitch, frame_buf);
+        /* --- Present frame ---------------------------------------------- */
+        if (use_doublebuf) {
+            /* VBE 4F07h page flip: swap displayed page, optionally wait
+             * for vsync.  With wait=1 the BIOS blocks until the next
+             * vertical retrace before switching — zero tearing.
+             * With wait=0 the flip is immediate — may produce a tear.
+             * Either way NO software spin-wait loop is needed.            */
+            vbe_set_display_start(0, (unsigned short)(back_page * HEIGHT),
+                                  vsync_on);
+            back_page = 1 - back_page;          /* toggle for next frame   */
+        } else {
+            /* Single-buffer fallback: optional software vsync + blit     */
+            if (vsync_on)
+                wait_vsync();
+            blit_to_lfb(lfb, lfb_pitch, frame_buf);
+        }
 
         /* --- Advance animation ------------------------------------------ */
-        t += 2;   /* two steps per frame keeps motion clearly visible      */
+        t += 2;
         frame_count++;
 
         /* --- FPS counter (updated ~once per second) --------------------- */
@@ -680,6 +778,7 @@ int main(void)
     free(g_dist);
     dpmi_free_dos();
 
-    printf("PLASMA done.  mode=0x%03X  DAC=%d-bit\n", target_mode, g_dac_bits);
+    printf("PLASMA done.  mode=0x%03X  DAC=%d-bit  buf:%s\n",
+           target_mode, g_dac_bits, use_doublebuf ? "double" : "single");
     return 0;
 }

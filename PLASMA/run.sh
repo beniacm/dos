@@ -20,5 +20,5 @@ c:
 PLASMA.EXE
 EOF
 
-dosbox-x -conf "$CONF"
+dosbox -conf "$CONF"
 rm -f "$CONF"
