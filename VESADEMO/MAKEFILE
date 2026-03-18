@@ -1,0 +1,16 @@
+# VESADEMO - OpenWatcom 2.0 Makefile (wmake)
+# Build: wmake
+
+CC      = wcc386
+CFLAGS  = -bt=dos -3r -ox -s -zq
+LINK    = wlink
+
+VESADEMO.EXE : VESADEMO.OBJ
+	$(LINK) system dos4g name VESADEMO file VESADEMO option quiet
+
+VESADEMO.OBJ : VESADEMO.C
+	$(CC) $(CFLAGS) VESADEMO.C
+
+clean : .SYMBOLIC
+	@if exist VESADEMO.OBJ del VESADEMO.OBJ
+	@if exist VESADEMO.EXE del VESADEMO.EXE

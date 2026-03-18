@@ -1,0 +1,19 @@
+# PLASMA - 8bpp VESA Plasma Demo with VSync
+# OpenWatcom 2.0 wmake build file
+
+CC      = wcc386
+LINK    = wlink
+CFLAGS  = -bt=dos -3r -ox -s -zq
+TARGET  = PLASMA
+
+all: $(TARGET).exe
+
+$(TARGET).obj: $(TARGET).C
+	$(CC) $(CFLAGS) $[@
+
+$(TARGET).exe: $(TARGET).obj
+	$(LINK) system dos4g name $(TARGET) file $(TARGET) option quiet
+
+clean: .SYMBOLIC
+	del $(TARGET).obj
+	del $(TARGET).exe

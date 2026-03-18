@@ -1,0 +1,15 @@
+# RADEON - OpenWatcom 2.0 Makefile (wmake)
+
+CC      = wcc386
+CFLAGS  = -bt=dos -3r -ox -s -zq -fp3
+LINK    = wlink
+
+RADEON.EXE : RADEON.OBJ
+	$(LINK) system dos4g name RADEON file RADEON option quiet
+
+RADEON.OBJ : RADEON.C
+	$(CC) $(CFLAGS) RADEON.C
+
+clean : .SYMBOLIC
+	@if exist RADEON.OBJ del RADEON.OBJ
+	@if exist RADEON.EXE del RADEON.EXE
