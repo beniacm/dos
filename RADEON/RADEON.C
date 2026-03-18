@@ -61,18 +61,37 @@ typedef struct {
 
 /* =============================================================== */
 /*  ATI Radeon register offsets (R300-R500 compatible 2D engine)    */
+/*  Reference: Linux kernel radeon_reg.h, xf86-video-ati           */
 /* =============================================================== */
 
+/* Bus / config registers */
+#define R_RBBM_SOFT_RESET          0x00F0
+#define   SOFT_RESET_CP            (1UL << 0)
+#define   SOFT_RESET_HI            (1UL << 1)
+#define   SOFT_RESET_SE            (1UL << 2)
+#define   SOFT_RESET_RE            (1UL << 3)
+#define   SOFT_RESET_PP            (1UL << 4)
+#define   SOFT_RESET_E2            (1UL << 5)
+#define   SOFT_RESET_RB            (1UL << 6)
+#define   SOFT_RESET_HDP           (1UL << 7)
 #define R_CONFIG_MEMSIZE           0x00F8
+#define R_HOST_PATH_CNTL           0x0130
+#define R_SURFACE_CNTL             0x0B00
 
 #define R_RBBM_STATUS              0x0E40
 #define   RBBM_FIFOCNT_MASK        0x007F
 #define   RBBM_ACTIVE              (1UL << 31)
 
+/* 2D engine registers */
 #define R_DSTCACHE_CTLSTAT         0x1714
 #define   DC_FLUSH_ALL             0x000F
 
 #define R_WAIT_UNTIL               0x1720
+#define   WAIT_2D_IDLE             (1UL << 14)
+#define   WAIT_3D_IDLE             (1UL << 15)
+#define   WAIT_2D_IDLECLEAN        (1UL << 16)
+#define   WAIT_3D_IDLECLEAN        (1UL << 17)
+#define R_RBBM_GUICNTL             0x172C
 
 #define R_DST_OFFSET               0x1404
 #define R_DST_PITCH                0x1408
@@ -118,6 +137,22 @@ typedef struct {
 #define R_DST_LINE_START           0x1600
 #define R_DST_LINE_END             0x1604
 #define R_DST_LINE_PATCOUNT        0x1608
+
+/* R300+ specific registers */
+#define R_RB3D_DSTCACHE_MODE       0x3258
+#define R_RB2D_DSTCACHE_MODE       0x3428
+#define R_RB2D_DSTCACHE_CTLSTAT    0x342C
+#define   RB2D_DC_FLUSH            (3UL << 0)
+#define   RB2D_DC_FREE             (3UL << 2)
+#define   RB2D_DC_FLUSH_ALL        0x0FUL
+#define   RB2D_DC_BUSY             (1UL << 31)
+#define R_GB_TILE_CONFIG           0x4018
+#define   GB_TILE_ENABLE           (1UL << 0)
+#define   GB_TILE_SIZE_16          (1UL << 4)
+#define   GB_PIPE_COUNT_RV350      (0UL << 1)
+#define R_DST_PIPE_CONFIG          0x170C
+#define   PIPE_AUTO_CONFIG         (1UL << 31)
+#define R_GB_PIPE_SELECT           0x402C
 
 /* =============================================================== */
 /*  RV515 / RV516 device-ID table (Radeon X1300 family)            */
@@ -484,13 +519,64 @@ static void gpu_wait_idle(void)
 }
 
 /* =============================================================== */
-/*  Radeon 2D engine initialisation                                 */
+/*  Radeon engine reset (from xf86-video-ati RADEONEngineReset)     */
+/* =============================================================== */
+
+static void gpu_engine_reset(void)
+{
+    unsigned long rbbm_soft_reset;
+    unsigned long host_path_cntl;
+
+    /*
+     * R300+/R500 soft reset sequence:
+     * Reset CP, HI, E2 — leave SE/RE/PP/RB alone to avoid lockup.
+     * Reference: xf86-video-ati radeon_accel.c RADEONEngineReset()
+     */
+    rbbm_soft_reset = rreg(R_RBBM_SOFT_RESET);
+    wreg(R_RBBM_SOFT_RESET, rbbm_soft_reset |
+         SOFT_RESET_CP | SOFT_RESET_HI | SOFT_RESET_E2);
+    (void)rreg(R_RBBM_SOFT_RESET);   /* flush posted write */
+    wreg(R_RBBM_SOFT_RESET, 0);
+    (void)rreg(R_RBBM_SOFT_RESET);   /* flush */
+
+    /*
+     * Reset HDP via HOST_PATH_CNTL toggle (RBBM_SOFT_RESET of HDP
+     * can cause problems on some ASICs).
+     */
+    host_path_cntl = rreg(R_HOST_PATH_CNTL);
+    wreg(R_HOST_PATH_CNTL, host_path_cntl);
+    (void)rreg(R_HOST_PATH_CNTL);
+
+    /* Enable destination cache autoflush (R300+) */
+    wreg(R_RB3D_DSTCACHE_MODE, rreg(R_RB3D_DSTCACHE_MODE) | (1UL << 17));
+    wreg(R_RB2D_DSTCACHE_MODE, rreg(R_RB2D_DSTCACHE_MODE) |
+         (1UL << 2) | (1UL << 15));  /* DC_AUTOFLUSH | DC_DISABLE_IGNORE_PE */
+}
+
+/* =============================================================== */
+/*  Radeon R500 2D engine initialization                            */
+/*  Reference: xf86-video-ati RADEONEngineInit() / EngineRestore() */
 /* =============================================================== */
 
 static void gpu_init_2d(void)
 {
     unsigned long pitch64;
 
+    /* Reset the engine first */
+    gpu_engine_reset();
+
+    /* R300+/R500: GB tile config with single pipe (RV515 has 1 pipe) */
+    wreg(R_GB_TILE_CONFIG, GB_TILE_ENABLE | GB_TILE_SIZE_16 |
+         GB_PIPE_COUNT_RV350);
+    wreg(R_WAIT_UNTIL, WAIT_2D_IDLECLEAN | WAIT_3D_IDLECLEAN);
+
+    /* R420+/R500: auto-configure destination pipe */
+    wreg(R_DST_PIPE_CONFIG, rreg(R_DST_PIPE_CONFIG) | PIPE_AUTO_CONFIG);
+
+    /* Set RBBM GUI control — no byte swap (x86 is little-endian) */
+    wreg(R_RBBM_GUICNTL, 0);
+
+    /* Wait for full idle */
     gpu_wait_idle();
 
     /* Flush destination cache */
@@ -498,7 +584,8 @@ static void gpu_init_2d(void)
     gpu_wait_idle();
 
     /* Encode pitch/offset for the combined register.
-       Pitch field is in 64-byte units, offset in 1024-byte units. */
+       Pitch field is in 64-byte units at bits [31:22],
+       offset in 1024-byte units at bits [21:0]. */
     pitch64 = ((unsigned long)g_pitch + 63) / 64;
 
     gpu_wait_fifo(10);
@@ -512,6 +599,9 @@ static void gpu_init_2d(void)
 
     wreg(R_DP_WRITE_MASK, 0xFFFFFFFF);
     wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+
+    /* Set surface byte-order control (no swap for x86) */
+    wreg(R_SURFACE_CNTL, 0);
 
     gpu_wait_idle();
 }
@@ -893,8 +983,9 @@ static void demo_blit(void)
 
 int main(void)
 {
-    unsigned long bar0, pci_cmd;
+    unsigned long bar0, bar1, pci_cmd;
     unsigned long lfb_sz;
+    unsigned long rbbm_val;
     int ch;
 
     printf("RADEON.EXE - ATI Radeon X1300 Pro DOS Hardware Demo\n");
@@ -924,30 +1015,79 @@ int main(void)
            pci_rd16(g_pci_bus,g_pci_dev,g_pci_func,0x2C),
            pci_rd16(g_pci_bus,g_pci_dev,g_pci_func,0x2E));
 
-    /* --- Map MMIO registers (BAR0) --- */
+    /* --- Map MMIO registers (BAR0 — may be 64-bit on PCIe) --- */
     bar0 = pci_rd32(g_pci_bus, g_pci_dev, g_pci_func, 0x10);
     g_mmio_phys = bar0 & 0xFFFFFFF0UL;
-    printf("  MMIO phys : 0x%08lX\n", g_mmio_phys);
 
-    g_mmio = (volatile unsigned long *)dpmi_map(g_mmio_phys, 0x10000);
+    /* Check if BAR0 is 64-bit (type field bits [2:1] == 10b) */
+    if ((bar0 & 0x06) == 0x04) {
+        bar1 = pci_rd32(g_pci_bus, g_pci_dev, g_pci_func, 0x14);
+        printf("  BAR0      : 64-bit, lower=0x%08lX upper=0x%08lX\n",
+               bar0, bar1);
+        if (bar1 != 0) {
+            printf("ERROR: MMIO mapped above 4GB (0x%08lX%08lX).\n",
+                   bar1, g_mmio_phys);
+            printf("Cannot access from 32-bit DOS extender.\n");
+            dpmi_free();
+            return 1;
+        }
+    } else {
+        printf("  BAR0      : 32-bit = 0x%08lX\n", bar0);
+    }
+
+    printf("  MMIO phys : 0x%08lX %s\n", g_mmio_phys,
+           (bar0 & 0x08) ? "(prefetchable)" : "(non-prefetchable)");
+
+    /* Map 128KB of MMIO (RV515 register space) */
+    g_mmio = (volatile unsigned long *)dpmi_map(g_mmio_phys, 0x20000);
     if (!g_mmio) {
         printf("ERROR: Cannot map MMIO registers.\n");
         dpmi_free();
         return 1;
     }
+    printf("  MMIO lin  : 0x%08lX (mapped 128KB)\n",
+           (unsigned long)g_mmio);
 
-    /* Ensure PCI memory access is enabled */
+    /* Ensure PCI bus-master + memory access are enabled */
     pci_cmd = pci_rd32(g_pci_bus, g_pci_dev, g_pci_func, 0x04);
-    if (!(pci_cmd & 0x02)) {
-        pci_wr32(g_pci_bus, g_pci_dev, g_pci_func, 0x04, pci_cmd | 0x02);
-        printf("  (Enabled PCI memory access)\n");
+    if ((pci_cmd & 0x06) != 0x06) {
+        pci_wr32(g_pci_bus, g_pci_dev, g_pci_func, 0x04,
+                 pci_cmd | 0x06);  /* memory + bus-master */
+        printf("  (Enabled PCI memory access + bus-master)\n");
     }
 
-    /* --- Read GPU info --- */
+    /* --- Validate MMIO mapping by reading known registers --- */
     g_vram_mb = rreg(R_CONFIG_MEMSIZE) / (1024UL * 1024UL);
+    rbbm_val = rreg(R_RBBM_STATUS);
     printf("  Video RAM : %lu MB\n", g_vram_mb);
-    printf("  Engine    : %s\n",
-           (rreg(R_RBBM_STATUS) & RBBM_ACTIVE) ? "BUSY" : "idle");
+    printf("  RBBM_STS  : 0x%08lX  (FIFO=%lu, %s)\n",
+           rbbm_val, rbbm_val & RBBM_FIFOCNT_MASK,
+           (rbbm_val & RBBM_ACTIVE) ? "BUSY" : "idle");
+
+    /* Sanity check: VRAM should be 64-512 MB for X1300 */
+    if (g_vram_mb == 0 || g_vram_mb > 1024) {
+        printf("WARNING: VRAM size %lu MB looks wrong.\n", g_vram_mb);
+        printf("  CONFIG_MEMSIZE=0x%08lX\n", rreg(R_CONFIG_MEMSIZE));
+        printf("  BAR0 may not be MMIO. Check lspci output.\n");
+    }
+
+    /* Print all BARs for diagnostics */
+    {
+        int i;
+        printf("\n  PCI BARs:\n");
+        for (i = 0; i < 6; i++) {
+            unsigned long b = pci_rd32(g_pci_bus, g_pci_dev,
+                                       g_pci_func, 0x10 + i*4);
+            printf("    BAR%d: 0x%08lX", i, b);
+            if (b & 1) printf(" (I/O)");
+            else {
+                printf(" (Mem, %s, %s)",
+                       (b & 0x06)==0x04 ? "64-bit" : "32-bit",
+                       (b & 0x08) ? "pref" : "non-pref");
+            }
+            printf("\n");
+        }
+    }
 
     /* --- Find VESA mode --- */
     printf("\nLooking for 800x600 8bpp VESA mode...\n");
