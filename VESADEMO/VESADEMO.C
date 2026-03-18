@@ -80,6 +80,36 @@ typedef struct {
 
 #pragma pack()
 
+/* ===== VBE 3.0: CRTC timing block (50 bytes, passed in ES:DI on mode set) ===== */
+
+#pragma pack(1)
+typedef struct {
+    unsigned short htotal;        /* Horizontal total (pixels)          */
+    unsigned short hsyncs;        /* HSync start                        */
+    unsigned short hsynce;        /* HSync end                          */
+    unsigned short vtotal;        /* Vertical total (lines)             */
+    unsigned short vsyncs;        /* VSync start                        */
+    unsigned short vsynce;        /* VSync end                          */
+    unsigned char  flags;         /* bit2=HSync neg, bit3=VSync neg     */
+    unsigned long  pixel_clock;   /* Hz                                 */
+    unsigned short refresh_rate;  /* units of 0.01 Hz                   */
+    unsigned char  reserved[40];
+} CRTC_INFO;                      /* 50 bytes total                     */
+#pragma pack()
+
+/* Standard 60 Hz CRTC timings for common resolutions (VESA DMT) */
+typedef struct { unsigned short xres, yres; CRTC_INFO crtc; } CRTCEntry;
+static const CRTCEntry g_crtc_table[] = {
+    /* 640x480@59.94Hz */
+    { 640,  480,  { 800, 656, 752, 525, 490, 492, 0x0C, 25175000UL, 5994, {0} } },
+    /* 800x600@60.32Hz */
+    { 800,  600,  { 1056, 840, 968, 628, 601, 605, 0x00, 40000000UL, 6032, {0} } },
+    /* 1024x768@60.00Hz */
+    { 1024, 768,  { 1344, 1048, 1184, 806, 771, 777, 0x0C, 65000000UL, 6000, {0} } },
+    /* terminator */
+    { 0, 0, { 0,0,0,0,0,0,0,0,0,{0} } }
+};
+
 /* ===== Mode table ===== */
 
 #define MAX_MODES 64
@@ -95,6 +125,17 @@ typedef struct {
 
 static ModeEntry g_modes[MAX_MODES];
 static int       g_num_modes = 0;
+
+/* ===== VBE 3.0 state ===== */
+static int           g_vbe3         = 0;    /* non-zero when VBE >= 3.0     */
+static unsigned short g_vbe_version = 0;    /* raw VBE version (BCD)        */
+static int           g_pmi_ok       = 0;    /* non-zero when PMI available  */
+static unsigned short g_pmi_rm_seg  = 0;    /* real-mode segment of PMI tbl */
+static unsigned short g_pmi_rm_off  = 0;    /* real-mode offset  of PMI tbl */
+static unsigned short g_pmi_size    = 0;    /* PMI table size in bytes      */
+static unsigned short g_pmi_setw_off  = 0;  /* SetWindow entry offset       */
+static unsigned short g_pmi_setds_off = 0;  /* SetDisplayStart entry offset */
+static unsigned short g_pmi_setpal_off= 0;  /* SetPrimaryPalette offset     */
 
 /* DOS conventional-memory buffer (allocated via DPMI) */
 static unsigned short g_dos_seg = 0;   /* real-mode segment  */
@@ -231,6 +272,64 @@ static int vbe_set_mode(unsigned short mode)
 
     if (!dpmi_real_int(0x10, &rmi)) return 0;
     return ((rmi.eax & 0xFFFF) == 0x004F);
+}
+
+/*
+ * VBE 3.0: set mode with CRTC timing block.
+ * BX bit 14 = LFB, bit 11 = use CRTC timing in ES:DI.
+ * crtc must be in DOS conventional memory (write to dos_buf first).
+ */
+static int vbe_set_mode_crtc(unsigned short mode, const CRTC_INFO *crtc)
+{
+    RMI rmi;
+    memcpy(dos_buf(), crtc, sizeof(CRTC_INFO));
+    memset(&rmi, 0, sizeof(rmi));
+    rmi.eax = 0x4F02;
+    rmi.ebx = (unsigned long)mode | 0x4000 | 0x0800; /* LFB + CRTC */
+    rmi.es  = g_dos_seg;
+    rmi.edi = 0;
+    if (!dpmi_real_int(0x10, &rmi)) return 0;
+    return ((rmi.eax & 0xFFFF) == 0x004F);
+}
+
+/* Look up CRTC timings for the given resolution; returns NULL if not found. */
+static const CRTC_INFO *find_crtc(unsigned short xres, unsigned short yres)
+{
+    const CRTCEntry *e;
+    for (e = g_crtc_table; e->xres; e++)
+        if (e->xres == xres && e->yres == yres)
+            return &e->crtc;
+    return NULL;
+}
+
+/*
+ * VBE 3.0: query Protected Mode Interface via INT 10h AX=4F0Ah.
+ * Fills g_pmi_* globals.  Returns 1 on success, 0 if unavailable.
+ */
+static int query_pmi(void)
+{
+    RMI rmi;
+    unsigned long pmi_flat;
+
+    memset(&rmi, 0, sizeof(rmi));
+    rmi.eax = 0x4F0A;
+    rmi.ebx = 0x0000;   /* BL=00: get PM interface info */
+    if (!dpmi_real_int(0x10, &rmi)) return 0;
+    if ((rmi.eax & 0xFFFF) != 0x004F) return 0;
+
+    g_pmi_rm_seg = (unsigned short)rmi.es;
+    g_pmi_rm_off = (unsigned short)(rmi.edi & 0xFFFF);
+    g_pmi_size   = (unsigned short)(rmi.ecx & 0xFFFF);
+
+    if (g_pmi_size == 0) return 0;
+
+    /* Read entry offsets from the PMI table header (first 6 bytes) */
+    pmi_flat = (unsigned long)g_pmi_rm_seg * 16 + g_pmi_rm_off;
+    g_pmi_setw_off   = *(unsigned short *)(pmi_flat + 0);
+    g_pmi_setds_off  = *(unsigned short *)(pmi_flat + 2);
+    g_pmi_setpal_off = *(unsigned short *)(pmi_flat + 4);
+
+    return 1;
 }
 
 static void vbe_set_text_mode(void)
@@ -572,11 +671,26 @@ static void draw_demo(unsigned char *fb, int xres, int yres, int pitch,
     if (bx1 < 4) bx1 = 4;
     draw_string_big(fb, pitch, bx1, bot_y, buf, 254, font, scale);
 
-    /* --- footer --- */
-    sprintf(buf, "Press any key for next mode  -  ESC to quit");
-    bx1 = (xres - (int)strlen(buf) * 8) / 2;
-    if (bx1 < 4) bx1 = 4;
-    draw_string(fb, pitch, bx1, yres - 6 - 8, buf, 253, font);
+    /* --- footer: VBE version + PMI + CRTC status (+ keyhelp if room) --- */
+    {
+        const CRTC_INFO *crtc = find_crtc((unsigned short)xres, (unsigned short)yres);
+        int vmaj = g_vbe_version >> 8, vmin = g_vbe_version & 0xFF;
+        const char *pmi_s  = g_pmi_ok ? "YES" : "NO ";
+        const char *crtc_s = (g_vbe3 && crtc) ? "60Hz" : "N/A";
+        /* choose footer length based on available pixels (8px per char) */
+        if ((int)xres >= 56 * 8)
+            sprintf(buf, "VBE %d.%d  PMI:%s  CRTC:%s    [any key=next  ESC=quit]",
+                    vmaj, vmin, pmi_s, crtc_s);
+        else if ((int)xres >= 38 * 8)
+            sprintf(buf, "VBE %d.%d PMI:%s CRTC:%s  [SPC/ESC]",
+                    vmaj, vmin, pmi_s, crtc_s);
+        else
+            sprintf(buf, "VBE %d.%d PMI:%s CRTC:%s",
+                    vmaj, vmin, pmi_s, crtc_s);
+        bx1 = ((int)xres - (int)strlen(buf) * 8) / 2;
+        if (bx1 < 4) bx1 = 4;
+        draw_string(fb, pitch, bx1, yres - 6 - 8, buf, 253, font);
+    }
 }
 
 /* ===== Simple sort by resolution (ascending) ===== */
@@ -634,14 +748,31 @@ int main(void)
         return 1;
     }
 
-    printf("VBE version : %d.%d\n",
-           vbe.vbe_version >> 8, vbe.vbe_version & 0xFF);
+    g_vbe_version = vbe.vbe_version;
+    g_vbe3        = (vbe.vbe_version >= 0x0300);
+
+    printf("VBE version : %d.%d%s\n",
+           vbe.vbe_version >> 8, vbe.vbe_version & 0xFF,
+           g_vbe3 ? " (VBE 3.0 features enabled)" : "");
     printf("Video memory: %u KB\n", (unsigned)vbe.total_memory * 64);
 
     if (vbe.vbe_version < 0x0200) {
         printf("ERROR: VBE 2.0 or later required for LFB support.\n");
         dpmi_free_dos();
         return 1;
+    }
+
+    /* VBE 3.0: query Protected Mode Interface */
+    if (g_vbe3) {
+        g_pmi_ok = query_pmi();
+        if (g_pmi_ok) {
+            printf("PMI        : available at %04X:%04X  size=%u\n",
+                   g_pmi_rm_seg, g_pmi_rm_off, g_pmi_size);
+            printf("  SetWindow=%04X  SetDisplayStart=%04X  SetPalette=%04X\n",
+                   g_pmi_setw_off, g_pmi_setds_off, g_pmi_setpal_off);
+        } else {
+            printf("PMI        : not available\n");
+        }
     }
 
     /* Copy mode list from real-mode pointer to local array.
@@ -705,11 +836,20 @@ int main(void)
     /* --- Demo loop --- */
     for (i = 0; i < g_num_modes; i++) {
         unsigned char *lfb;
+        int set_ok;
 
-        if (!vbe_set_mode(g_modes[i].number)) {
-            /* If LFB mode set fails, skip */
-            continue;
+        /* VBE 3.0: use CRTC timing if we have a table entry for this resolution */
+        if (g_vbe3) {
+            const CRTC_INFO *crtc = find_crtc(g_modes[i].xres, g_modes[i].yres);
+            if (crtc)
+                set_ok = vbe_set_mode_crtc(g_modes[i].number, crtc);
+            else
+                set_ok = vbe_set_mode(g_modes[i].number);
+        } else {
+            set_ok = vbe_set_mode(g_modes[i].number);
         }
+
+        if (!set_ok) continue;
 
         lfb = (unsigned char *)dpmi_map_physical(
                   g_modes[i].lfb_phys, g_modes[i].lfb_size);
