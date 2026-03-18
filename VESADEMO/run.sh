@@ -20,5 +20,5 @@ c:
 VESADEMO.EXE
 EOF
 
-dosbox -conf "$CONF"
+dosbox-x -conf "$CONF"
 rm -f "$CONF"
