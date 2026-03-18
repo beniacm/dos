@@ -9,6 +9,7 @@
  *   - Hardware-accelerated screen-to-screen blit
  *   - CPU vs GPU framebuffer fill benchmark
  *   - Animated GPU rectangle flood with throughput counter
+ *   - GPU parallax scrolling (4 layers, color-key transparency)
  *
  * Requires actual Radeon RV515/RV516 hardware (or compatible).
  * Build: wcl386 -bt=dos -l=dos4g -ox radeon.c
@@ -153,6 +154,13 @@ typedef struct {
 #define R_DST_PIPE_CONFIG          0x170C
 #define   PIPE_AUTO_CONFIG         (1UL << 31)
 #define R_GB_PIPE_SELECT           0x402C
+
+/* Color compare registers (for transparency keying) */
+#define R_CLR_CMP_CNTL            0x15C0
+#define R_CLR_CMP_CLR_SRC         0x15C4
+#define R_CLR_CMP_MASK            0x15CC
+#define   CLR_CMP_FCN_NE          5UL           /* draw when src != key */
+#define   CLR_CMP_SRC_SOURCE      (1UL << 24)   /* compare source pixels */
 
 /* =============================================================== */
 /*  RV515 / RV516 device-ID table (Radeon X1300 family)            */
@@ -666,6 +674,44 @@ static void gpu_line(int x1, int y1, int x2, int y2, unsigned char color)
     wreg(R_DST_LINE_PATCOUNT, 0x55UL << 16);
 }
 
+/* Forward blit (no overlap detection — for non-overlapping regions) */
+static void gpu_blit_fwd(int sx, int sy, int dx, int dy, int w, int h)
+{
+    gpu_wait_fifo(5);
+
+    wreg(R_DP_GUI_MASTER_CNTL,
+         GMC_BRUSH_NONE | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_SRCCOPY | GMC_DP_SRC_MEMORY | GMC_CLR_CMP_DIS |
+         GMC_WR_MSK_DIS);
+
+    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+    wreg(R_SRC_Y_X, ((unsigned long)sy << 16) | (unsigned long)(sx & 0xFFFF));
+    wreg(R_DST_Y_X, ((unsigned long)dy << 16) | (unsigned long)(dx & 0xFFFF));
+    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
+}
+
+/* Forward blit with source color-key transparency.
+   Pixels in the source matching `key` are NOT drawn. */
+static void gpu_blit_key(int sx, int sy, int dx, int dy, int w, int h,
+                         unsigned char key)
+{
+    gpu_wait_fifo(8);
+
+    wreg(R_CLR_CMP_CLR_SRC, (unsigned long)key);
+    wreg(R_CLR_CMP_MASK,    0x000000FFUL);
+    wreg(R_CLR_CMP_CNTL,    CLR_CMP_SRC_SOURCE | CLR_CMP_FCN_NE);
+
+    wreg(R_DP_GUI_MASTER_CNTL,
+         GMC_BRUSH_NONE | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_SRCCOPY | GMC_DP_SRC_MEMORY | GMC_WR_MSK_DIS);
+         /* Note: no GMC_CLR_CMP_DIS — color compare is active */
+
+    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+    wreg(R_SRC_Y_X, ((unsigned long)sy << 16) | (unsigned long)(sx & 0xFFFF));
+    wreg(R_DST_Y_X, ((unsigned long)dy << 16) | (unsigned long)(dx & 0xFFFF));
+    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
+}
+
 /* =============================================================== */
 /*  VESA mode selection: find best 8bpp LFB mode                    */
 /* =============================================================== */
@@ -978,7 +1024,306 @@ static void demo_blit(void)
 }
 
 /* =============================================================== */
-/*  Main                                                            */
+/*  Demo 5: GPU parallax scrolling with color-key transparency      */
+/*                                                                  */
+/*  4 layers at different scroll speeds, composited each frame      */
+/*  using GPU BLT.  Upper layers use source color-key (index 0) so */
+/*  lower layers show through transparent regions.                  */
+/*  Double-buffered via VBE 4F07h page flip.                        */
+/* =============================================================== */
+
+#define PLAX_NLAYERS   4
+#define PLAX_TRANSP    0    /* palette index = transparent */
+
+/* Integer triangle wave.  t = input, period > 0, returns [-amp..+amp]. */
+static int tri_wave(int t, int period, int amp)
+{
+    int q, phase;
+    if (period <= 0 || amp == 0) return 0;
+    q = period / 4;
+    if (q <= 0) return 0;
+    phase = ((t % period) + period) % period;
+    if (phase < q)      return  phase * amp / q;
+    if (phase < 3 * q)  return (2 * q - phase) * amp / q;
+    return (phase - period) * amp / q;
+}
+
+/* Blit one layer with horizontal wrapping (two BLTs when scroll
+   crosses the edge).  use_key: 0=opaque, 1=color-key transparency. */
+static void plax_blit_wrap(int layer_y, int scroll_x,
+                           int dst_y, int h, int use_key)
+{
+    int sx, w1, w2;
+    sx = scroll_x % g_xres;
+    if (sx < 0) sx += g_xres;
+    w1 = g_xres - sx;
+    w2 = sx;
+
+    if (use_key) {
+        gpu_blit_key(sx, layer_y, 0, dst_y, w1, h, PLAX_TRANSP);
+        if (w2 > 0)
+            gpu_blit_key(0, layer_y, w1, dst_y, w2, h, PLAX_TRANSP);
+    } else {
+        gpu_blit_fwd(sx, layer_y, 0, dst_y, w1, h);
+        if (w2 > 0)
+            gpu_blit_fwd(0, layer_y, w1, dst_y, w2, h);
+    }
+}
+
+/* ----- Layer 0: star field / night sky (opaque, full screen) ----- */
+static void gen_sky(int base)
+{
+    int x, y, i, n;
+
+    for (y = 0; y < g_yres; y++) {
+        unsigned char c = (unsigned char)(1 + y * 16 / g_yres);
+        memset(g_lfb + (long)(base + y) * g_pitch, c, g_xres);
+    }
+    srand(42);
+    n = g_xres * g_yres / 50;
+    for (i = 0; i < n; i++) {
+        x = rand() % g_xres;
+        y = rand() % (g_yres * 3 / 4);
+        g_lfb[(long)(base + y) * g_pitch + x] =
+            (unsigned char)((rand() % 4 == 0) ? 255 : 193 + rand() % 20);
+    }
+}
+
+/* ----- Layer 1: far mountains (gray, transparent above) ---------- */
+static void gen_mountains(int base)
+{
+    int x, y, h, top, shade;
+
+    for (y = 0; y < g_yres; y++)
+        memset(g_lfb + (long)(base + y) * g_pitch, PLAX_TRANSP, g_xres);
+
+    for (x = 0; x < g_xres; x++) {
+        h = g_yres * 35 / 100
+            + tri_wave(x * 7,        g_xres * 2, g_yres / 5)
+            + tri_wave(x * 13 + 80,  g_xres * 3, g_yres / 7)
+            + tri_wave(x * 29 + 200, g_xres,     g_yres / 10);
+        if (h < 40)                h = 40;
+        if (h > g_yres * 7 / 10)  h = g_yres * 7 / 10;
+        top = g_yres - h;
+
+        for (y = top; y < g_yres; y++) {
+            shade = 195 + (y - top) * 22 / h;
+            if (shade > 218) shade = 218;
+            if (y < top + h / 10 && h > g_yres / 3)
+                shade = 255;   /* snow cap on tallest peaks */
+            g_lfb[(long)(base + y) * g_pitch + x] = (unsigned char)shade;
+        }
+    }
+}
+
+/* ----- Layer 2: green hills with trees (transparent above) ------- */
+static void gen_hills(int base)
+{
+    int x, y, h, top, ci;
+
+    for (y = 0; y < g_yres; y++)
+        memset(g_lfb + (long)(base + y) * g_pitch, PLAX_TRANSP, g_xres);
+
+    for (x = 0; x < g_xres; x++) {
+        h = g_yres * 22 / 100
+            + tri_wave(x * 11,       g_xres * 2, g_yres / 8)
+            + tri_wave(x * 23 + 50,  g_xres,     g_yres / 12);
+        if (h < 20)            h = 20;
+        if (h > g_yres / 2)   h = g_yres / 2;
+        top = g_yres - h;
+
+        for (y = top; y < g_yres; y++) {
+            ci = 33 + (y - top) * 26 / h;
+            if (ci > 58) ci = 58;
+            g_lfb[(long)(base + y) * g_pitch + x] = (unsigned char)ci;
+        }
+
+        /* Tree trunks every ~50 pixels on taller hills */
+        if ((x % 50) < 2 && h > g_yres / 5) {
+            int th = h / 4;
+            for (y = top - th; y < top; y++)
+                if (y >= 0)
+                    g_lfb[(long)(base + y) * g_pitch + x] = 38;
+            /* Canopy */
+            {
+                int cx, cy;
+                for (cy = top - th - 10; cy < top - th + 2; cy++)
+                    for (cx = x - 4; cx <= x + 4; cx++)
+                        if (cy >= 0 && cx >= 0 && cx < g_xres)
+                            g_lfb[(long)(base + cy) * g_pitch + cx] = 42;
+            }
+        }
+    }
+}
+
+/* ----- Layer 3: city skyline (transparent above) ----------------- */
+static void gen_cityscape(int base)
+{
+    int x, y, ground_h, bx, by;
+
+    for (y = 0; y < g_yres; y++)
+        memset(g_lfb + (long)(base + y) * g_pitch, PLAX_TRANSP, g_xres);
+
+    ground_h = g_yres / 10;
+
+    /* Ground strip */
+    for (y = g_yres - ground_h; y < g_yres; y++) {
+        int ci = 70 + (y - (g_yres - ground_h)) * 20 / ground_h;
+        if (ci > 90) ci = 90;
+        memset(g_lfb + (long)(base + y) * g_pitch, (unsigned char)ci, g_xres);
+    }
+
+    /* Buildings */
+    srand(7777);
+    x = 2;
+    while (x < g_xres) {
+        int bw = 12 + rand() % 20;
+        int bh = ground_h + 20 + rand() % (g_yres / 4);
+        int top_y = g_yres - bh;
+        unsigned char bc = (unsigned char)(129 + rand() % 28);
+
+        if (top_y < g_yres / 3) top_y = g_yres / 3;
+
+        for (bx = x; bx < x + bw && bx < g_xres; bx++)
+            for (by = top_y; by < g_yres - ground_h; by++)
+                g_lfb[(long)(base + by) * g_pitch + bx] = bc;
+
+        /* Roof highlight */
+        for (bx = x; bx < x + bw && bx < g_xres; bx++)
+            if (top_y > 0)
+                g_lfb[(long)(base + top_y) * g_pitch + bx] =
+                    (unsigned char)(bc + 5 < 160 ? bc + 5 : 159);
+
+        /* Windows (some lit, some dark) */
+        for (by = top_y + 5; by < g_yres - ground_h - 5; by += 8)
+            for (bx = x + 3; bx < x + bw - 3; bx += 5) {
+                int wy, wx;
+                unsigned char wc;
+                if (bx + 2 >= g_xres) continue;
+                wc = (unsigned char)((rand() % 3) ? 254 : 248);
+                for (wy = by; wy < by + 3; wy++)
+                    for (wx = bx; wx < bx + 2; wx++)
+                        g_lfb[(long)(base + wy) * g_pitch + wx] = wc;
+            }
+
+        x += bw + 4 + rand() % 15;
+    }
+}
+
+/* ----- Main parallax loop ---------------------------------------- */
+static void demo_parallax(void)
+{
+    int layer_base[PLAX_NLAYERS];
+    int back_page, back_y, scroll;
+    long fps_count;
+    clock_t fps_t0;
+    double fps;
+    char buf[80];
+    int i;
+    unsigned long need;
+    RMI rm;
+
+    /* Verify VRAM can hold 2 display pages + 4 layer pages */
+    need = (unsigned long)g_pitch * g_yres * 6;
+    if (g_vram_mb > 0 && need > g_vram_mb * 1024UL * 1024UL) {
+        gpu_fill(0, 0, g_xres, g_yres, 0);
+        gpu_wait_idle();
+        cpu_str_c(g_yres / 2, "Not enough VRAM for parallax demo", 251, 2);
+        cpu_str_c(g_yres / 2 + 30, "Press any key...", 253, 1);
+        getch();
+        return;
+    }
+
+    /* Layer offscreen rows: page 2..5 (pages 0-1 are display buffers) */
+    for (i = 0; i < PLAX_NLAYERS; i++)
+        layer_base[i] = g_yres * (2 + i);
+
+    /* Widen scissor so GPU ops can reach offscreen VRAM */
+    gpu_wait_fifo(1);
+    wreg(R_SC_BOTTOM_RIGHT, (0x1FFFUL << 16) | (unsigned long)g_xres);
+
+    /* Show generation message on current visible page */
+    gpu_fill(0, 0, g_xres, g_yres, 0);
+    gpu_wait_idle();
+    cpu_str_c(g_yres / 2 - 20, "Generating parallax layers...", 255, 2);
+    cpu_str_c(g_yres / 2 + 10, "Sky - Mountains - Hills - City", 253, 1);
+
+    /* Procedurally generate 4 layers into offscreen VRAM */
+    gen_sky(layer_base[0]);
+    gen_mountains(layer_base[1]);
+    gen_hills(layer_base[2]);
+    gen_cityscape(layer_base[3]);
+
+    /* Clear both display pages */
+    gpu_fill(0, 0, g_xres, g_yres * 2, 0);
+    gpu_wait_idle();
+
+    back_page = 1;
+    scroll    = 0;
+    fps_count = 0;
+    fps       = 0.0;
+    fps_t0    = clock();
+
+    while (!kbhit()) {
+        back_y = back_page * g_yres;
+
+        /* Composite layers back-to-front into back buffer.
+           Scroll speeds: sky 1/8, mountains 1/4, hills 1/2, city 1x */
+        plax_blit_wrap(layer_base[0], scroll / 8,
+                       back_y, g_yres, 0);  /* sky: opaque */
+        plax_blit_wrap(layer_base[1], scroll / 4,
+                       back_y, g_yres, 1);  /* mountains: keyed */
+        plax_blit_wrap(layer_base[2], scroll / 2,
+                       back_y, g_yres, 1);  /* hills: keyed */
+        plax_blit_wrap(layer_base[3], scroll,
+                       back_y, g_yres, 1);  /* city: keyed */
+
+        gpu_wait_idle();
+
+        /* FPS counter (update every ~1 second) */
+        fps_count++;
+        {
+            clock_t now = clock();
+            double elapsed = (double)(now - fps_t0) / CLOCKS_PER_SEC;
+            if (elapsed >= 1.0) {
+                fps = (double)fps_count / elapsed;
+                fps_count = 0;
+                fps_t0 = now;
+            }
+        }
+
+        /* HUD text (CPU writes directly to back buffer in LFB) */
+        sprintf(buf, "GPU Parallax  %d layers  %.1f FPS  [ESC quit]",
+                PLAX_NLAYERS, fps);
+        cpu_str(4, back_y + 4, buf, 255, 1);
+
+        /* VBE 4F07h: flip display to back buffer (vsync) */
+        memset(&rm, 0, sizeof rm);
+        rm.eax = 0x4F07;
+        rm.ebx = 0x0080;   /* set during vertical retrace */
+        rm.ecx = 0;
+        rm.edx = (unsigned long)back_y;
+        dpmi_rmint(0x10, &rm);
+
+        back_page ^= 1;
+        scroll++;
+        if (scroll >= g_xres * 1000) scroll = 0;  /* prevent overflow */
+    }
+    getch();
+
+    /* Restore display to page 0 */
+    memset(&rm, 0, sizeof rm);
+    rm.eax = 0x4F07;
+    rm.ebx = 0x0000;
+    rm.ecx = 0;
+    rm.edx = 0;
+    dpmi_rmint(0x10, &rm);
+
+    /* Restore scissor */
+    gpu_wait_fifo(1);
+    wreg(R_SC_BOTTOM_RIGHT,
+         ((unsigned long)g_yres << 16) | (unsigned long)g_xres);
+}
 /* =============================================================== */
 
 int main(void)
@@ -1113,7 +1458,11 @@ int main(void)
         return 1;
     }
 
-    lfb_sz = ((unsigned long)g_pitch * g_yres + 4095UL) & ~4095UL;
+    /* Map enough LFB for parallax demo: 2 display + 4 layer pages (6×) */
+    lfb_sz = (unsigned long)g_pitch * g_yres * 6;
+    if (g_vram_mb > 0 && lfb_sz > g_vram_mb * 1024UL * 1024UL)
+        lfb_sz = g_vram_mb * 1024UL * 1024UL;
+    lfb_sz = (lfb_sz + 4095UL) & ~4095UL;
     g_lfb = (unsigned char *)dpmi_map(g_lfb_phys, lfb_sz);
     if (!g_lfb) {
         vbe_text();
@@ -1148,6 +1497,15 @@ int main(void)
     if (ch != 27) {
         /* === Demo 4: Blit bounce === */
         demo_blit();
+    }
+
+    if (ch != 27) {
+        ch = getch();
+    }
+
+    if (ch != 27) {
+        /* === Demo 5: GPU parallax scrolling === */
+        demo_parallax();
     }
 
     /* --- Restore text mode, cleanup --- */

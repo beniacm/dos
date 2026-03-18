@@ -1,0 +1,6 @@
+WATCOM=
+WATCOM=W:
+Directory of W:\BINW\.
+WCC386   EXE            905,814 18-03-2026  4:41
+    1 File(s)           905,814 Bytes.
+    0 Dir(s)        262,111,744 Bytes free.
