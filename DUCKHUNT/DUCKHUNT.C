@@ -955,6 +955,8 @@ static void setup_palette(void)
  * ======================================================================== */
 
 static unsigned char g_tex[NUM_TEX][TEX_H][TEX_W];
+static unsigned char g_floor_tex[TEX_H][TEX_W];
+static unsigned char g_ceil_tex[TEX_H][TEX_W];
 
 static int hash2d(int x, int y)
 {
@@ -1029,12 +1031,59 @@ static void gen_metal_tex(unsigned char tex[TEX_H][TEX_W])
     }
 }
 
+static void gen_cobble_tex(unsigned char tex[TEX_H][TEX_W])
+{
+    int x, y;
+    for (y = 0; y < TEX_H; y++) {
+        for (x = 0; x < TEX_W; x++) {
+            int row = y / 16;
+            int ox = (row & 1) ? 8 : 0;
+            int bx = (x + ox) % 16;
+            int cy = y % 16;
+            int n = hash2d(x, y) & 3;
+            int shade;
+            if (cy < 1 || bx < 1)
+                shade = 3 + (n & 1);
+            else {
+                int block = hash2d((x + ox) / 16, y / 16) & 7;
+                shade = 5 + block / 2 + n;
+            }
+            if (shade > 13) shade = 13;
+            tex[y][x] = PAL(HUE_FLOOR, shade);
+        }
+    }
+}
+
+static void gen_dungeon_ceil_tex(unsigned char tex[TEX_H][TEX_W])
+{
+    int x, y;
+    for (y = 0; y < TEX_H; y++) {
+        for (x = 0; x < TEX_W; x++) {
+            int n = hash2d(x, y) & 3;
+            int shade;
+            if ((y % 32) < 1 || (x % 32) < 1)
+                shade = 3 + (n & 1);
+            else {
+                int block = hash2d(x / 32, y / 32) & 3;
+                shade = 6 + block + (n >> 1);
+                if (hash2d(x / 8, y / 8) > 220)
+                    shade -= 2;
+            }
+            if (shade < 2) shade = 2;
+            if (shade > 11) shade = 11;
+            tex[y][x] = PAL(HUE_STONE, shade);
+        }
+    }
+}
+
 static void generate_textures(void)
 {
     gen_brick_tex(g_tex[0]);
     gen_stone_tex(g_tex[1]);
     gen_wood_tex(g_tex[2]);
     gen_metal_tex(g_tex[3]);
+    gen_cobble_tex(g_floor_tex);
+    gen_dungeon_ceil_tex(g_ceil_tex);
 }
 
 /* ========================================================================
@@ -1403,6 +1452,61 @@ static void update_player(float dt)
 
 static float g_zbuf[WIDTH];   /* wall distance per column (for sprites) */
 
+static void render_floor_ceiling(unsigned char *buf)
+{
+    int y;
+    float rayDirX0 = g_dirX - g_planeX;
+    float rayDirY0 = g_dirY - g_planeY;
+    float rayDirX1 = g_dirX + g_planeX;
+    float rayDirY1 = g_dirY + g_planeY;
+
+    for (y = 0; y < VIEW_H; y++) {
+        int p = y - VIEW_H / 2 - g_pitch;
+        float rowDist, fStepX, fStepY, fX, fY;
+        int x, isFloor, ap;
+        unsigned char *row;
+
+        if (p == 0) continue;
+        isFloor = (p > 0);
+        ap = p > 0 ? p : -p;
+        rowDist = (float)VIEW_H / (2.0f * (float)ap);
+
+        fStepX = rowDist * (rayDirX1 - rayDirX0) / (float)WIDTH;
+        fStepY = rowDist * (rayDirY1 - rayDirY0) / (float)WIDTH;
+        fX = g_posX + rowDist * rayDirX0;
+        fY = g_posY + rowDist * rayDirY0;
+        row = buf + y * WIDTH;
+
+        if (isFloor) {
+            int fogVal = (int)(rowDist * 0.8f);
+            if (fogVal > 12) fogVal = 12;
+            for (x = 0; x < WIDTH; x++) {
+                int tx = ((int)(fX * TEX_W)) & (TEX_W - 1);
+                int ty = ((int)(fY * TEX_H)) & (TEX_H - 1);
+                unsigned char c = g_floor_tex[ty][tx];
+                int sh = (c & 15) - fogVal;
+                if (sh < 0) sh = 0;
+                row[x] = (unsigned char)((c & 0xF0) + sh);
+                fX += fStepX;
+                fY += fStepY;
+            }
+        } else {
+            int fogVal = (int)(rowDist * 0.8f);
+            if (fogVal > 12) fogVal = 12;
+            for (x = 0; x < WIDTH; x++) {
+                int tx = ((int)(fX * TEX_W)) & (TEX_W - 1);
+                int ty = ((int)(fY * TEX_H)) & (TEX_H - 1);
+                unsigned char c = g_ceil_tex[ty][tx];
+                int sh = (c & 15) - fogVal;
+                if (sh < 0) sh = 0;
+                row[x] = (unsigned char)((c & 0xF0) + sh);
+                fX += fStepX;
+                fY += fStepY;
+            }
+        }
+    }
+}
+
 static void render_walls(unsigned char *buf)
 {
     int x;
@@ -1489,19 +1593,7 @@ static void render_walls(unsigned char *buf)
         if (fog > 12) fog = 12;
         sideFog = side ? 2 : 0;
 
-        /* Draw ceiling */
-        {
-            int ylim = drawStart;
-            if (ylim > VIEW_H) ylim = VIEW_H;
-            for (y = 0; y < ylim; y++) {
-                int dist = abs(VIEW_H / 2 + g_pitch - y);
-                int sh = dist * 12 / (VIEW_H / 2);
-                if (sh > 12) sh = 12;
-                buf[y * WIDTH + x] = PAL(HUE_SKY, sh);
-            }
-        }
-
-        /* Draw wall strip */
+        /* Draw wall strip (floor/ceiling already rendered by render_floor_ceiling) */
         {
             int ys = drawStart < 0 ? 0 : drawStart;
             int ye = drawEnd >= VIEW_H ? VIEW_H - 1 : drawEnd;
@@ -1516,18 +1608,6 @@ static void render_walls(unsigned char *buf)
                 shade = (c & 15) - fog - sideFog;
                 if (shade < 0) shade = 0;
                 buf[y * WIDTH + x] = (unsigned char)(hue * 16 + shade);
-            }
-        }
-
-        /* Draw floor */
-        {
-            int ys = drawEnd + 1;
-            if (ys < 0) ys = 0;
-            for (y = ys; y < VIEW_H; y++) {
-                int dist = abs(y - VIEW_H / 2 - g_pitch);
-                int sh = dist * 10 / (VIEW_H / 2);
-                if (sh > 10) sh = 10;
-                buf[y * WIDTH + x] = PAL(HUE_FLOOR, sh);
             }
         }
     }
@@ -2188,6 +2268,7 @@ int main(int argc, char *argv[])
         }
 
         /* ---- RENDER ---- */
+        render_floor_ceiling(frame_buf);
         render_walls(frame_buf);
         render_sprites(frame_buf);
         render_gun_flash(frame_buf);
