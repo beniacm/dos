@@ -66,6 +66,8 @@ typedef struct {
 /* =============================================================== */
 
 /* Bus / config registers */
+#define R_MC_IND_INDEX             0x0070
+#define R_MC_IND_DATA              0x0074
 #define R_RBBM_SOFT_RESET          0x00F0
 #define   SOFT_RESET_CP            (1UL << 0)
 #define   SOFT_RESET_HI            (1UL << 1)
@@ -77,15 +79,19 @@ typedef struct {
 #define   SOFT_RESET_HDP           (1UL << 7)
 #define R_CONFIG_MEMSIZE           0x00F8
 #define R_HOST_PATH_CNTL           0x0130
+#define R_HDP_FB_LOCATION          0x0134
 #define R_SURFACE_CNTL             0x0B00
+
+/* RV515 indirect MC register numbers (via MC_IND_INDEX/MC_IND_DATA) */
+#define RV515_MC_FB_LOCATION       0x0001
 
 #define R_RBBM_STATUS              0x0E40
 #define   RBBM_FIFOCNT_MASK        0x007F
 #define   RBBM_ACTIVE              (1UL << 31)
 
 /* 2D engine registers */
-#define R_DSTCACHE_CTLSTAT         0x1714
-#define   DC_FLUSH_ALL             0x000F
+/* NOTE: R_DSTCACHE_CTLSTAT (0x1714) is the R100/R200 cache flush register.
+   For R300+/R500, use R_RB2D_DSTCACHE_CTLSTAT (0x342C) instead. */
 
 #define R_WAIT_UNTIL               0x1720
 #define   WAIT_2D_IDLE             (1UL << 14)
@@ -130,6 +136,7 @@ typedef struct {
 #define R_DP_DATATYPE              0x16C4
 #define R_DP_MIX                   0x16C8
 #define R_DP_WRITE_MASK            0x16CC
+#define R_DEFAULT_PITCH_OFFSET     0x16E0
 
 #define R_DEFAULT_SC_BOTTOM_RIGHT  0x16E8
 #define R_SC_TOP_LEFT              0x16EC
@@ -195,6 +202,7 @@ static unsigned long  g_mmio_phys = 0;
 static unsigned long  g_vram_mb   = 0;
 static unsigned char *g_lfb       = NULL;          /* LFB pointer   */
 static unsigned long  g_lfb_phys  = 0;
+static unsigned long  g_fb_location = 0;   /* GPU internal FB base address */
 static int g_xres, g_yres, g_pitch;
 static unsigned short g_vmode;
 static unsigned char *g_font = NULL;
@@ -505,12 +513,33 @@ static unsigned long rreg(unsigned long off)
 static void wreg(unsigned long off, unsigned long val)
 { g_mmio[off >> 2] = val; }
 
+/* Read RV515 indirect MC register (via MC_IND_INDEX/MC_IND_DATA) */
+static unsigned long mc_rreg(unsigned long reg)
+{
+    unsigned long r;
+    wreg(R_MC_IND_INDEX, 0x7F0000UL | (reg & 0xFFFF));
+    r = rreg(R_MC_IND_DATA);
+    wreg(R_MC_IND_INDEX, 0);
+    return r;
+}
+
 /* Wait for at least `n` free FIFO entries */
 static void gpu_wait_fifo(int n)
 {
     unsigned long timeout = 2000000UL;
     while (timeout--) {
         if ((int)(rreg(R_RBBM_STATUS) & RBBM_FIFOCNT_MASK) >= n)
+            return;
+    }
+}
+
+/* Flush R300+/R500 2D destination cache and wait until done */
+static void gpu_engine_flush(void)
+{
+    unsigned long timeout = 2000000UL;
+    wreg(R_RB2D_DSTCACHE_CTLSTAT, RB2D_DC_FLUSH_ALL);
+    while (timeout--) {
+        if (!(rreg(R_RB2D_DSTCACHE_CTLSTAT) & RB2D_DC_BUSY))
             return;
     }
 }
@@ -522,8 +551,9 @@ static void gpu_wait_idle(void)
     gpu_wait_fifo(64);
     while (timeout--) {
         if (!(rreg(R_RBBM_STATUS) & RBBM_ACTIVE))
-            return;
+            break;
     }
+    gpu_engine_flush();
 }
 
 /* =============================================================== */
@@ -569,6 +599,7 @@ static void gpu_engine_reset(void)
 static void gpu_init_2d(void)
 {
     unsigned long pitch64;
+    unsigned long pitch_offset;
 
     /* Reset the engine first */
     gpu_engine_reset();
@@ -587,18 +618,20 @@ static void gpu_init_2d(void)
     /* Wait for full idle */
     gpu_wait_idle();
 
-    /* Flush destination cache */
-    wreg(R_DSTCACHE_CTLSTAT, DC_FLUSH_ALL);
-    gpu_wait_idle();
+    /* Flush destination cache using R300+/R500 register */
+    gpu_engine_flush();
 
     /* Encode pitch/offset for the combined register.
-       Pitch field is in 64-byte units at bits [31:22],
-       offset in 1024-byte units at bits [21:0]. */
+       Pitch field is in 64-byte units at bits [29:22],
+       offset in 1024-byte units at bits [21:0].
+       Offset includes GPU internal FB base address from HDP_FB_LOCATION. */
     pitch64 = ((unsigned long)g_pitch + 63) / 64;
+    pitch_offset = (pitch64 << 22) | ((g_fb_location >> 10) & 0x003FFFFFUL);
 
-    gpu_wait_fifo(10);
-    wreg(R_DST_PITCH_OFFSET, (pitch64 << 22) | 0);
-    wreg(R_SRC_PITCH_OFFSET, (pitch64 << 22) | 0);
+    gpu_wait_fifo(12);
+    wreg(R_DEFAULT_PITCH_OFFSET, pitch_offset);
+    wreg(R_DST_PITCH_OFFSET, pitch_offset);
+    wreg(R_SRC_PITCH_OFFSET, pitch_offset);
 
     wreg(R_DEFAULT_SC_BOTTOM_RIGHT, (0x1FFF << 16) | 0x1FFF);
     wreg(R_SC_TOP_LEFT, 0);
@@ -1434,6 +1467,19 @@ int main(void)
         }
     }
 
+    /* --- Read GPU framebuffer base address (for 2D engine offsets) --- */
+    {
+        unsigned long hdp_fb, mc_fb;
+        hdp_fb = rreg(R_HDP_FB_LOCATION);
+        mc_fb  = mc_rreg(RV515_MC_FB_LOCATION);
+        g_fb_location = (hdp_fb & 0xFFFFUL) << 16;
+        printf("\n  HDP_FB_LOC: 0x%08lX  (FB base = 0x%08lX)\n",
+               hdp_fb, g_fb_location);
+        printf("  MC_FB_LOC : 0x%08lX  (indirect MC reg 0x01)\n", mc_fb);
+        if (g_fb_location != 0)
+            printf("  NOTE: Non-zero FB base — 2D engine offsets adjusted\n");
+    }
+
     /* --- Find VESA mode --- */
     printf("\nLooking for 800x600 8bpp VESA mode...\n");
     if (!find_mode()) {
@@ -1444,6 +1490,13 @@ int main(void)
     }
     printf("  Mode 0x%03X: %dx%d pitch=%d  LFB=0x%08lX\n",
            g_vmode, g_xres, g_yres, g_pitch, g_lfb_phys);
+    {
+        unsigned long pitch64 = ((unsigned long)g_pitch + 63) / 64;
+        unsigned long po = (pitch64 << 22) |
+                           ((g_fb_location >> 10) & 0x003FFFFFUL);
+        printf("  PITCH_OFFSET: 0x%08lX  (pitch64=%lu, offset=0x%lX)\n",
+               po, pitch64, (g_fb_location >> 10) & 0x003FFFFFUL);
+    }
 
     printf("\nPress any key to start graphics demo...\n");
     getch();
@@ -1474,6 +1527,59 @@ int main(void)
 
     setup_palette();
     gpu_init_2d();
+
+    /* Verify GPU 2D engine: read back PITCH_OFFSET and do a test fill */
+    {
+        unsigned long po = rreg(R_DST_PITCH_OFFSET);
+        unsigned long rbbm;
+        unsigned char before, after;
+
+        /* Read back one pixel before GPU fill */
+        before = g_lfb[0];
+        /* GPU fill a single pixel at (0,0) with color 0xAA */
+        gpu_fill(0, 0, 1, 1, 0xAA);
+        gpu_wait_idle();
+        after = g_lfb[0];
+
+        /* If GPU wrote correctly, after should be 0xAA */
+        if (after != 0xAA) {
+            /* GPU fill didn't reach visible VRAM — show diagnostics */
+            rbbm = rreg(R_RBBM_STATUS);
+            vbe_text();
+            printf("GPU 2D Engine Diagnostic:\n");
+            printf("  DST_PITCH_OFFSET: 0x%08lX\n", po);
+            printf("    pitch field = %lu (x64 = %lu bytes)\n",
+                   (po >> 22) & 0xFF, ((po >> 22) & 0xFF) * 64UL);
+            printf("    offset field = %lu (x1024 = 0x%08lX)\n",
+                   po & 0x3FFFFFUL,
+                   (po & 0x3FFFFFUL) * 1024UL);
+            printf("  FB base       : 0x%08lX\n", g_fb_location);
+            printf("  RBBM_STATUS   : 0x%08lX (FIFO=%lu, %s)\n",
+                   rbbm, rbbm & RBBM_FIFOCNT_MASK,
+                   (rbbm & RBBM_ACTIVE) ? "BUSY" : "idle");
+            printf("  LFB pixel test: before=0x%02X after=0x%02X "
+                   "(expected 0xAA)\n", before, after);
+            printf("\n  GPU 2D engine may not be functional.\n");
+            printf("  Press any key to continue anyway, ESC to quit.\n");
+            ch = getch();
+            if (ch == 27) {
+                dpmi_unmap(g_lfb);
+                dpmi_unmap((void *)g_mmio);
+                dpmi_free();
+                return 1;
+            }
+            /* Re-enter graphics mode */
+            if (!vbe_set(g_vmode)) {
+                printf("ERROR: Cannot re-set VESA mode.\n");
+                dpmi_unmap(g_lfb);
+                dpmi_unmap((void *)g_mmio);
+                dpmi_free();
+                return 1;
+            }
+            setup_palette();
+            gpu_init_2d();
+        }
+    }
 
     /* === Demo 1: GPU-accelerated pattern === */
     demo_pattern();
