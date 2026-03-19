@@ -16,7 +16,7 @@
  *   ESC           - Quit
  *
  * Command line:
- *   DUCKHUNT [-vbe2] [-pmi] [-nopmi] [-hwflip] [-sched] [-nomtrr] [-mtrrinfo] [-vsync]
+ *   DUCKHUNT [-vbe2] [-pmi] [-nopmi] [-hwflip] [-sched] [-nomtrr] [-mtrrinfo] [-vsync] [-nodblbuf]
  *
  * Requires: PMODE/W (ring 0), VBE 2.0+, mouse driver (CTMOUSE etc.)
  *
@@ -315,21 +315,23 @@ static int g_dac_bits = 6;
 static void vbe_set_dac_width(int bits)
 {
     RMI rmi;
+    /* VBE 4F08h BL=00: Set DAC width (BH=desired bits)
+     * VBE 4F08h BL=01: Get DAC width (returns BH=current bits)
+     * NOTE: was incorrectly using 4F09h (palette data) which trashes IVT! */
     memset(&rmi, 0, sizeof(rmi));
-    rmi.eax = 0x4F09;
-    rmi.ebx = 0x0001;  /* get DAC width */
+    rmi.eax = 0x4F08;
+    rmi.ebx = 0x0001;  /* BL=01: get current DAC width */
     dpmi_real_int(0x10, &rmi);
     if ((rmi.eax & 0xFFFF) == 0x004F) {
-        int current = (int)(rmi.ebx & 0xFF);
+        int current = (int)((rmi.ebx >> 8) & 0xFF);  /* BH = current width */
         if (current >= bits) { g_dac_bits = current; return; }
     }
     memset(&rmi, 0, sizeof(rmi));
-    rmi.eax = 0x4F09;
-    rmi.ebx = 0x0000;  /* set DAC width */
-    rmi.ecx = (unsigned short)bits;
+    rmi.eax = 0x4F08;
+    rmi.ebx = (unsigned short)(bits << 8);  /* BH=bits, BL=00: set */
     dpmi_real_int(0x10, &rmi);
     if ((rmi.eax & 0xFFFF) == 0x004F)
-        g_dac_bits = (int)(rmi.ebx & 0xFF);
+        g_dac_bits = (int)((rmi.ebx >> 8) & 0xFF);  /* BH = actual width */
 }
 
 static void set_palette_entry(int idx, int r, int g, int b)
@@ -1884,6 +1886,7 @@ int main(int argc, char *argv[])
     unsigned long total_vram;
     int no_mtrr = 0, show_mtrrinfo = 0;
     int no_pmi = 1;   /* PMI off by default, -pmi enables */
+    int no_dblbuf = 0;
     int hw_flip_requested = 0;
     int sched_requested = 0;
     int running = 1;
@@ -1905,6 +1908,7 @@ int main(int argc, char *argv[])
         else if (strcmp(argv[i], "-hwflip") == 0) hw_flip_requested = 1;
         else if (strcmp(argv[i], "-sched") == 0) sched_requested = 1;
         else if (strcmp(argv[i], "-vsync") == 0) g_vsync_on = 1;
+        else if (strcmp(argv[i], "-nodblbuf") == 0) no_dblbuf = 1;
     }
 
     draw_title();
@@ -1955,7 +1959,7 @@ int main(int argc, char *argv[])
     if (g_lfb_pitch == 0) g_lfb_pitch = WIDTH;
     g_page_size = (unsigned long)g_lfb_pitch * HEIGHT;
     total_vram = (unsigned long)g_vbi.total_memory * 65536UL;
-    if (total_vram >= g_page_size * 2UL)
+    if (total_vram >= g_page_size * 2UL && !no_dblbuf)
         g_use_doublebuf = 1;
     map_size = g_use_doublebuf ? g_page_size * 2UL : g_page_size;
 
