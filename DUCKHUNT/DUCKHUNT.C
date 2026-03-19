@@ -1909,8 +1909,10 @@ int main(int argc, char *argv[])
 
     draw_title();
 
-    /* Allocate DOS conventional memory for VBE calls */
-    if (!dpmi_alloc_dos(32)) {
+    /* Conventional DOS memory for VBE calls:
+     *   512 B VBEInfo + 256 B ModeInfo + 1024 B palette = 1792 B
+     *   128 paragraphs = 2048 B — enough with room to spare */
+    if (!dpmi_alloc_dos(128)) {
         printf("Failed to allocate DOS memory\n");
         return 1;
     }
