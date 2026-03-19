@@ -9,3 +9,8 @@ echo "Building PLASMA..."
 wcc386 -bt=dos -5r -ox -s -zq PLASMA.C
 wlink system pmodew name PLASMA file PLASMA option quiet
 echo "Done: PLASMA.exe"
+
+echo "Building MTRRDIAG..."
+wcc386 -bt=dos -5r -ox -s -zq MTRRDIAG.C
+wlink system pmodew name MTRRDIAG file MTRRDIAG option quiet
+echo "Done: MTRRDIAG.exe"

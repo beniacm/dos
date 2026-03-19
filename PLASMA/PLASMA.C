@@ -29,6 +29,7 @@
  *   -pmi        = enable VBE 3.0 Protected Mode Interface
  *   -nopmi      = disable PMI (default)
  *   -nomtrr     = skip MTRR write-combining setup
+ *   -mtrrinfo   = show detailed MTRR/PAT/PTE diagnostic dump
  *   -directvram = render directly to VRAM (slow, for benchmarking)
  *   -hwflip     = direct GPU register page flip (tear-free, bypasses BIOS)
  *
@@ -129,6 +130,7 @@ static int           g_vbe3         = 0;    /* non-zero when VBE >= 3.0     */
 static int           g_force_vbe2   = 0;    /* non-zero to disable VBE 3.0  */
 static int           g_no_pmi      = 1;    /* 0=use PMI, 1=skip (default: skip, use -pmi to enable) */
 static int           g_no_mtrr     = 0;    /* non-zero to skip MTRR WC     */
+static int           g_mtrr_info   = 0;    /* non-zero to show MTRR dump   */
 static int           g_direct_vram = 0;    /* non-zero to render direct to VRAM (slow, for comparison) */
 static unsigned short g_vbe_version = 0;    /* raw VBE version (BCD)        */
 static int           g_pmi_ok       = 0;    /* non-zero when PMI page-flip  */
@@ -618,6 +620,20 @@ void _wrmsr_3(unsigned long, unsigned long, unsigned long);
 void _wbinvd(void);
 #pragma aux _wbinvd = "db 0Fh, 09h"
 
+unsigned long _read_cr3(void);
+#pragma aux _read_cr3 = \
+    "db 0Fh, 20h, 0D8h"    \
+    value [eax]
+
+void _flush_tlb(void);
+#pragma aux _flush_tlb = \
+    "db 0Fh, 20h, 0D8h"    \
+    "db 0Fh, 22h, 0D8h"    \
+    modify [eax]
+
+#define MSR_MTRR_DEF_TYPE   0x2FF
+#define MSR_PAT             0x277
+
 /* MTRR state for cleanup on exit */
 static int           g_mtrr_slot = -1;
 static unsigned long g_mtrr_save_base_lo, g_mtrr_save_base_hi;
@@ -741,6 +757,177 @@ static void restore_mtrr(void)
 
     g_mtrr_slot = -1;
     g_mtrr_wc = 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Page Table Entry fix for WC passthrough
+ *
+ * PMODE/W maps MMIO regions with PCD=1, PWT=1 in the PTE (UC strong).
+ * On PAT-capable CPUs (Pentium III+), the effective memory type is:
+ *
+ *   PCD  PWT  PAT-bit  →  PAT index  →  Default PAT entry  →  Effective
+ *    1    1      0          3              UC (strong)          UC wins over MTRR WC
+ *    1    0      0          2              UC- (weak)           MTRR WC takes effect!
+ *    0    0      0          0              WB                   MTRR WC takes effect
+ *
+ * Fix: clear PWT in PTEs covering the LFB.  UC- allows MTRR WC passthrough.
+ * This is the standard method used by Linux/FreeBSD to enable WC on LFBs.
+ * -------------------------------------------------------------------------- */
+static int g_pte_fixed = 0;   /* count of PTEs fixed */
+
+static int fix_lfb_pte_for_wc(unsigned long lfb_va, unsigned long size)
+{
+    unsigned long cr3, *pgdir;
+    unsigned long va, end;
+    int fixed = 0;
+
+    if ((_get_cs() & 3) != 0) return 0;
+    if (!(_cpuid1_edx() & (1UL << 16))) return 0; /* no PAT support */
+
+    cr3 = _read_cr3();
+    pgdir = (unsigned long *)(cr3 & 0xFFFFF000UL);
+    va = lfb_va;
+    end = va + size;
+
+    while (va < end) {
+        unsigned long pde_idx = va >> 22;
+        unsigned long pde = pgdir[pde_idx];
+
+        if (!(pde & 1)) {
+            va = (va + 0x400000UL) & ~0x3FFFFFUL;
+            continue;
+        }
+
+        if (pde & 0x80) {
+            /* 4MB page (PSE): PWT=bit3, PCD=bit4 */
+            if ((pde & 0x18) == 0x18) {
+                pgdir[pde_idx] = pde & ~0x08UL;  /* PWT=0 → UC- */
+                fixed++;
+            }
+            va = (va + 0x400000UL) & ~0x3FFFFFUL;
+        } else {
+            /* 4KB pages */
+            unsigned long *pt = (unsigned long *)(pde & 0xFFFFF000UL);
+            unsigned long j   = (va >> 12) & 0x3FF;
+            unsigned long lim = j + ((end - va + 0xFFF) >> 12);
+            if (lim > 1024) lim = 1024;
+            for (; j < lim; j++, va += 0x1000) {
+                unsigned long pte = pt[j];
+                if ((pte & 1) && (pte & 0x18) == 0x18) {
+                    pt[j] = pte & ~0x08UL;  /* PWT=0 → UC- */
+                    fixed++;
+                }
+            }
+        }
+    }
+
+    if (fixed > 0) _flush_tlb();
+    g_pte_fixed = fixed;
+    return fixed;
+}
+
+/* --------------------------------------------------------------------------
+ * MTRR diagnostic dump (printed with -mtrrinfo flag)
+ * -------------------------------------------------------------------------- */
+static const char *mtrr_type_name(unsigned long type)
+{
+    switch (type & 0xFF) {
+        case 0: return "UC";
+        case 1: return "WC";
+        case 4: return "WT";
+        case 5: return "WP";
+        case 6: return "WB";
+        default: return "??";
+    }
+}
+
+static void dump_mtrr_info(unsigned long lfb_va, unsigned long map_size)
+{
+    unsigned long cap_lo, def_lo, def_hi, pat_lo, pat_hi;
+    unsigned long cr3;
+    int num_var, i;
+
+    if ((_get_cs() & 3) != 0) {
+        printf("MTRR dump: ring 3, cannot read MSRs\n");
+        return;
+    }
+    if (!_has_cpuid()) { printf("MTRR dump: no CPUID\n"); return; }
+
+    cap_lo = _rdmsr_lo(MSR_MTRRCAP);
+    num_var = (int)(cap_lo & 0xFF);
+    def_lo = _rdmsr_lo(MSR_MTRR_DEF_TYPE);
+    def_hi = _rdmsr_hi(MSR_MTRR_DEF_TYPE);
+
+    printf("==========================================\n");
+    printf(" MTRR / PAT Diagnostic\n");
+    printf("==========================================\n");
+    printf(" MTRRCAP      : %d variable, WC=%s, FIX=%s\n",
+           num_var,
+           (cap_lo & (1UL << 10)) ? "yes" : "no",
+           (cap_lo & (1UL <<  8)) ? "yes" : "no");
+    printf(" DEF_TYPE     : %s (0x%02lX), MTRR_E=%d, FIX_E=%d\n",
+           mtrr_type_name(def_lo), def_lo & 0xFF,
+           (int)((def_lo >> 11) & 1), (int)((def_lo >> 10) & 1));
+
+    printf(" Variable MTRRs:\n");
+    for (i = 0; i < num_var && i < 8; i++) {
+        unsigned long blo = _rdmsr_lo(MSR_MTRR_PHYSBASE0 + i * 2);
+        unsigned long bhi = _rdmsr_hi(MSR_MTRR_PHYSBASE0 + i * 2);
+        unsigned long mlo = _rdmsr_lo(MSR_MTRR_PHYSMASK0 + i * 2);
+        unsigned long mhi = _rdmsr_hi(MSR_MTRR_PHYSMASK0 + i * 2);
+        int valid = (mlo >> 11) & 1;
+        if (valid) {
+            unsigned long base = blo & 0xFFFFF000UL;
+            unsigned long mask = mlo & 0xFFFFF000UL;
+            unsigned long sz = (~mask + 1) & 0xFFFFF000UL;
+            printf("   [%d] base=0x%08lX size=%luMB type=%s\n",
+                   i, base, sz >> 20, mtrr_type_name(blo));
+        } else {
+            printf("   [%d] <free>\n", i);
+        }
+    }
+
+    /* PAT entries */
+    if (_cpuid1_edx() & (1UL << 16)) {
+        pat_lo = _rdmsr_lo(MSR_PAT);
+        pat_hi = _rdmsr_hi(MSR_PAT);
+        printf(" PAT entries  : ");
+        for (i = 0; i < 4; i++)
+            printf("%d=%s ", i, mtrr_type_name((pat_lo >> (i * 8)) & 7));
+        for (i = 0; i < 4; i++)
+            printf("%d=%s ", i + 4, mtrr_type_name((pat_hi >> (i * 8)) & 7));
+        printf("\n");
+    } else {
+        printf(" PAT          : not supported\n");
+    }
+
+    /* Page table entry for LFB */
+    if (lfb_va) {
+        cr3 = _read_cr3();
+        {
+            unsigned long *pgdir = (unsigned long *)(cr3 & 0xFFFFF000UL);
+            unsigned long pde_idx = lfb_va >> 22;
+            unsigned long pde = pgdir[pde_idx];
+            printf(" LFB VA       : 0x%08lX\n", lfb_va);
+            printf(" PDE[%3lu]     : 0x%08lX  P=%d PS=%d PWT=%d PCD=%d\n",
+                   pde_idx, pde, (int)(pde & 1), (int)((pde >> 7) & 1),
+                   (int)((pde >> 3) & 1), (int)((pde >> 4) & 1));
+            if ((pde & 1) && !(pde & 0x80)) {
+                unsigned long *pt = (unsigned long *)(pde & 0xFFFFF000UL);
+                unsigned long pte_idx = (lfb_va >> 12) & 0x3FF;
+                unsigned long pte = pt[pte_idx];
+                int pat_idx = ((pte >> 3) & 1) + (((pte >> 4) & 1) << 1)
+                            + (((pte >> 7) & 1) << 2);
+                printf(" PTE[%3lu]     : 0x%08lX  PWT=%d PCD=%d PAT=%d → idx=%d\n",
+                       pte_idx, pte,
+                       (int)((pte >> 3) & 1), (int)((pte >> 4) & 1),
+                       (int)((pte >> 7) & 1), pat_idx);
+            }
+        }
+    }
+
+    printf(" PTE fix      : %d entries patched (UC->UC-)\n", g_pte_fixed);
+    printf("==========================================\n");
 }
 
 /* --------------------------------------------------------------------------
@@ -1160,6 +1347,10 @@ int main(int argc, char *argv[])
             stricmp(argv[i], "/hwflip") == 0) {
             g_hw_flip = 1;
         }
+        if (stricmp(argv[i], "-mtrrinfo") == 0 ||
+            stricmp(argv[i], "/mtrrinfo") == 0) {
+            g_mtrr_info = 1;
+        }
     }
 
     /* Conventional DOS memory:
@@ -1345,6 +1536,22 @@ int main(int argc, char *argv[])
         printf("MTRR WC    : disabled by -nomtrr\n");
     }
 
+    /* ---- Fix page table entries for WC passthrough --------------------- */
+    if (g_mtrr_wc == 1) {
+        unsigned long map_size = use_doublebuf ? page_size * 2UL : page_size;
+        int nfix = fix_lfb_pte_for_wc((unsigned long)lfb, map_size);
+        if (nfix > 0)
+            printf("PTE fix    : %d entries UC->UC- for WC passthrough\n", nfix);
+        else
+            printf("PTE fix    : not needed (already UC- or WB)\n");
+    }
+
+    /* ---- MTRR diagnostic dump (with -mtrrinfo flag) -------------------- */
+    if (g_mtrr_info) {
+        unsigned long map_size = use_doublebuf ? page_size * 2UL : page_size;
+        dump_mtrr_info((unsigned long)lfb, map_size);
+    }
+
     /* ---- Brief mode set to test page-flip features --------------------- */
     if (!vbe_set_mode(target_mode)) {
         dpmi_unmap_physical(lfb);
@@ -1506,6 +1713,9 @@ int main(int argc, char *argv[])
         printf(" Ring         : %s\n", ring_str);
         printf(" PMI          : %s\n", pmi_str);
         printf(" MTRR WC      : %s\n", mtrr_str);
+        printf(" PTE fix      : %s\n",
+               g_pte_fixed > 0 ? "applied (UC->UC- for WC passthrough)" :
+               g_mtrr_wc ? "not needed" : "n/a");
         printf(" Page flip    : %s\n", flip_str);
         printf(" Sched flip   : %s\n", sched_str);
         printf(" HW flip      : %s\n", hwflip_str);
