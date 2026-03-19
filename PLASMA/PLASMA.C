@@ -120,6 +120,8 @@ static unsigned short g_dos_sel = 0;
 /* VBE 3.0 / PMI state */
 static int           g_vbe3         = 0;    /* non-zero when VBE >= 3.0     */
 static int           g_force_vbe2   = 0;    /* non-zero to disable VBE 3.0  */
+static int           g_no_pmi      = 0;    /* non-zero to skip PMI         */
+static int           g_no_mtrr     = 0;    /* non-zero to skip MTRR WC     */
 static unsigned short g_vbe_version = 0;    /* raw VBE version (BCD)        */
 static int           g_pmi_ok       = 0;    /* non-zero when PMI page-flip  */
 static unsigned short g_pmi_rm_seg  = 0;    /* real-mode segment of PMI tbl */
@@ -799,6 +801,14 @@ int main(int argc, char *argv[])
             stricmp(argv[i], "/vbe2") == 0) {
             g_force_vbe2 = 1;
         }
+        if (stricmp(argv[i], "-nopmi") == 0 ||
+            stricmp(argv[i], "/nopmi") == 0) {
+            g_no_pmi = 1;
+        }
+        if (stricmp(argv[i], "-nomtrr") == 0 ||
+            stricmp(argv[i], "/nomtrr") == 0) {
+            g_no_mtrr = 1;
+        }
     }
 
     /* Conventional DOS memory:
@@ -835,13 +845,15 @@ int main(int argc, char *argv[])
     printf("Video memory: %u KB\n", (unsigned)vbi.total_memory * 64);
 
     /* VBE 3.0: query Protected Mode Interface */
-    if (g_vbe3) {
+    if (g_vbe3 && !g_no_pmi) {
         g_pmi_ok = query_pmi();
         if (g_pmi_ok)
             printf("PMI        : available at %04X:%04X  SetDisplayStart=%04X\n",
                    g_pmi_rm_seg, g_pmi_rm_off, g_pmi_setds_off);
         else
             printf("PMI        : not available\n");
+    } else if (g_no_pmi) {
+        printf("PMI        : disabled by -nopmi\n");
     }
 
     {
@@ -946,7 +958,7 @@ int main(int argc, char *argv[])
     }
 
     /* ---- MTRR Write-Combining for LFB --------------------------------- */
-    {
+    if (!g_no_mtrr) {
         unsigned long total_vram = (unsigned long)vbi.total_memory * 65536UL;
         int wc = setup_mtrr_wc(lfb_phys, total_vram);
         if (wc == 1)
@@ -958,6 +970,8 @@ int main(int argc, char *argv[])
             printf("MTRR WC    : skipped (ring 3 — use PMODE/W for ring 0)\n");
         else
             printf("MTRR WC    : not available\n");
+    } else {
+        printf("MTRR WC    : disabled by -nomtrr\n");
     }
 
     /* ---- Set video mode ------------------------------------------------ */
