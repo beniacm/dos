@@ -882,6 +882,7 @@ static unsigned char *g_dist  = NULL;        /* WIDTH*HEIGHT Euclidean dist  */
 static double g_bench_render_ms   = 0.0;
 static double g_bench_blit_ms     = 0.0;
 static double g_bench_combined_ms = 0.0;
+static double g_rdtsc_mhz         = 0.0; /* calibrated CPU MHz via RDTSC */
 
 static void init_plasma_tables(void)
 {
@@ -984,6 +985,55 @@ static void blit_to_lfb(unsigned char *lfb, int lfb_pitch,
 }
 
 /* --------------------------------------------------------------------------
+ * RDTSC helpers (Pentium+)
+ * -------------------------------------------------------------------------- */
+
+static void rdtsc_read(unsigned long *lo, unsigned long *hi)
+{
+    unsigned long a, d;
+    __asm {
+        rdtsc
+        mov [a], eax
+        mov [d], edx
+    }
+    *lo = a;
+    *hi = d;
+}
+
+/* Convert two (hi:lo) TSC snapshots to milliseconds using g_rdtsc_mhz */
+static double tsc_to_ms(unsigned long lo1, unsigned long hi1,
+                         unsigned long lo0, unsigned long hi0)
+{
+    double cycles = (double)hi1 * 4294967296.0 + (double)lo1
+                  - (double)hi0 * 4294967296.0 - (double)lo0;
+    return (g_rdtsc_mhz > 0.0) ? cycles / (g_rdtsc_mhz * 1000.0) : 0.0;
+}
+
+/* Calibrate RDTSC against DOS clock() (18.2 Hz reference).
+ * Called in text mode before graphics.  Takes ~220ms. */
+static void calibrate_rdtsc(void)
+{
+    clock_t t0, t1;
+    unsigned long lo0, hi0, lo1, hi1;
+    double elapsed_s, cycles;
+
+    /* Synchronise to a tick edge */
+    t0 = clock();
+    while ((t1 = clock()) == t0) {}
+
+    /* Now measure over ~4 ticks (~220 ms) for good accuracy */
+    rdtsc_read(&lo0, &hi0);
+    t0 = t1;
+    while ((t1 = clock()) - t0 < 4) {}
+    rdtsc_read(&lo1, &hi1);
+
+    elapsed_s = (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
+    cycles    = (double)hi1 * 4294967296.0 + (double)lo1
+              - (double)hi0 * 4294967296.0 - (double)lo0;
+    g_rdtsc_mhz = cycles / elapsed_s / 1.0e6;
+}
+
+/* --------------------------------------------------------------------------
  * Startup performance benchmark
  *
  * Runs before the demo loop to show where the time goes.
@@ -995,7 +1045,7 @@ static void blit_to_lfb(unsigned char *lfb, int lfb_pitch,
 
 static void run_benchmark(unsigned char *lfb, int lfb_pitch)
 {
-    clock_t  t0, t1;
+    unsigned long lo0, hi0, lo1, hi1;
     unsigned char *tmp;
     int      i;
 
@@ -1008,27 +1058,27 @@ static void run_benchmark(unsigned char *lfb, int lfb_pitch)
     blit_to_lfb(lfb, lfb_pitch, tmp);
 
     /* Render only */
-    t0 = clock();
+    rdtsc_read(&lo0, &hi0);
     for (i = 0; i < BENCH_FRAMES; i++)
         render_plasma(tmp, WIDTH, (unsigned int)i * 3);
-    t1 = clock();
-    g_bench_render_ms = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC / BENCH_FRAMES;
+    rdtsc_read(&lo1, &hi1);
+    g_bench_render_ms = tsc_to_ms(lo1, hi1, lo0, hi0) / BENCH_FRAMES;
 
     /* Blit only */
-    t0 = clock();
+    rdtsc_read(&lo0, &hi0);
     for (i = 0; i < BENCH_FRAMES; i++)
         blit_to_lfb(lfb, lfb_pitch, tmp);
-    t1 = clock();
-    g_bench_blit_ms = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC / BENCH_FRAMES;
+    rdtsc_read(&lo1, &hi1);
+    g_bench_blit_ms = tsc_to_ms(lo1, hi1, lo0, hi0) / BENCH_FRAMES;
 
     /* Combined */
-    t0 = clock();
+    rdtsc_read(&lo0, &hi0);
     for (i = 0; i < BENCH_FRAMES; i++) {
         render_plasma(tmp, WIDTH, (unsigned int)i * 3);
         blit_to_lfb(lfb, lfb_pitch, tmp);
     }
-    t1 = clock();
-    g_bench_combined_ms = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC / BENCH_FRAMES;
+    rdtsc_read(&lo1, &hi1);
+    g_bench_combined_ms = tsc_to_ms(lo1, hi1, lo0, hi0) / BENCH_FRAMES;
 
     free(tmp);
 }
@@ -1097,6 +1147,11 @@ int main(int argc, char *argv[])
         printf("DPMI: cannot allocate conventional memory\n");
         return 1;
     }
+
+    /* Calibrate RDTSC frequency (~220ms, text mode, safe) */
+    printf("Calibrating CPU frequency...\n");
+    calibrate_rdtsc();
+    printf("CPU: %.0f MHz\n", g_rdtsc_mhz);
 
     /* ---- Locate 1024x768 8bpp LFB mode -------------------------------- */
     printf("Searching for 1024x768 8bpp LFB mode...\n");
@@ -1409,6 +1464,7 @@ int main(int argc, char *argv[])
         printf("==========================================\n");
         printf(" PLASMA - Feature Summary\n");
         printf("==========================================\n");
+        printf(" CPU          : %.0f MHz\n", g_rdtsc_mhz);
         printf(" VBE version  : %d.%d%s\n",
                g_vbe_version >> 8, g_vbe_version & 0xFF,
                g_force_vbe2 ? " (forced VBE 2.0)" : "");
@@ -1447,7 +1503,7 @@ int main(int argc, char *argv[])
                        g_bench_blit_ms,
                        1000.0 / g_bench_blit_ms, b_pct, blit_mbs);
             else
-                printf("  Blit   :  0.00 ms  <1 tick (too fast to measure)\n");
+                printf("  Blit   : <0.01 ms  (sub-us, RDTSC not calibrated)\n");
             printf("  Total  : %5.2f ms  %4.0f FPS  bottleneck: %s\n",
                    g_bench_combined_ms,
                    1000.0 / g_bench_combined_ms, bn);
