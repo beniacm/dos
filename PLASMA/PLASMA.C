@@ -30,6 +30,7 @@
  *   -nopmi      = disable PMI (default)
  *   -nomtrr     = skip MTRR write-combining setup
  *   -directvram = render directly to VRAM (slow, for benchmarking)
+ *   -hwflip     = direct GPU register page flip (tear-free, bypasses BIOS)
  *
  * Build:
  *   wcc386 -bt=dos -3r -ox -s -zq PLASMA.C
@@ -137,6 +138,11 @@ static unsigned short g_pmi_size    = 0;    /* PMI table size in bytes      */
 static unsigned short g_pmi_setw_off  = 0;  /* SetWindow entry offset       */
 static unsigned short g_pmi_setds_off = 0;  /* SetDisplayStart entry offset */
 static unsigned short g_pmi_setpal_off= 0;  /* SetPrimaryPalette offset     */
+
+/* Direct GPU register page flip (bypasses BIOS completely) */
+static int            g_hw_flip      = 0;   /* use direct HW register flip  */
+static unsigned short g_gpu_iobase   = 0;   /* GPU I/O base (MM_INDEX port) */
+static unsigned long  g_fb_phys      = 0;   /* LFB physical base for flip   */
 
 static unsigned char *dos_buf(void)
 {
@@ -422,6 +428,125 @@ static int pmi_is_flip_complete(void)
     unsigned long ebx_out;
     ebx_out = _pmi_call4_ebx(entry, 0x4F07, 0x0004UL, 0, 0);
     return ((ebx_out & 0xFF00) == 0);  /* BH=0 means flip complete */
+}
+
+/* --------------------------------------------------------------------------
+ * Direct GPU register access via PCI I/O-mapped MMIO (MM_INDEX / MM_DATA)
+ *
+ * ATI/AMD GPUs expose their register file through an I/O BAR:
+ *   port+0 = MM_INDEX (write register address)
+ *   port+4 = MM_DATA  (read/write register value)
+ *
+ * This bypasses the BIOS entirely, allowing us to use the hardware's
+ * built-in surface update lock for tear-free page flipping.
+ *
+ * VBEDUMP analysis of the X1300 Pro PMI code revealed three BIOS bugs:
+ *   1. PMI SetDisplayStart address overflows for Y >= 64 (24-bit mask)
+ *   2. PMI BL=80h vsync wait writes registers AFTER blanking ends
+ *   3. No D1GRPH_UPDATE_LOCK used — immediate writes cause tearing
+ *
+ * This direct implementation fixes all three by:
+ *   - Computing correct physical address (base + page * pitch * height)
+ *   - Using D1GRPH_UPDATE_LOCK so hardware applies at next vsync
+ *   - Never blocking — CPU is free to render the next frame immediately
+ *
+ * Requires ring 0 (PMODE/W) for I/O port access.
+ * -------------------------------------------------------------------------- */
+
+/* R500 (RV515/X1300) register definitions */
+#define R5_D1GRPH_PRIMARY_SURFACE_ADDRESS   0x6110
+#define R5_D1GRPH_SECONDARY_SURFACE_ADDRESS 0x6118
+#define R5_D1GRPH_UPDATE                    0x6144
+#define R5_D1GRPH_SURFACE_UPDATE_PENDING    (1UL << 2)
+#define R5_D1GRPH_SURFACE_UPDATE_LOCK       (1UL << 16)
+
+/* Dword I/O port access (named to avoid conio.h conflict) */
+void _gpu_outpd(unsigned short port, unsigned long val);
+#pragma aux _gpu_outpd = "out dx, eax" parm [dx] [eax] modify exact []
+
+unsigned long _gpu_inpd(unsigned short port);
+#pragma aux _gpu_inpd = "in eax, dx" parm [dx] value [eax] modify exact []
+
+static unsigned long gpu_reg_read(unsigned long reg)
+{
+    _gpu_outpd(g_gpu_iobase, reg);
+    return _gpu_inpd(g_gpu_iobase + 4);
+}
+
+static void gpu_reg_write(unsigned long reg, unsigned long val)
+{
+    _gpu_outpd(g_gpu_iobase, reg);
+    _gpu_outpd(g_gpu_iobase + 4, val);
+}
+
+/* Detect GPU I/O base by PCI bus scan.
+ * Finds the PCI device whose memory BAR matches lfb_phys,
+ * then locates its I/O BAR for MM_INDEX/MM_DATA access. */
+static int detect_gpu_iobase(unsigned long lfb_phys)
+{
+    unsigned int bus, dev;
+    unsigned long addr, bar;
+    int i, found_lfb;
+    unsigned short io_base;
+
+    for (bus = 0; bus < 16; bus++) {
+        for (dev = 0; dev < 32; dev++) {
+            addr = 0x80000000UL | ((unsigned long)bus << 16)
+                 | ((unsigned long)dev << 11);
+
+            _gpu_outpd(0x0CF8, addr);
+            if ((_gpu_inpd(0x0CFC) & 0xFFFF) == 0xFFFF) continue;
+
+            found_lfb = 0;
+            io_base   = 0;
+
+            for (i = 0; i < 6; i++) {
+                _gpu_outpd(0x0CF8, addr | (unsigned long)(0x10 + i * 4));
+                bar = _gpu_inpd(0x0CFC);
+                if (bar & 1) {
+                    /* I/O BAR — strip indicator bits (low byte like PMI) */
+                    if (!io_base)
+                        io_base = (unsigned short)(bar & ~0xFFUL);
+                } else if ((bar & 0xFFF00000UL) == (lfb_phys & 0xFFF00000UL)
+                        && (bar & 0xFFF00000UL) != 0) {
+                    found_lfb = 1;
+                }
+            }
+
+            if (found_lfb && io_base) {
+                g_gpu_iobase = io_base;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Tear-free page flip using D1GRPH surface update lock.
+ * The lock buffers register writes; on unlock the hardware applies
+ * the new surface address atomically at the next vsync boundary. */
+static void hw_page_flip(unsigned long page_phys_addr)
+{
+    unsigned long lock;
+
+    /* Lock surface updates */
+    lock = gpu_reg_read(R5_D1GRPH_UPDATE);
+    gpu_reg_write(R5_D1GRPH_UPDATE, lock | R5_D1GRPH_SURFACE_UPDATE_LOCK);
+
+    /* Write new surface address to both primary and secondary */
+    gpu_reg_write(R5_D1GRPH_PRIMARY_SURFACE_ADDRESS, page_phys_addr);
+    gpu_reg_write(R5_D1GRPH_SECONDARY_SURFACE_ADDRESS, page_phys_addr);
+
+    /* Unlock — hardware applies at next vsync */
+    lock = gpu_reg_read(R5_D1GRPH_UPDATE);
+    gpu_reg_write(R5_D1GRPH_UPDATE, lock & ~R5_D1GRPH_SURFACE_UPDATE_LOCK);
+}
+
+/* Check if the previous hw_page_flip has been applied by hardware.
+ * Returns 1 if flip is done, 0 if still pending. */
+static int hw_is_flip_done(void)
+{
+    return !(gpu_reg_read(R5_D1GRPH_UPDATE) & R5_D1GRPH_SURFACE_UPDATE_PENDING);
 }
 
 /* --------------------------------------------------------------------------
@@ -895,6 +1020,10 @@ int main(int argc, char *argv[])
             stricmp(argv[i], "/directvram") == 0) {
             g_direct_vram = 1;
         }
+        if (stricmp(argv[i], "-hwflip") == 0 ||
+            stricmp(argv[i], "/hwflip") == 0) {
+            g_hw_flip = 1;
+        }
     }
 
     /* Conventional DOS memory:
@@ -1124,6 +1253,34 @@ int main(int argc, char *argv[])
         }
     }
 
+    /* Test direct GPU register access for -hwflip */
+    if (g_hw_flip && use_doublebuf) {
+        if ((_get_cs() & 3) != 0) {
+            printf("HW flip    : skipped (ring 3 — use PMODE/W)\n");
+            g_hw_flip = 0;
+        } else if (!detect_gpu_iobase(lfb_phys)) {
+            printf("HW flip    : GPU I/O base not found\n");
+            g_hw_flip = 0;
+        } else {
+            /* Verify by reading D1GRPH_PRIMARY_SURFACE_ADDRESS.
+             * After mode set, it should contain our LFB physical base. */
+            unsigned long cur = gpu_reg_read(R5_D1GRPH_PRIMARY_SURFACE_ADDRESS);
+            if ((cur & 0xFFF00000UL) != (lfb_phys & 0xFFF00000UL)) {
+                printf("HW flip    : verification failed "
+                       "(D1GRPH=0x%08lX, LFB=0x%08lX)\n", cur, lfb_phys);
+                g_hw_flip = 0;
+            } else {
+                g_fb_phys = lfb_phys;
+                printf("HW flip    : active (I/O=0x%04X, "
+                       "D1GRPH=0x%08lX)\n",
+                       g_gpu_iobase, cur);
+            }
+        }
+    } else if (g_hw_flip) {
+        printf("HW flip    : disabled (no page flip support)\n");
+        g_hw_flip = 0;
+    }
+
     /* Return to text mode for feature summary */
     vbe_set_text_mode();
 
@@ -1133,6 +1290,7 @@ int main(int argc, char *argv[])
                                 "0 (PMODE/W)" : "3 (DOS4GW)";
         const char *pmi_str, *mtrr_str, *flip_str;
         const char *sched_str, *buf_str, *render_str;
+        const char *hwflip_str;
 
         if (g_pmi_ok)
             pmi_str = "available";
@@ -1167,6 +1325,11 @@ int main(int argc, char *argv[])
         else
             sched_str = "not supported";
 
+        if (g_hw_flip)
+            hwflip_str = "active (GPU register + update lock)";
+        else
+            hwflip_str = "off (use -hwflip to enable)";
+
         if (g_direct_vram)
             buf_str = use_doublebuf ? "double (2x VRAM)" :
                                       "single (1x VRAM)";
@@ -1195,6 +1358,7 @@ int main(int argc, char *argv[])
         printf(" MTRR WC      : %s\n", mtrr_str);
         printf(" Page flip    : %s\n", flip_str);
         printf(" Sched flip   : %s\n", sched_str);
+        printf(" HW flip      : %s\n", hwflip_str);
         printf(" Buffering    : %s\n", buf_str);
         printf(" Render       : %s\n", render_str);
         printf("==========================================\n");
@@ -1257,7 +1421,10 @@ int main(int argc, char *argv[])
             render_plasma(dst, lfb_pitch, t);
             /* No HUD in direct-VRAM mode (would need a scratch buffer) */
             if (use_doublebuf) {
-                if (g_pmi_ok)
+                if (g_hw_flip)
+                    hw_page_flip(g_fb_phys +
+                        (unsigned long)back_page * page_size);
+                else if (g_pmi_ok)
                     pmi_set_display_start(0,
                         (unsigned short)(back_page * HEIGHT), 0);
                 else
@@ -1277,12 +1444,21 @@ int main(int argc, char *argv[])
                                        (use_doublebuf ? "TRP" : "DBL");
                 const char *pmi_str  = g_pmi_ok ? "YES" : "NO ";
                 const char *wc_str   = g_mtrr_wc ? "YES" : "NO ";
-                sprintf(msg, "VSYNC:%s BUF:%s PMI:%s WC:%s FPS:%5.1f  [V]=vsync [ESC]=quit",
-                        sync_str, buf_str, pmi_str, wc_str, fps);
+                const char *hwf_str  = g_hw_flip ? "YES" : "NO ";
+                sprintf(msg, "VSYNC:%s BUF:%s PMI:%s HWF:%s WC:%s FPS:%5.1f  [V] [ESC]",
+                        sync_str, buf_str, pmi_str, hwf_str, wc_str, fps);
                 draw_str_bg(frame_buf, WIDTH, 4, 4, msg, 255, 0, font);
             }
 
-            if (vsync_on && g_sched_flip) {
+            if (vsync_on && g_hw_flip) {
+                draw_str_2x(frame_buf, WIDTH, 4, 16,
+                            "HW FLIP - GPU locked, tear-free  ",
+                            160, 0, font);
+            } else if (!vsync_on && g_hw_flip) {
+                draw_str_2x(frame_buf, WIDTH, 4, 16,
+                            "HW FLIP - tear-free, no throttle ",
+                            160, 0, font);
+            } else if (vsync_on && g_sched_flip) {
                 draw_str_2x(frame_buf, WIDTH, 4, 16,
                             "VSYNC SCHED - non-blocking flip  ",
                             180, 0, font);
@@ -1298,45 +1474,62 @@ int main(int argc, char *argv[])
 
             /* --- Present frame ------------------------------------------ */
             if (use_doublebuf) {
-                /* Wait for previous scheduled flip to complete before
-                 * overwriting the back page that may still be displayed. */
-                if (g_sched_flip) {
+                if (g_hw_flip) {
+                    /* Direct GPU register flip with update lock.
+                     * The lock buffers the surface address write; on
+                     * unlock the hardware applies it atomically at the
+                     * next vsync — guaranteed tear-free, non-blocking.
+                     *
+                     * For vsync throttling we wait for the pending bit
+                     * to clear (i.e. hardware applied previous flip). */
+                    if (vsync_on)
+                        while (!hw_is_flip_done()) {}
+
+                    blit_to_lfb(lfb + (unsigned long)back_page * page_size,
+                                lfb_pitch, frame_buf);
+
+                    hw_page_flip(g_fb_phys +
+                        (unsigned long)back_page * page_size);
+
+                } else if (g_sched_flip) {
+                    /* Wait for previous scheduled flip to complete before
+                     * overwriting the back page that may still be displayed. */
                     if (g_pmi_ok) {
                         while (!pmi_is_flip_complete()) {}
                     } else {
                         while (!vbe_is_flip_complete()) {}
                     }
-                }
 
-                blit_to_lfb(lfb + (unsigned long)back_page * page_size,
-                            lfb_pitch, frame_buf);
+                    blit_to_lfb(lfb + (unsigned long)back_page * page_size,
+                                lfb_pitch, frame_buf);
 
-                if (g_sched_flip && vsync_on) {
-                    /* VBE 3.0 non-blocking scheduled flip: schedule the
-                     * page flip for the next vsync and return immediately.
-                     * CPU can start rendering the next frame right away. */
-                    if (g_pmi_ok)
-                        pmi_schedule_display_start(0,
-                            (unsigned short)(back_page * HEIGHT));
-                    else
-                        vbe_schedule_display_start(0,
-                            (unsigned short)(back_page * HEIGHT));
+                    if (vsync_on) {
+                        /* VBE 3.0 non-blocking scheduled flip */
+                        if (g_pmi_ok)
+                            pmi_schedule_display_start(0,
+                                (unsigned short)(back_page * HEIGHT));
+                        else
+                            vbe_schedule_display_start(0,
+                                (unsigned short)(back_page * HEIGHT));
+                    } else {
+                        if (g_pmi_ok)
+                            pmi_set_display_start(0,
+                                (unsigned short)(back_page * HEIGHT), 0);
+                        else
+                            vbe_set_display_start(0,
+                                (unsigned short)(back_page * HEIGHT), 0);
+                    }
                 } else {
-                    /* Always use immediate flip (BL=00h).
+                    /* Standard BIOS flip: always BL=00h (immediate).
                      *
                      * BL=80h (BIOS-managed vsync wait) is unreliable on
-                     * modern GPUs: ATI ATOMBIOS executes slow command tables
-                     * to program the CRTC, missing the vsync blanking window
-                     * and causing tearing DURING active display.
+                     * modern GPUs: ATI ATOMBIOS writes registers AFTER
+                     * blanking ends, causing tearing at the top of screen.
                      *
-                     * Modern GPUs (Radeon etc.) double-buffer the CRTC start
-                     * address: BL=00h latches the address immediately, and
-                     * the hardware applies it at the next vsync.  So BL=00h
-                     * is inherently tear-free on double-buffered hardware.
-                     *
-                     * For vsync throttling we wait_vsync() AFTER the flip to
-                     * ensure the page swap has completed before we overwrite
-                     * the old displayed page on the next iteration. */
+                     * For vsync throttling we wait_vsync() AFTER the flip. */
+                    blit_to_lfb(lfb + (unsigned long)back_page * page_size,
+                                lfb_pitch, frame_buf);
+
                     if (g_pmi_ok)
                         pmi_set_display_start(0,
                             (unsigned short)(back_page * HEIGHT), 0);
@@ -1376,11 +1569,12 @@ int main(int argc, char *argv[])
     free(g_dist);
     dpmi_free_dos();
 
-    printf("PLASMA done.  mode=0x%03X  DAC=%d-bit  buf:%s  PMI:%s  WC:%s  sched:%s  render:%s\n",
+    printf("PLASMA done.  mode=0x%03X  DAC=%d-bit  buf:%s  PMI:%s  HWF:%s  WC:%s  sched:%s  render:%s\n",
            target_mode, g_dac_bits,
            g_direct_vram ? (use_doublebuf ? "double" : "single") :
                            (use_doublebuf ? "triple" : "double"),
            g_pmi_ok ? "yes" : "no",
+           g_hw_flip ? "yes" : "no",
            g_mtrr_wc == 1 ? "mtrr" : g_mtrr_wc == 2 ? "bios" : "no",
            g_sched_flip ? "yes" : "no",
            g_direct_vram ? "direct" : "sysram");
