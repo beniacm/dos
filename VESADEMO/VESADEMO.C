@@ -67,7 +67,20 @@ typedef struct {
     unsigned long  phys_base_ptr;       /* +28  VBE 2.0+ LFB addr   */
     unsigned long  reserved2;           /* +2C */
     unsigned short reserved3;           /* +30 */
-    unsigned char  padding[206];        /* pad to 256 bytes total    */
+    /* VBE 3.0+ fields (offset 0x32) */
+    unsigned short lin_bytes_per_scan;  /* +32 */
+    unsigned char  bnk_num_img_pages;   /* +34 */
+    unsigned char  lin_num_img_pages;   /* +35 */
+    unsigned char  lin_red_mask_size;   /* +36 */
+    unsigned char  lin_red_field_pos;   /* +37 */
+    unsigned char  lin_green_mask_size; /* +38 */
+    unsigned char  lin_green_field_pos; /* +39 */
+    unsigned char  lin_blue_mask_size;  /* +3A */
+    unsigned char  lin_blue_field_pos;  /* +3B */
+    unsigned char  lin_rsvd_mask_size;  /* +3C */
+    unsigned char  lin_rsvd_field_pos;  /* +3D */
+    unsigned long  max_pixel_clock;     /* +3E  max pixel clock in Hz */
+    unsigned char  padding[190];        /* +42  pad to 256 bytes      */
 } VBEModeInfo;
 
 /* DPMI real-mode register structure for INT 31h AX=0300h */
@@ -94,7 +107,7 @@ typedef struct {
     unsigned long  pixel_clock;   /* Hz                                 */
     unsigned short refresh_rate;  /* units of 0.01 Hz                   */
     unsigned char  reserved[40];
-} CRTC_INFO;                      /* 50 bytes total                     */
+} CRTC_INFO;                      /* 59 bytes total                     */
 #pragma pack()
 
 /* Standard 60 Hz CRTC timings for common resolutions (VESA DMT) */
@@ -121,6 +134,7 @@ typedef struct {
     unsigned short pitch;       /* bytes per scan line */
     unsigned long  lfb_phys;
     unsigned long  lfb_size;
+    unsigned long  max_pixel_clock; /* VBE 3.0: max pixel clock Hz, 0 if N/A */
 } ModeEntry;
 
 static ModeEntry g_modes[MAX_MODES];
@@ -128,6 +142,7 @@ static int       g_num_modes = 0;
 
 /* ===== VBE 3.0 state ===== */
 static int           g_vbe3         = 0;    /* non-zero when VBE >= 3.0     */
+static int           g_no_crtc      = 0;    /* non-zero to skip CRTC override */
 static unsigned short g_vbe_version = 0;    /* raw VBE version (BCD)        */
 static int           g_pmi_ok       = 0;    /* non-zero when PMI available  */
 static unsigned short g_pmi_rm_seg  = 0;    /* real-mode segment of PMI tbl */
@@ -567,7 +582,7 @@ static void setup_palette(void)
 
 static void draw_demo(unsigned char *fb, int xres, int yres, int pitch,
                       unsigned short mode_num, int idx, int total,
-                      unsigned char *font)
+                      unsigned char *font, int crtc_used)
 {
     int scale, title_h, info_h;
     int top_y, bot_y, avail_h;
@@ -673,10 +688,9 @@ static void draw_demo(unsigned char *fb, int xres, int yres, int pitch,
 
     /* --- footer: VBE version + PMI + CRTC status (+ keyhelp if room) --- */
     {
-        const CRTC_INFO *crtc = find_crtc((unsigned short)xres, (unsigned short)yres);
         int vmaj = g_vbe_version >> 8, vmin = g_vbe_version & 0xFF;
         const char *pmi_s  = g_pmi_ok ? "YES" : "NO ";
-        const char *crtc_s = (g_vbe3 && crtc) ? "60Hz" : "N/A";
+        const char *crtc_s = crtc_used ? "60Hz" : "N/A";
         /* choose footer length based on available pixels (8px per char) */
         if ((int)xres >= 56 * 8)
             sprintf(buf, "VBE %d.%d  PMI:%s  CRTC:%s    [any key=next  ESC=quit]",
@@ -716,7 +730,7 @@ static void sort_modes(void)
 
 /* ===== Main ===== */
 
-int main(void)
+int main(int argc, char *argv[])
 {
     VBEInfo      vbe;
     VBEModeInfo  mi;
@@ -725,6 +739,14 @@ int main(void)
     unsigned long  seg, off;
     int i, count, ch;
     unsigned char *font;
+
+    /* Parse command-line flags */
+    for (i = 1; i < argc; i++) {
+        if (stricmp(argv[i], "-nocrtc") == 0 ||
+            stricmp(argv[i], "/nocrtc") == 0) {
+            g_no_crtc = 1;
+        }
+    }
 
     printf("VESADEMO - VESA LFB 8bpp Resolution Demo\n");
     printf("=========================================\n\n");
@@ -754,6 +776,8 @@ int main(void)
     printf("VBE version : %d.%d%s\n",
            vbe.vbe_version >> 8, vbe.vbe_version & 0xFF,
            g_vbe3 ? " (VBE 3.0 features enabled)" : "");
+    if (g_no_crtc)
+        printf("CRTC override: disabled by -nocrtc flag\n");
     printf("Video memory: %u KB\n", (unsigned)vbe.total_memory * 64);
 
     if (vbe.vbe_version < 0x0200) {
@@ -808,12 +832,32 @@ int main(void)
         g_modes[g_num_modes].lfb_size =
             ((unsigned long)mi.bytes_per_scan_line * mi.y_resolution
              + 4095UL) & ~4095UL;   /* round up to page */
+        g_modes[g_num_modes].max_pixel_clock =
+            g_vbe3 ? mi.max_pixel_clock : 0;
 
-        printf("  0x%03X : %4ux%-4u  pitch=%-5u  LFB=0x%08lX\n",
-               mode_list[i],
-               (unsigned)mi.x_resolution, (unsigned)mi.y_resolution,
-               (unsigned)mi.bytes_per_scan_line,
-               mi.phys_base_ptr);
+        {
+            const CRTC_INFO *crtc = find_crtc(mi.x_resolution, mi.y_resolution);
+            printf("  0x%03X : %4ux%-4u  pitch=%-5u  LFB=0x%08lX",
+                   mode_list[i],
+                   (unsigned)mi.x_resolution, (unsigned)mi.y_resolution,
+                   (unsigned)mi.bytes_per_scan_line,
+                   mi.phys_base_ptr);
+            if (g_vbe3) {
+                printf("  MaxClk=%lu", mi.max_pixel_clock);
+                if (crtc) {
+                    if (g_no_crtc)
+                        printf("  CRTC:disabled");
+                    else if (mi.max_pixel_clock &&
+                             crtc->pixel_clock > mi.max_pixel_clock)
+                        printf("  CRTC:clk-exceeds");
+                    else
+                        printf("  CRTC:avail");
+                } else {
+                    printf("  CRTC:no-timing");
+                }
+            }
+            printf("\n");
+        }
 
         g_num_modes++;
     }
@@ -837,17 +881,34 @@ int main(void)
     for (i = 0; i < g_num_modes; i++) {
         unsigned char *lfb;
         int set_ok;
+        int crtc_used = 0;
 
-        /* VBE 3.0: use CRTC timing if we have a table entry for this resolution */
-        if (g_vbe3) {
+        /*
+         * VBE 3.0: attempt CRTC timing override if available and allowed.
+         * If the CRTC mode set fails, fall back to standard mode set.
+         * Some BIOSes (notably ATI/AMD) report VBE 3.0 but do not
+         * properly support the CRTC override (bit 11 of BX).
+         */
+        if (g_vbe3 && !g_no_crtc) {
             const CRTC_INFO *crtc = find_crtc(g_modes[i].xres, g_modes[i].yres);
-            if (crtc)
-                set_ok = vbe_set_mode_crtc(g_modes[i].number, crtc);
-            else
-                set_ok = vbe_set_mode(g_modes[i].number);
-        } else {
-            set_ok = vbe_set_mode(g_modes[i].number);
+            if (crtc) {
+                int clk_ok = 1;
+                /* Validate against MaxPixelClock if reported */
+                if (g_modes[i].max_pixel_clock &&
+                    crtc->pixel_clock > g_modes[i].max_pixel_clock)
+                    clk_ok = 0;
+
+                if (clk_ok) {
+                    set_ok = vbe_set_mode_crtc(g_modes[i].number, crtc);
+                    if (set_ok)
+                        crtc_used = 1;
+                }
+            }
         }
+
+        /* Standard mode set (no CRTC): used as primary or fallback */
+        if (!crtc_used)
+            set_ok = vbe_set_mode(g_modes[i].number);
 
         if (!set_ok) continue;
 
@@ -865,7 +926,7 @@ int main(void)
 
         draw_demo(lfb, g_modes[i].xres, g_modes[i].yres,
                   g_modes[i].pitch, g_modes[i].number,
-                  i + 1, g_num_modes, font);
+                  i + 1, g_num_modes, font, crtc_used);
 
         ch = getch();
 
