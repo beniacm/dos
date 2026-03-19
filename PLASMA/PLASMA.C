@@ -312,40 +312,40 @@ static int query_pmi(void)
     return 1;
 }
 
-/* Call a real-mode far procedure via DPMI 0301h.
- * Avoids INT 10h dispatch overhead vs dpmi_real_int (0300h). */
-static int dpmi_call_rm_proc(RMI *rmi)
-{
-    union REGS  r;
-    struct SREGS sr;
-    segread(&sr);
-    memset(&r, 0, sizeof(r));
-    r.x.eax = 0x0301;
-    r.x.ebx = 0;          /* BH = flags = 0 */
-    r.x.ecx = 0;          /* no stack words to copy */
-    r.x.edi = (unsigned int)rmi;
-    int386x(0x31, &r, &r, &sr);
-    return !(r.x.cflag);
-}
-
 /*
- * VBE 3.0 PMI page flip: call SetDisplayStart entry directly via
- * DPMI 0301h (call real-mode far procedure).  Bypasses the INT 10h
- * dispatch and VBE function-number lookup — faster per-frame.
+ * VBE 3.0 PMI: direct 32-bit protected-mode call.
+ *
+ * The PMI table returned by INT 10h AX=4F0Ah contains 32-bit PM code
+ * that does direct port I/O to the video hardware (CRTC registers).
+ * It lives in the BIOS ROM area (typically 0xC0000–0xCFFFF), which is
+ * accessible via the flat memory model.
+ *
+ * The correct calling convention is a near CALL in 32-bit PM — NOT
+ * DPMI 0300h/0301h (those are for real-mode code).  Registers follow
+ * the same convention as INT 10h VBE calls.
+ *
+ * Requires ring 0 (PMODE/W) for the direct port I/O in the PMI code.
  */
+unsigned long _pmi_call4(unsigned long entry, unsigned long eax,
+                         unsigned long ebx,  unsigned long ecx,
+                         unsigned long edx);
+#pragma aux _pmi_call4 = \
+    "call esi"           \
+    parm [esi] [eax] [ebx] [ecx] [edx] \
+    value [eax]          \
+    modify [ebx ecx edx esi edi]
+
 static int pmi_set_display_start(unsigned short cx, unsigned short dy,
                                  int wait)
 {
-    RMI rmi;
-    memset(&rmi, 0, sizeof(rmi));
-    rmi.eax = 0x4F07;
-    rmi.ebx = wait ? 0x0080UL : 0x0000UL;
-    rmi.ecx = (unsigned long)cx;
-    rmi.edx = (unsigned long)dy;
-    rmi.cs  = g_pmi_rm_seg;
-    rmi.ip  = g_pmi_rm_off + g_pmi_setds_off;
-    if (!dpmi_call_rm_proc(&rmi)) return 0;
-    return ((rmi.eax & 0xFFFF) == 0x004F);
+    unsigned long entry = (unsigned long)g_pmi_rm_seg * 16
+                        + g_pmi_rm_off + g_pmi_setds_off;
+    unsigned long result;
+    result = _pmi_call4(entry, 0x4F07,
+                        wait ? 0x0080UL : 0x0000UL,
+                        (unsigned long)cx,
+                        (unsigned long)dy);
+    return ((result & 0xFFFF) == 0x004F);
 }
 
 /* --------------------------------------------------------------------------
@@ -854,16 +854,23 @@ int main(int argc, char *argv[])
            g_force_vbe2 ? " (VBE 3.0 disabled by -vbe2)" : "");
     printf("Video memory: %u KB\n", (unsigned)vbi.total_memory * 64);
 
-    /* VBE 3.0: query Protected Mode Interface */
+    /* VBE 3.0: query Protected Mode Interface
+     * PMI code does direct port I/O — requires ring 0 (PMODE/W). */
     if (g_vbe3 && !g_no_pmi) {
-        g_pmi_ok = query_pmi();
-        if (g_pmi_ok)
-            printf("PMI        : available at %04X:%04X  SetDisplayStart=%04X\n",
-                   g_pmi_rm_seg, g_pmi_rm_off, g_pmi_setds_off);
-        else
-            printf("PMI        : not available\n");
+        if ((_get_cs() & 3) != 0) {
+            printf("PMI        : skipped (ring 3 — needs PMODE/W for direct I/O)\n");
+        } else {
+            g_pmi_ok = query_pmi();
+            if (g_pmi_ok) {
+                unsigned long entry = (unsigned long)g_pmi_rm_seg * 16
+                                    + g_pmi_rm_off + g_pmi_setds_off;
+                printf("PMI        : available, entry at 0x%08lX (linear)\n", entry);
+            } else {
+                printf("PMI        : not available\n");
+            }
+        }
     } else if (g_no_pmi) {
-        printf("PMI        : disabled (use -pmi to enable; may crash on ATI ATOMBIOS)\n");
+        printf("PMI        : disabled (use -pmi to enable)\n");
     }
 
     {
