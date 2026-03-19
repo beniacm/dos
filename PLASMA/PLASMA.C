@@ -1013,24 +1013,27 @@ static double tsc_to_ms(unsigned long lo1, unsigned long hi1,
  * Called in text mode before graphics.  Takes ~220ms. */
 static void calibrate_rdtsc(void)
 {
-    clock_t t0, t1;
+    /* Use BIOS tick counter at 0x46C (18.2065 Hz) directly — avoids any
+     * CLOCKS_PER_SEC ambiguity in the C runtime.                          */
+    volatile unsigned long *bios_ticks = (volatile unsigned long *)0x46CUL;
+    unsigned long bt0, bt1;
     unsigned long lo0, hi0, lo1, hi1;
     double elapsed_s, cycles;
 
-    /* Synchronise to a tick edge */
-    t0 = clock();
-    while ((t1 = clock()) == t0) {}
+    /* Sync to a tick edge */
+    bt0 = *bios_ticks;
+    while (*bios_ticks == bt0) {}
 
-    /* Now measure over ~4 ticks (~220 ms) for good accuracy */
+    /* Measure over 4 BIOS ticks = exactly 4/18.2065 s ≈ 219.7 ms */
     rdtsc_read(&lo0, &hi0);
-    t0 = t1;
-    while ((t1 = clock()) - t0 < 4) {}
+    bt0 = *bios_ticks;
+    while ((bt1 = *bios_ticks) - bt0 < 4) {}
     rdtsc_read(&lo1, &hi1);
 
-    elapsed_s = (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
+    elapsed_s = (double)(bt1 - bt0) / 18.2065;
     cycles    = (double)hi1 * 4294967296.0 + (double)lo1
               - (double)hi0 * 4294967296.0 - (double)lo0;
-    g_rdtsc_mhz = cycles / elapsed_s / 1.0e6;
+    g_rdtsc_mhz = (elapsed_s > 0.0) ? cycles / elapsed_s / 1.0e6 : 0.0;
 }
 
 /* --------------------------------------------------------------------------
@@ -1464,7 +1467,9 @@ int main(int argc, char *argv[])
         printf("==========================================\n");
         printf(" PLASMA - Feature Summary\n");
         printf("==========================================\n");
-        printf(" CPU          : %.0f MHz\n", g_rdtsc_mhz);
+        printf(" CPU          : %.0f MHz%s\n", g_rdtsc_mhz,
+               (g_rdtsc_mhz < 100.0 || g_rdtsc_mhz > 10000.0)
+                   ? " (emulator - timing unreliable)" : "");
         printf(" VBE version  : %d.%d%s\n",
                g_vbe_version >> 8, g_vbe_version & 0xFF,
                g_force_vbe2 ? " (forced VBE 2.0)" : "");
@@ -1485,8 +1490,11 @@ int main(int argc, char *argv[])
         printf("==========================================\n");
         /* Benchmark results */
         if (g_bench_combined_ms > 0.0) {
-            double r_pct = g_bench_render_ms   / g_bench_combined_ms * 100.0;
-            double b_pct = g_bench_blit_ms     / g_bench_combined_ms * 100.0;
+            double r_fps  = g_bench_render_ms   > 0.0 ? 1000.0 / g_bench_render_ms   : 0.0;
+            double b_fps  = g_bench_blit_ms     > 0.0 ? 1000.0 / g_bench_blit_ms     : 0.0;
+            double c_fps  = g_bench_combined_ms > 0.0 ? 1000.0 / g_bench_combined_ms : 0.0;
+            double r_pct  = g_bench_render_ms   / g_bench_combined_ms * 100.0;
+            double b_pct  = g_bench_blit_ms     / g_bench_combined_ms * 100.0;
             unsigned long blit_mbs = g_bench_blit_ms > 0.0
                 ? (unsigned long)(PIXELS / 1024.0 / 1024.0 / (g_bench_blit_ms / 1000.0))
                 : 0UL;
@@ -1494,19 +1502,18 @@ int main(int argc, char *argv[])
                              (b_pct >= 60.0) ? "BLIT"   : "balanced";
             printf("==========================================\n");
             printf(" Benchmark (%d frames, sysram+blit)\n", BENCH_FRAMES);
-            printf("  Render : %5.2f ms  %4.0f FPS  (%3.0f%%)\n",
-                   g_bench_render_ms,
-                   g_bench_render_ms > 0.0 ? 1000.0 / g_bench_render_ms : 0.0,
-                   r_pct);
+            printf("  Render : %8.3f ms  %7.2f FPS\n",
+                   g_bench_render_ms, r_fps);
             if (g_bench_blit_ms > 0.0)
-                printf("  Blit   : %5.2f ms  %4.0f FPS  (%3.0f%%)  %lu MB/s\n",
-                       g_bench_blit_ms,
-                       1000.0 / g_bench_blit_ms, b_pct, blit_mbs);
+                printf("  Blit   : %8.3f ms  %7.2f FPS  %lu MB/s\n",
+                       g_bench_blit_ms, b_fps, blit_mbs);
             else
-                printf("  Blit   : <0.01 ms  (sub-us, RDTSC not calibrated)\n");
-            printf("  Total  : %5.2f ms  %4.0f FPS  bottleneck: %s\n",
-                   g_bench_combined_ms,
-                   1000.0 / g_bench_combined_ms, bn);
+                printf("  Blit   : <0.001 ms  (sub-us, fast emulator RAM)\n");
+            printf("  Total  : %8.3f ms  %7.2f FPS  bottleneck: %s\n",
+                   g_bench_combined_ms, c_fps, bn);
+            printf("  Share  : render %3.0f%%  blit %3.0f%%\n",
+                   r_pct > 0.0 ? r_pct : 0.0,
+                   b_pct > 0.0 ? b_pct : 0.0);
         }
         printf("==========================================\n");
         printf(" Controls: [V] toggle vsync  [ESC] quit\n");
