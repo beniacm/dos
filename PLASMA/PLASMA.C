@@ -878,6 +878,11 @@ static unsigned char  g_xdist[WIDTH];        /* 1 KB — always L1-hot        */
 static unsigned char  g_ydist[HEIGHT];       /* 768 B — always L1-hot       */
 static unsigned char *g_dist  = NULL;        /* WIDTH*HEIGHT Euclidean dist  */
 
+/* Benchmark results — filled by run_benchmark(), shown in summary */
+static double g_bench_render_ms   = 0.0;
+static double g_bench_blit_ms     = 0.0;
+static double g_bench_combined_ms = 0.0;
+
 static void init_plasma_tables(void)
 {
     int x, y;
@@ -991,80 +996,41 @@ static void blit_to_lfb(unsigned char *lfb, int lfb_pitch,
 static void run_benchmark(unsigned char *lfb, int lfb_pitch)
 {
     clock_t  t0, t1;
-    double   render_ms, blit_ms, combined_ms;
-    double   render_fps, blit_fps, combined_fps;
     unsigned char *tmp;
     int      i;
-    const char *bottleneck;
 
-    /* Allocate a temporary sysram buffer if needed */
     tmp = (unsigned char *)malloc(PIXELS);
-    if (!tmp) {
-        printf("  (benchmark skipped: out of memory)\n");
-        return;
-    }
+    if (!tmp) return;
     memset(tmp, 0x80, PIXELS);
 
-    printf("\n--- Startup Benchmark (%d frames, 1024x768 8bpp) ---\n",
-           BENCH_FRAMES);
+    /* Warm up */
+    render_plasma(tmp, WIDTH, 0);
+    blit_to_lfb(lfb, lfb_pitch, tmp);
 
-    /* --- Render only (no blit, writes to sysram) --- */
-    render_plasma(tmp, WIDTH, 0);   /* warm up caches */
+    /* Render only */
     t0 = clock();
     for (i = 0; i < BENCH_FRAMES; i++)
         render_plasma(tmp, WIDTH, (unsigned int)i * 3);
     t1 = clock();
-    render_ms  = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC / BENCH_FRAMES;
-    render_fps = render_ms > 0.0 ? 1000.0 / render_ms : 0.0;
+    g_bench_render_ms = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC / BENCH_FRAMES;
 
-    /* --- Blit only (sysram -> VRAM, no render) --- */
-    blit_to_lfb(lfb, lfb_pitch, tmp);  /* warm up VRAM write path */
+    /* Blit only */
     t0 = clock();
     for (i = 0; i < BENCH_FRAMES; i++)
         blit_to_lfb(lfb, lfb_pitch, tmp);
     t1 = clock();
-    blit_ms  = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC / BENCH_FRAMES;
-    blit_fps = blit_ms > 0.0 ? 1000.0 / blit_ms : 0.0;
+    g_bench_blit_ms = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC / BENCH_FRAMES;
 
-    /* --- Render + Blit combined (matches real demo loop) --- */
+    /* Combined */
     t0 = clock();
     for (i = 0; i < BENCH_FRAMES; i++) {
         render_plasma(tmp, WIDTH, (unsigned int)i * 3);
         blit_to_lfb(lfb, lfb_pitch, tmp);
     }
     t1 = clock();
-    combined_ms  = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC / BENCH_FRAMES;
-    combined_fps = combined_ms > 0.0 ? 1000.0 / combined_ms : 0.0;
+    g_bench_combined_ms = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC / BENCH_FRAMES;
 
     free(tmp);
-
-    /* Identify bottleneck */
-    if (combined_ms > 0.0) {
-        double render_share = render_ms / combined_ms;
-        double blit_share   = blit_ms   / combined_ms;
-        if (render_share >= 0.60)      bottleneck = "RENDER";
-        else if (blit_share >= 0.60)   bottleneck = "BLIT";
-        else                            bottleneck = "balanced";
-    } else {
-        bottleneck = "?";
-    }
-
-    printf("  Render only : %5.2f ms/frame  ->  %5.0f FPS\n",
-           render_ms, render_fps);
-    printf("  Blit only   : %5.2f ms/frame  ->  %5.0f FPS"
-           "  (%lu MB/s)\n",
-           blit_ms, blit_fps,
-           blit_ms > 0.0
-               ? (unsigned long)(PIXELS / 1024.0 / 1024.0
-                                 / (blit_ms / 1000.0))
-               : 0UL);
-    printf("  Combined    : %5.2f ms/frame  ->  %5.0f FPS"
-           "  (bottleneck: %s)\n",
-           combined_ms, combined_fps, bottleneck);
-    printf("  Render %%    : %.0f%%   Blit %%: %.0f%%\n",
-           combined_ms > 0.0 ? render_ms / combined_ms * 100.0 : 0.0,
-           combined_ms > 0.0 ? blit_ms   / combined_ms * 100.0 : 0.0);
-    printf("----------------------------------------------------\n");
 }
 
 /* --------------------------------------------------------------------------
@@ -1298,9 +1264,6 @@ int main(int argc, char *argv[])
         printf("MTRR WC    : disabled by -nomtrr\n");
     }
 
-    /* ---- Startup performance benchmark --------------------------------- */
-    run_benchmark(lfb, lfb_pitch);
-
     /* ---- Brief mode set to test page-flip features --------------------- */
     if (!vbe_set_mode(target_mode)) {
         dpmi_unmap_physical(lfb);
@@ -1379,6 +1342,9 @@ int main(int argc, char *argv[])
         printf("HW flip    : disabled (no page flip support)\n");
         g_hw_flip = 0;
     }
+
+    /* ---- Startup benchmark (while in graphics mode — safe VRAM writes) - */
+    run_benchmark(lfb, lfb_pitch);
 
     /* Return to text mode for feature summary */
     vbe_set_text_mode();
@@ -1460,6 +1426,27 @@ int main(int argc, char *argv[])
         printf(" HW flip      : %s\n", hwflip_str);
         printf(" Buffering    : %s\n", buf_str);
         printf(" Render       : %s\n", render_str);
+        printf("==========================================\n");
+        /* Benchmark results */
+        if (g_bench_combined_ms > 0.0) {
+            double r_pct = g_bench_render_ms   / g_bench_combined_ms * 100.0;
+            double b_pct = g_bench_blit_ms     / g_bench_combined_ms * 100.0;
+            unsigned long blit_mbs = (unsigned long)(
+                PIXELS / 1024.0 / 1024.0 / (g_bench_blit_ms / 1000.0));
+            const char *bn = (r_pct >= 60.0) ? "RENDER" :
+                             (b_pct >= 60.0) ? "BLIT"   : "balanced";
+            printf("==========================================\n");
+            printf(" Benchmark (%d frames, sysram+blit)\n", BENCH_FRAMES);
+            printf("  Render : %5.2f ms  %4.0f FPS  (%3.0f%%)\n",
+                   g_bench_render_ms,
+                   1000.0 / g_bench_render_ms, r_pct);
+            printf("  Blit   : %5.2f ms  %4.0f FPS  (%3.0f%%)  %lu MB/s\n",
+                   g_bench_blit_ms,
+                   1000.0 / g_bench_blit_ms, b_pct, blit_mbs);
+            printf("  Total  : %5.2f ms  %4.0f FPS  bottleneck: %s\n",
+                   g_bench_combined_ms,
+                   1000.0 / g_bench_combined_ms, bn);
+        }
         printf("==========================================\n");
         printf(" Controls: [V] toggle vsync  [ESC] quit\n");
         printf("==========================================\n");
