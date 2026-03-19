@@ -25,7 +25,11 @@
  *   ESC   = quit
  *
  * Options:
- *   -vbe2 = force VBE 2.0 mode (disable VBE 3.0 PMI)
+ *   -vbe2       = force VBE 2.0 mode (disable VBE 3.0 features)
+ *   -pmi        = enable VBE 3.0 Protected Mode Interface
+ *   -nopmi      = disable PMI (default)
+ *   -nomtrr     = skip MTRR write-combining setup
+ *   -directvram = render directly to VRAM (slow, for benchmarking)
  *
  * Build:
  *   wcc386 -bt=dos -3r -ox -s -zq PLASMA.C
@@ -849,7 +853,7 @@ int main(int argc, char *argv[])
     int            lfb_pitch;
     unsigned long  lfb_phys;
     unsigned char *lfb;
-    unsigned char *frame_buf;       /* system-RAM render buffer          */
+    unsigned char *frame_buf = NULL; /* system-RAM render buffer          */
     unsigned char  pal[256*4];
     unsigned char *font;
     char           msg[96];
@@ -1066,51 +1070,154 @@ int main(int argc, char *argv[])
         printf("MTRR WC    : disabled by -nomtrr\n");
     }
 
-    /* ---- Set video mode ------------------------------------------------ */
+    /* ---- Brief mode set to test page-flip features --------------------- */
     if (!vbe_set_mode(target_mode)) {
         dpmi_unmap_physical(lfb);
-        free(frame_buf);
+        if (frame_buf) free(frame_buf);
         free(g_dist);
         dpmi_free_dos();
         printf("Set mode 0x%03X failed\n", target_mode);
         return 1;
     }
 
-    /* ---- Test VBE 4F07h support (must be after set mode) -------------- */
+    /* Test DAC width (needs VBE mode active) */
+    init_dac();
+
+    /* Test VBE 4F07h page-flip support (needs VBE mode active) */
     if (use_doublebuf) {
         if (!vbe_set_display_start(0, 0, 0)) {
-            printf("4F07h not supported - falling back to double-buffer (sysram+blit only)\n");
             use_doublebuf = 0;
         } else {
-            back_page = 1;   /* start rendering into page 1 */
             /* Test PMI SetDisplayStart if available */
             if (g_pmi_ok) {
                 if (!pmi_set_display_start(0, 0, 0)) {
-                    printf("PMI SetDisplayStart failed - using standard 4F07h\n");
                     g_pmi_ok = 0;
-                    /* Reset display start via standard call */
                     vbe_set_display_start(0, 0, 0);
                 }
             }
-            /* Test VBE 3.0 scheduled flip (BL=02h) for true triple buffering */
+            /* Test VBE 3.0 scheduled flip (BL=02h).
+             * Use dy=HEIGHT (page 1) to avoid BIOSes that may reject
+             * a no-op flip to the already-displayed page. */
             if (g_vbe3) {
                 int sched_ok;
                 if (g_pmi_ok)
-                    sched_ok = pmi_schedule_display_start(0, 0);
+                    sched_ok = pmi_schedule_display_start(0,
+                                   (unsigned short)HEIGHT);
                 else
-                    sched_ok = vbe_schedule_display_start(0, 0);
+                    sched_ok = vbe_schedule_display_start(0,
+                                   (unsigned short)HEIGHT);
                 if (sched_ok) {
                     g_sched_flip = 1;
-                    printf("Sched flip : VBE 3.0 BL=02h supported (non-blocking vsync)\n");
-                } else {
-                    printf("Sched flip : VBE 3.0 BL=02h not supported\n");
+                    /* Wait for test flip, then reset to page 0 */
+                    if (g_pmi_ok) {
+                        while (!pmi_is_flip_complete()) {}
+                        pmi_set_display_start(0, 0, 0);
+                    } else {
+                        while (!vbe_is_flip_complete()) {}
+                        vbe_set_display_start(0, 0, 0);
+                    }
                 }
             }
         }
     }
 
-    /* ---- Palette ------------------------------------------------------- */
+    /* Return to text mode for feature summary */
+    vbe_set_text_mode();
+
+    /* ---- Feature Summary ----------------------------------------------- */
+    {
+        const char *ring_str  = ((_get_cs() & 3) == 0) ?
+                                "0 (PMODE/W)" : "3 (DOS4GW)";
+        const char *pmi_str, *mtrr_str, *flip_str;
+        const char *sched_str, *buf_str, *render_str;
+
+        if (g_pmi_ok)
+            pmi_str = "available";
+        else if (g_no_pmi)
+            pmi_str = "disabled (use -pmi to enable)";
+        else if (g_force_vbe2)
+            pmi_str = "disabled (-vbe2)";
+        else if ((_get_cs() & 3) != 0)
+            pmi_str = "skipped (ring 3)";
+        else
+            pmi_str = "not available";
+
+        if (g_mtrr_wc == 1)
+            mtrr_str = "enabled by us";
+        else if (g_mtrr_wc == 2)
+            mtrr_str = "already active (BIOS)";
+        else if (g_no_mtrr)
+            mtrr_str = "disabled (-nomtrr)";
+        else if ((_get_cs() & 3) != 0)
+            mtrr_str = "skipped (ring 3)";
+        else
+            mtrr_str = "not available";
+
+        flip_str = use_doublebuf ? "yes (4F07h)" : "no";
+
+        if (g_sched_flip)
+            sched_str = "yes (BL=02h)";
+        else if (!g_vbe3)
+            sched_str = "n/a (VBE 2.0)";
+        else if (!use_doublebuf)
+            sched_str = "n/a (no page flip)";
+        else
+            sched_str = "not supported";
+
+        if (g_direct_vram)
+            buf_str = use_doublebuf ? "double (2x VRAM)" :
+                                      "single (1x VRAM)";
+        else
+            buf_str = use_doublebuf ? "triple (sysram + 2x VRAM)" :
+                                      "double (sysram + 1x VRAM)";
+
+        render_str = g_direct_vram ? "direct-to-VRAM (-directvram)" :
+                                     "system-RAM + blit";
+
+        printf("\n");
+        printf("==========================================\n");
+        printf(" PLASMA - Feature Summary\n");
+        printf("==========================================\n");
+        printf(" VBE version  : %d.%d%s\n",
+               g_vbe_version >> 8, g_vbe_version & 0xFF,
+               g_force_vbe2 ? " (forced VBE 2.0)" : "");
+        printf(" Video memory : %u KB\n", (unsigned)vbi.total_memory * 64);
+        printf(" Mode         : 0x%03X  %dx%d %dbpp\n",
+               target_mode, WIDTH, HEIGHT, 8);
+        printf(" LFB          : 0x%08lX  pitch=%d\n",
+               lfb_phys, lfb_pitch);
+        printf(" DAC          : %d-bit\n", g_dac_bits);
+        printf(" Ring         : %s\n", ring_str);
+        printf(" PMI          : %s\n", pmi_str);
+        printf(" MTRR WC      : %s\n", mtrr_str);
+        printf(" Page flip    : %s\n", flip_str);
+        printf(" Sched flip   : %s\n", sched_str);
+        printf(" Buffering    : %s\n", buf_str);
+        printf(" Render       : %s\n", render_str);
+        printf("==========================================\n");
+        printf(" Controls: [V] toggle vsync  [ESC] quit\n");
+        printf("==========================================\n");
+        printf("\n Press any key to start...");
+    }
+    getch();
+
+    /* ---- Set video mode (for the demo) --------------------------------- */
+    if (!vbe_set_mode(target_mode)) {
+        dpmi_unmap_physical(lfb);
+        if (frame_buf) free(frame_buf);
+        free(g_dist);
+        dpmi_free_dos();
+        return 1;
+    }
+
+    /* Re-initialize DAC and display start for the demo */
     init_dac();
+    if (use_doublebuf) {
+        vbe_set_display_start(0, 0, 0);
+        back_page = 1;
+    }
+
+    /* ---- Palette ------------------------------------------------------- */
     build_plasma_palette(pal);
     vbe_set_palette(0, 256, pal);
 
@@ -1250,12 +1357,13 @@ int main(int argc, char *argv[])
     free(g_dist);
     dpmi_free_dos();
 
-    printf("PLASMA done.  mode=0x%03X  DAC=%d-bit  buf:%s  PMI:%s  WC:%s  render:%s\n",
+    printf("PLASMA done.  mode=0x%03X  DAC=%d-bit  buf:%s  PMI:%s  WC:%s  sched:%s  render:%s\n",
            target_mode, g_dac_bits,
            g_direct_vram ? (use_doublebuf ? "double" : "single") :
                            (use_doublebuf ? "triple" : "double"),
            g_pmi_ok ? "yes" : "no",
            g_mtrr_wc == 1 ? "mtrr" : g_mtrr_wc == 2 ? "bios" : "no",
+           g_sched_flip ? "yes" : "no",
            g_direct_vram ? "direct" : "sysram");
     return 0;
 }
