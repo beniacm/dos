@@ -623,6 +623,7 @@ static int           g_mtrr_slot = -1;
 static unsigned long g_mtrr_save_base_lo, g_mtrr_save_base_hi;
 static unsigned long g_mtrr_save_mask_lo, g_mtrr_save_mask_hi;
 static int           g_mtrr_wc = 0;  /* 0=off, 1=set by us, 2=already set */
+static int           g_mtrr_replaced_uc = 0; /* 1 if we replaced a BIOS UC entry */
 
 static unsigned long next_pow2(unsigned long v)
 {
@@ -638,11 +639,18 @@ static unsigned long next_pow2(unsigned long v)
  *  Returns:  1 = WC enabled by us
  *           -1 = WC already active (BIOS/chipset)
  *            0 = not possible (ring 3, no MTRR, no free slot, etc.)
+ *
+ * Intel MTRR overlap rule: if two entries cover the same address, the result
+ * type is the LOWEST-priority type (UC=0 beats WC=1 beats everything else).
+ * So adding WC alongside an existing UC for the same range does NOTHING.
+ * Fix: scan for a conflicting UC MTRR covering our LFB and replace it in-place
+ * with WC.  Only fall back to a free slot if no UC conflict is found.
  */
 static int setup_mtrr_wc(unsigned long phys_addr, unsigned long vram_bytes)
 {
     unsigned long cap_lo, size, mask_val;
     int num_var, i;
+    int free_slot = -1, replace_slot = -1;
 
     /* Ring 0 required for RDMSR/WRMSR */
     if ((_get_cs() & 3) != 0) return 0;
@@ -658,52 +666,63 @@ static int setup_mtrr_wc(unsigned long phys_addr, unsigned long vram_bytes)
     if (!(cap_lo & (1UL << 10))) return 0;
     if (num_var == 0) return 0;
 
-    /* Check if an existing MTRR already covers our LFB as WC */
+    /* Compute WC range parameters (must do before scanning) */
+    size = next_pow2(vram_bytes);
+    if (phys_addr & (size - 1)) return 0;   /* must be naturally aligned */
+    mask_val = ~(size - 1) & 0xFFFFF000UL;
+
+    /* Single pass: look for existing WC covering us, a UC conflict, or a
+     * free slot.  Priority: WC already set > replace UC conflict > free slot */
     for (i = 0; i < num_var; i++) {
         unsigned long mlo = _rdmsr_lo(MSR_MTRR_PHYSMASK0 + i * 2);
         unsigned long blo = _rdmsr_lo(MSR_MTRR_PHYSBASE0 + i * 2);
-        if (!(mlo & 0x800)) continue;              /* not valid          */
-        if ((blo & 0xFF) != MTRR_TYPE_WC) continue; /* not WC            */
-        if ((phys_addr & (mlo & 0xFFFFF000UL)) ==
-            (blo & 0xFFFFF000UL)) {
+
+        if (!(mlo & 0x800)) {
+            /* Free slot — record first one found */
+            if (free_slot < 0) free_slot = i;
+            continue;
+        }
+
+        /* Check if this active MTRR's mask covers phys_addr */
+        if ((phys_addr & (mlo & 0xFFFFF000UL)) != (blo & 0xFFFFF000UL))
+            continue;
+
+        if ((blo & 0xFF) == MTRR_TYPE_WC) {
+            /* LFB already WC — nothing to do */
             g_mtrr_wc = 2;
-            return -1;                             /* already WC         */
+            return -1;
+        }
+
+        if ((blo & 0xFF) == 0 /* UC */) {
+            /* Conflicting UC entry — must replace to avoid overlap loss */
+            replace_slot = i;
         }
     }
 
-    /* Round VRAM size to power-of-2 (MTRR size constraint) */
-    size = next_pow2(vram_bytes);
-    if (phys_addr & (size - 1)) return 0;  /* must be naturally aligned */
+    /* Prefer replacing a conflicting UC over adding to a free slot */
+    i = (replace_slot >= 0) ? replace_slot : free_slot;
+    if (i < 0) return 0;   /* no usable slot */
 
-    mask_val = ~(size - 1) & 0xFFFFF000UL;
+    /* Save original values for cleanup on exit */
+    g_mtrr_save_base_lo = _rdmsr_lo(MSR_MTRR_PHYSBASE0 + i * 2);
+    g_mtrr_save_base_hi = _rdmsr_hi(MSR_MTRR_PHYSBASE0 + i * 2);
+    g_mtrr_save_mask_lo = _rdmsr_lo(MSR_MTRR_PHYSMASK0 + i * 2);
+    g_mtrr_save_mask_hi = _rdmsr_hi(MSR_MTRR_PHYSMASK0 + i * 2);
+    g_mtrr_slot = i;
+    g_mtrr_replaced_uc = (replace_slot >= 0) ? 1 : 0;
 
-    /* Find a free variable-range MTRR slot (valid bit clear) */
-    for (i = 0; i < num_var; i++) {
-        unsigned long mlo = _rdmsr_lo(MSR_MTRR_PHYSMASK0 + i * 2);
-        if (mlo & 0x800) continue;   /* slot in use */
+    /* Program MTRR: CLI, flush caches, write, flush, STI */
+    _disable();
+    _wbinvd();
+    _wrmsr_3(MSR_MTRR_PHYSBASE0 + i * 2,
+             (phys_addr & 0xFFFFF000UL) | MTRR_TYPE_WC, 0);
+    _wrmsr_3(MSR_MTRR_PHYSMASK0 + i * 2,
+             mask_val | 0x800, 0);
+    _wbinvd();
+    _enable();
 
-        /* Save original values for cleanup */
-        g_mtrr_save_base_lo = _rdmsr_lo(MSR_MTRR_PHYSBASE0 + i * 2);
-        g_mtrr_save_base_hi = _rdmsr_hi(MSR_MTRR_PHYSBASE0 + i * 2);
-        g_mtrr_save_mask_lo = mlo;
-        g_mtrr_save_mask_hi = _rdmsr_hi(MSR_MTRR_PHYSMASK0 + i * 2);
-        g_mtrr_slot = i;
-
-        /* Program MTRR: CLI, flush caches, write, flush, STI */
-        _disable();
-        _wbinvd();
-        _wrmsr_3(MSR_MTRR_PHYSBASE0 + i * 2,
-                 (phys_addr & 0xFFFFF000UL) | MTRR_TYPE_WC, 0);
-        _wrmsr_3(MSR_MTRR_PHYSMASK0 + i * 2,
-                 mask_val | 0x800, 0);
-        _wbinvd();
-        _enable();
-
-        g_mtrr_wc = 1;
-        return 1;
-    }
-
-    return 0;   /* no free slot */
+    g_mtrr_wc = 1;
+    return 1;
 }
 
 static void restore_mtrr(void)
@@ -1309,13 +1328,17 @@ int main(int argc, char *argv[])
     if (!g_no_mtrr) {
         unsigned long total_vram = (unsigned long)vbi.total_memory * 65536UL;
         int wc = setup_mtrr_wc(lfb_phys, total_vram);
-        if (wc == 1)
-            printf("MTRR WC    : enabled (slot %d, %luMB at 0x%08lX)\n",
-                   g_mtrr_slot, next_pow2(total_vram) >> 20, lfb_phys);
-        else if (wc == -1)
+        if (wc == 1) {
+            if (g_mtrr_replaced_uc)
+                printf("MTRR WC    : enabled (slot %d, replaced BIOS UC, %luMB at 0x%08lX)\n",
+                       g_mtrr_slot, next_pow2(total_vram) >> 20, lfb_phys);
+            else
+                printf("MTRR WC    : enabled (slot %d, new entry, %luMB at 0x%08lX)\n",
+                       g_mtrr_slot, next_pow2(total_vram) >> 20, lfb_phys);
+        } else if (wc == -1)
             printf("MTRR WC    : already active (BIOS/chipset)\n");
         else if ((_get_cs() & 3) != 0)
-            printf("MTRR WC    : skipped (ring 3 — use PMODE/W for ring 0)\n");
+            printf("MTRR WC    : skipped (ring 3 - use PMODE/W for ring 0)\n");
         else
             printf("MTRR WC    : not available\n");
     } else {
@@ -1427,7 +1450,8 @@ int main(int argc, char *argv[])
             pmi_str = "not available";
 
         if (g_mtrr_wc == 1)
-            mtrr_str = "enabled by us";
+            mtrr_str = g_mtrr_replaced_uc ? "enabled (replaced BIOS UC)"
+                                           : "enabled (new slot)";
         else if (g_mtrr_wc == 2)
             mtrr_str = "already active (BIOS)";
         else if (g_no_mtrr)
