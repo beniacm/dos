@@ -122,6 +122,7 @@ static int           g_vbe3         = 0;    /* non-zero when VBE >= 3.0     */
 static int           g_force_vbe2   = 0;    /* non-zero to disable VBE 3.0  */
 static int           g_no_pmi      = 0;    /* non-zero to skip PMI         */
 static int           g_no_mtrr     = 0;    /* non-zero to skip MTRR WC     */
+static int           g_direct_vram = 0;    /* non-zero to render direct to VRAM (slow, for comparison) */
 static unsigned short g_vbe_version = 0;    /* raw VBE version (BCD)        */
 static int           g_pmi_ok       = 0;    /* non-zero when PMI page-flip  */
 static unsigned short g_pmi_rm_seg  = 0;    /* real-mode segment of PMI tbl */
@@ -809,6 +810,10 @@ int main(int argc, char *argv[])
             stricmp(argv[i], "/nomtrr") == 0) {
             g_no_mtrr = 1;
         }
+        if (stricmp(argv[i], "-directvram") == 0 ||
+            stricmp(argv[i], "/directvram") == 0) {
+            g_direct_vram = 1;
+        }
     }
 
     /* Conventional DOS memory:
@@ -924,21 +929,25 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* ---- Allocate system-RAM frame buffer (always needed) ------------- */
+    /* ---- Allocate system-RAM frame buffer (skipped with -directvram) --- */
     /*
      * Rendering plasma directly into VRAM is extremely slow because LFB
      * writes are uncached (UC) or write-combining (WC).  Individual byte
      * writes at ~100ns each × 786K pixels ≈ 78ms/frame → ~13 FPS.
-     * Instead, always render into fast cached system RAM, then blit to
-     * VRAM in one sequential burst (WC-friendly memcpy).
+     * Instead, render into fast cached system RAM, then blit to VRAM in
+     * one sequential burst (WC-friendly memcpy).
+     * Use -directvram to measure the difference on real hardware.
      */
-    frame_buf = (unsigned char *)malloc(PIXELS);
-    if (!frame_buf) {
-        free(g_dist);
-        dpmi_free_dos();
-        printf("Out of memory (frame buffer)\n");
-        return 1;
+    if (!g_direct_vram) {
+        frame_buf = (unsigned char *)malloc(PIXELS);
+        if (!frame_buf) {
+            free(g_dist);
+            dpmi_free_dos();
+            printf("Out of memory (frame buffer)\n");
+            return 1;
+        }
     }
+    printf("Render     : %s\n", g_direct_vram ? "direct-to-VRAM (-directvram)" : "system-RAM + blit");
 
     printf("Initialising plasma tables...\n");
     init_plasma_tables();
@@ -1031,48 +1040,64 @@ int main(int argc, char *argv[])
             }
         }
 
-        /* --- Render plasma into system RAM (fast cached writes) --------- */
-        render_plasma(frame_buf, WIDTH, t);
-
-        /* --- HUD overlay (into system RAM) ------------------------------ */
-        {
-            const char *sync_str = vsync_on ? "ON " : "OFF";
-            const char *buf_str  = use_doublebuf ? "DBL" : "SGL";
-            const char *pmi_str  = g_pmi_ok ? "YES" : "NO ";
-            const char *wc_str   = g_mtrr_wc ? "YES" : "NO ";
-            sprintf(msg, "VSYNC:%s BUF:%s PMI:%s WC:%s FPS:%5.1f  [V]=vsync [ESC]=quit",
-                    sync_str, buf_str, pmi_str, wc_str, fps);
-            draw_str_bg(frame_buf, WIDTH, 4, 4, msg, 255, 0, font);
-        }
-
-        if (vsync_on) {
-            draw_str_2x(frame_buf, WIDTH, 4, 16,
-                        "VSYNC ON  - tearing suppressed   ",
-                        200, 0, font);
+        /* --- Render plasma ------------------------------------------------- */
+        /* With -directvram: render straight into VRAM (slow, for comparison).
+         * Normal:           render into system RAM, then blit to VRAM.       */
+        if (g_direct_vram) {
+            unsigned char *dst = lfb + (use_doublebuf ?
+                                  (unsigned long)back_page * page_size : 0UL);
+            if (vsync_on) wait_vsync();
+            render_plasma(dst, lfb_pitch, t);
+            /* No HUD in direct-VRAM mode (would need a scratch buffer) */
+            if (use_doublebuf) {
+                if (g_pmi_ok)
+                    pmi_set_display_start(0,
+                        (unsigned short)(back_page * HEIGHT), 0);
+                else
+                    vbe_set_display_start(0,
+                        (unsigned short)(back_page * HEIGHT), 0);
+                back_page = 1 - back_page;
+            }
         } else {
-            draw_str_2x(frame_buf, WIDTH, 4, 16,
-                        "VSYNC OFF - watch for tear line! ",
-                        240, 0, font);
-        }
+            render_plasma(frame_buf, WIDTH, t);
 
-        /* --- Present frame ---------------------------------------------- */
-        if (use_doublebuf) {
-            /* Blit from system RAM to VRAM back page (sequential, WC-fast) */
-            blit_to_lfb(lfb + (unsigned long)back_page * page_size,
-                        lfb_pitch, frame_buf);
-            /* Page flip: use PMI (faster) or standard VBE 4F07h */
-            if (g_pmi_ok)
-                pmi_set_display_start(0, (unsigned short)(back_page * HEIGHT),
-                                      vsync_on);
-            else
-                vbe_set_display_start(0, (unsigned short)(back_page * HEIGHT),
-                                      vsync_on);
-            back_page = 1 - back_page;          /* toggle for next frame   */
-        } else {
-            /* Single-buffer: optional software vsync + blit              */
-            if (vsync_on)
-                wait_vsync();
-            blit_to_lfb(lfb, lfb_pitch, frame_buf);
+            /* --- HUD overlay (into system RAM) -------------------------- */
+            {
+                const char *sync_str = vsync_on ? "ON " : "OFF";
+                const char *buf_str  = use_doublebuf ? "DBL" : "SGL";
+                const char *pmi_str  = g_pmi_ok ? "YES" : "NO ";
+                const char *wc_str   = g_mtrr_wc ? "YES" : "NO ";
+                sprintf(msg, "VSYNC:%s BUF:%s PMI:%s WC:%s FPS:%5.1f  [V]=vsync [ESC]=quit",
+                        sync_str, buf_str, pmi_str, wc_str, fps);
+                draw_str_bg(frame_buf, WIDTH, 4, 4, msg, 255, 0, font);
+            }
+
+            if (vsync_on) {
+                draw_str_2x(frame_buf, WIDTH, 4, 16,
+                            "VSYNC ON  - tearing suppressed   ",
+                            200, 0, font);
+            } else {
+                draw_str_2x(frame_buf, WIDTH, 4, 16,
+                            "VSYNC OFF - watch for tear line! ",
+                            240, 0, font);
+            }
+
+            /* --- Present frame ------------------------------------------ */
+            if (use_doublebuf) {
+                blit_to_lfb(lfb + (unsigned long)back_page * page_size,
+                            lfb_pitch, frame_buf);
+                if (g_pmi_ok)
+                    pmi_set_display_start(0,
+                        (unsigned short)(back_page * HEIGHT), vsync_on);
+                else
+                    vbe_set_display_start(0,
+                        (unsigned short)(back_page * HEIGHT), vsync_on);
+                back_page = 1 - back_page;
+            } else {
+                if (vsync_on)
+                    wait_vsync();
+                blit_to_lfb(lfb, lfb_pitch, frame_buf);
+            }
         }
 
         /* --- Advance animation ------------------------------------------ */
@@ -1093,14 +1118,15 @@ int main(int argc, char *argv[])
     vbe_set_text_mode();
     restore_mtrr();
     dpmi_unmap_physical(lfb);
-    free(frame_buf);
+    if (frame_buf) free(frame_buf);
     free(g_dist);
     dpmi_free_dos();
 
-    printf("PLASMA done.  mode=0x%03X  DAC=%d-bit  buf:%s  PMI:%s  WC:%s\n",
+    printf("PLASMA done.  mode=0x%03X  DAC=%d-bit  buf:%s  PMI:%s  WC:%s  render:%s\n",
            target_mode, g_dac_bits,
            use_doublebuf ? "double" : "single",
            g_pmi_ok ? "yes" : "no",
-           g_mtrr_wc == 1 ? "mtrr" : g_mtrr_wc == 2 ? "bios" : "no");
+           g_mtrr_wc == 1 ? "mtrr" : g_mtrr_wc == 2 ? "bios" : "no",
+           g_direct_vram ? "direct" : "sysram");
     return 0;
 }
