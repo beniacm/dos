@@ -1452,14 +1452,6 @@ static void update_player(float dt)
 
 static float g_zbuf[WIDTH];   /* wall distance per column (for sprites) */
 
-/* 4x4 ordered dither (Bayer) — threshold values 0..15 */
-static const unsigned char g_dither4[4][4] = {
-    { 0,  8,  2, 10},
-    {12,  4, 14,  6},
-    { 3, 11,  1,  9},
-    {15,  7, 13,  5}
-};
-
 static void render_floor_ceiling(unsigned char *buf)
 {
     int y;
@@ -1489,13 +1481,12 @@ static void render_floor_ceiling(unsigned char *buf)
             float fogF = rowDist * 0.8f;
             int fogBase = (int)fogF;
             int fogFrac = (int)((fogF - (float)fogBase) * 16.0f);
-            const unsigned char *drow = g_dither4[y & 3];
             if (fogBase > 12) { fogBase = 12; fogFrac = 0; }
             for (x = 0; x < WIDTH; x++) {
                 int tx = ((int)(fX * TEX_W)) & (TEX_W - 1);
                 int ty = ((int)(fY * TEX_H)) & (TEX_H - 1);
                 unsigned char c = g_floor_tex[ty][tx];
-                int fv = fogBase + (drow[x & 3] < fogFrac ? 1 : 0);
+                int fv = fogBase + ((hash2d(x, y) & 15) < fogFrac ? 1 : 0);
                 int sh = (c & 15) - fv;
                 if (sh < 0) sh = 0;
                 row[x] = (unsigned char)((c & 0xF0) + sh);
@@ -1506,13 +1497,12 @@ static void render_floor_ceiling(unsigned char *buf)
             float fogF = rowDist * 0.8f;
             int fogBase = (int)fogF;
             int fogFrac = (int)((fogF - (float)fogBase) * 16.0f);
-            const unsigned char *drow = g_dither4[y & 3];
             if (fogBase > 12) { fogBase = 12; fogFrac = 0; }
             for (x = 0; x < WIDTH; x++) {
                 int tx = ((int)(fX * TEX_W)) & (TEX_W - 1);
                 int ty = ((int)(fY * TEX_H)) & (TEX_H - 1);
                 unsigned char c = g_ceil_tex[ty][tx];
-                int fv = fogBase + (drow[x & 3] < fogFrac ? 1 : 0);
+                int fv = fogBase + ((hash2d(x, y) & 15) < fogFrac ? 1 : 0);
                 int sh = (c & 15) - fv;
                 if (sh < 0) sh = 0;
                 row[x] = (unsigned char)((c & 0xF0) + sh);
@@ -1625,7 +1615,7 @@ static void render_walls(unsigned char *buf)
                 if (texY >= TEX_H) texY = TEX_H - 1;
                 c = texData[texY * TEX_W + texX];
                 hue = c >> 4;
-                fv = fog + (g_dither4[y & 3][x & 3] < fogFrac ? 1 : 0)
+                fv = fog + ((hash2d(x, y) & 15) < fogFrac ? 1 : 0)
                      + sideFog;
                 shade = (c & 15) - fv;
                 if (shade < 0) shade = 0;
