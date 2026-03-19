@@ -6,11 +6,12 @@
  *   - Classic 4-component plasma (horizontal, vertical, diagonal, radial waves)
  *   - VBE 2.0+ linear frame buffer in 1024x768 8bpp
  *   - VBE 4F09h palette programming (works on Radeon in VESA modes)
- *   - VBE 2.0 hardware double buffering via INT 10h AX=4F07h page flip
- *     (renders into system RAM, blits to VRAM back page, then flips)
+ *   - VBE 2.0 hardware page flip via INT 10h AX=4F07h — triple-buffered:
+ *     sysram render buffer + 2 VRAM pages (render→sysram, blit→back, flip)
  *   - VBE 3.0 Protected Mode Interface (PMI) for faster page flip via
  *     DPMI 0301h direct procedure call (bypasses INT 10h dispatch)
- *   - Falls back to single-buffer + blit if VRAM < 2 pages or 4F07h fails
+ *   - Falls back to double-buffer (sysram+blit, no flip) if VRAM < 2 pages
+ *     or 4F07h fails
  *   - Vertical retrace sync to eliminate frame tearing
  *
  * Performance note:
@@ -904,7 +905,7 @@ int main(int argc, char *argv[])
     printf("Found mode 0x%03X  LFB at 0x%08lX  pitch=%d\n",
            target_mode, lfb_phys, lfb_pitch);
 
-    /* ---- Check VRAM for double buffering ------------------------------ */
+    /* ---- Check VRAM for page-flipping --------------------------------- */
     page_size     = (unsigned long)lfb_pitch * HEIGHT;
     use_doublebuf = 0;
     back_page     = 0;
@@ -914,10 +915,12 @@ int main(int argc, char *argv[])
         printf("VRAM: %luKB  page: %luKB  ",
                total_vram / 1024UL, page_size / 1024UL);
         if (total_vram >= page_size * 2UL) {
-            printf("-> double-buffer candidate\n");
+            /* sysram render + 2 VRAM pages = triple-buffer */
+            printf("-> triple-buffer candidate (sysram + 2x VRAM)\n");
             use_doublebuf = 1;   /* confirmed after 4F07h test below    */
         } else {
-            printf("-> single-buffer (insufficient VRAM)\n");
+            /* sysram render + 1 VRAM page = double-buffer */
+            printf("-> double-buffer (sysram + 1x VRAM, insufficient for page flip)\n");
         }
     }
 
@@ -996,7 +999,7 @@ int main(int argc, char *argv[])
     /* ---- Test VBE 4F07h support (must be after set mode) -------------- */
     if (use_doublebuf) {
         if (!vbe_set_display_start(0, 0, 0)) {
-            printf("4F07h not supported - falling back to single-buffer\n");
+            printf("4F07h not supported - falling back to double-buffer (sysram+blit only)\n");
             use_doublebuf = 0;
         } else {
             back_page = 1;   /* start rendering into page 1 */
@@ -1064,7 +1067,9 @@ int main(int argc, char *argv[])
             /* --- HUD overlay (into system RAM) -------------------------- */
             {
                 const char *sync_str = vsync_on ? "ON " : "OFF";
-                const char *buf_str  = use_doublebuf ? "DBL" : "SGL";
+                const char *buf_str  = g_direct_vram ?
+                                       (use_doublebuf ? "DBL" : "SGL") :
+                                       (use_doublebuf ? "TRP" : "DBL");
                 const char *pmi_str  = g_pmi_ok ? "YES" : "NO ";
                 const char *wc_str   = g_mtrr_wc ? "YES" : "NO ";
                 sprintf(msg, "VSYNC:%s BUF:%s PMI:%s WC:%s FPS:%5.1f  [V]=vsync [ESC]=quit",
@@ -1124,7 +1129,8 @@ int main(int argc, char *argv[])
 
     printf("PLASMA done.  mode=0x%03X  DAC=%d-bit  buf:%s  PMI:%s  WC:%s  render:%s\n",
            target_mode, g_dac_bits,
-           use_doublebuf ? "double" : "single",
+           g_direct_vram ? (use_doublebuf ? "double" : "single") :
+                           (use_doublebuf ? "triple" : "double"),
            g_pmi_ok ? "yes" : "no",
            g_mtrr_wc == 1 ? "mtrr" : g_mtrr_wc == 2 ? "bios" : "no",
            g_direct_vram ? "direct" : "sysram");
