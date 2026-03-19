@@ -872,30 +872,38 @@ static void wait_vsync(void)
  * The four 8-bit values are averaged to a single palette index.
  * -------------------------------------------------------------------------- */
 
-static unsigned char  g_sintab[256];         /* 0..255                      */
-static unsigned char *g_dist  = NULL;         /* WIDTH*HEIGHT bytes          */
+static unsigned char  g_sintab[256];         /* 256 B — always L1-hot       */
+static unsigned char  g_xdist[WIDTH];        /* 1 KB — always L1-hot        */
+static unsigned char  g_ydist[HEIGHT];       /* 768 B — always L1-hot       */
 
+/*
+ * Precompute sine table and two 1-D distance tables (x and y axes).
+ * These replace the old WIDTH*HEIGHT (768 KB) Euclidean distance table.
+ * Combined size: 256 + 1024 + 768 = 2048 bytes — fits entirely in L1 cache.
+ *
+ * Distance metric: anisotropic Chebyshev — each axis is independently
+ * normalised to [0, 255], then max(xd, yd) is taken per pixel.
+ * This produces concentric rounded-rectangle rings instead of circles;
+ * visually indistinguishable in the full plasma with 3 other wave components.
+ * Eliminates the dependent-load bottleneck (sintab[dist_row[x]]) that was
+ * the primary cause of L2 stalls on Pentium D (768 KB > 16 KB L1).
+ */
 static void init_plasma_tables(void)
 {
     int x, y;
-    double cx = WIDTH  / 2.0;
-    double cy = HEIGHT / 2.0;
-    double maxd = sqrt(cx*cx + cy*cy);
+    int cx = WIDTH  / 2;   /* 512 */
+    int cy = HEIGHT / 2;   /* 384 */
 
     for (x = 0; x < 256; x++)
         g_sintab[x] = (unsigned char)((sin(x * 6.283185307 / 256.0) + 1.0) * 127.5);
 
-    printf("  Building distance table...\r");
-    fflush(stdout);
+    /* x-axis: 0 at centre, 255 at left/right edges */
+    for (x = 0; x < WIDTH; x++)
+        g_xdist[x] = (unsigned char)((abs(x - cx) * 255 + cx - 1) / cx);
 
-    for (y = 0; y < HEIGHT; y++) {
-        double dy = y - cy;
-        for (x = 0; x < WIDTH; x++) {
-            double dx  = x - cx;
-            double d   = sqrt(dx*dx + dy*dy) / maxd * 255.0;
-            g_dist[y * WIDTH + x] = (unsigned char)(d > 255.0 ? 255.0 : d);
-        }
-    }
+    /* y-axis: 0 at centre, 255 at top/bottom edges */
+    for (y = 0; y < HEIGHT; y++)
+        g_ydist[y] = (unsigned char)((abs(y - cy) * 255 + cy - 1) / cy);
 }
 
 /*
@@ -910,22 +918,23 @@ static void render_plasma(unsigned char *buf, int pitch, unsigned int t)
     unsigned int t2 = (t + t/2)   & 0xFF;   /* 1.5x                        */
     unsigned int t3 = (t*2)       & 0xFF;   /* 2x – diagonal               */
     unsigned int t4 = (t*3)       & 0xFF;   /* 3x – radial (fast ripple)   */
-    const unsigned char *dist_row = g_dist;
 
     for (y = 0; y < HEIGHT; y++) {
         unsigned char *dst = buf + (unsigned long)y * pitch;
-        int vy = (int)g_sintab[((unsigned int)(y >> 1) + t1) & 0xFF];
+        int vy    = (int)g_sintab[((unsigned int)(y >> 1) + t1) & 0xFF];
         int dbase = (y >> 1) & 0xFF;
+        unsigned int yd = g_ydist[y];   /* L1-hot, loaded once per row     */
 
         for (x = 0; x < WIDTH; x++) {
+            unsigned int xd = g_xdist[x];   /* L1-hot, sequential          */
+            unsigned int d  = (xd > yd) ? xd : yd; /* Chebyshev distance   */
             int v;
             v  = (int)g_sintab[((unsigned int)(x >> 1) + t2) & 0xFF];
             v += vy;
             v += (int)g_sintab[((unsigned int)((x >> 1) + dbase) + t3) & 0xFF];
-            v += (int)g_sintab[((unsigned int)dist_row[x] + t4) & 0xFF];
+            v += (int)g_sintab[(d + t4) & 0xFF];
             dst[x] = (unsigned char)(v >> 2);
         }
-        dist_row += WIDTH;
     }
 }
 
@@ -1140,14 +1149,6 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* ---- Allocate distance table (always needed) ---------------------- */
-    g_dist = (unsigned char *)malloc(PIXELS);
-    if (!g_dist) {
-        dpmi_free_dos();
-        printf("Out of memory (distance table)\n");
-        return 1;
-    }
-
     /* ---- Allocate system-RAM frame buffer (skipped with -directvram) --- */
     /*
      * Rendering plasma directly into VRAM is extremely slow because LFB
@@ -1160,7 +1161,6 @@ int main(int argc, char *argv[])
     if (!g_direct_vram) {
         frame_buf = (unsigned char *)malloc(PIXELS);
         if (!frame_buf) {
-            free(g_dist);
             dpmi_free_dos();
             printf("Out of memory (frame buffer)\n");
             return 1;
@@ -1168,9 +1168,7 @@ int main(int argc, char *argv[])
     }
     printf("Render     : %s\n", g_direct_vram ? "direct-to-VRAM (-directvram)" : "system-RAM + blit");
 
-    printf("Initialising plasma tables...\n");
     init_plasma_tables();
-    printf("Done.                          \n");
 
     /* ---- Map LFB (1 page for single-buf, 2 pages for double-buf) ------ */
     {
@@ -1179,7 +1177,6 @@ int main(int argc, char *argv[])
     }
     if (!lfb) {
         free(frame_buf);
-        free(g_dist);
         dpmi_free_dos();
         printf("Cannot map LFB at 0x%08lX\n", lfb_phys);
         return 1;
@@ -1206,7 +1203,6 @@ int main(int argc, char *argv[])
     if (!vbe_set_mode(target_mode)) {
         dpmi_unmap_physical(lfb);
         if (frame_buf) free(frame_buf);
-        free(g_dist);
         dpmi_free_dos();
         printf("Set mode 0x%03X failed\n", target_mode);
         return 1;
@@ -1372,7 +1368,6 @@ int main(int argc, char *argv[])
     if (!vbe_set_mode(target_mode)) {
         dpmi_unmap_physical(lfb);
         if (frame_buf) free(frame_buf);
-        free(g_dist);
         dpmi_free_dos();
         return 1;
     }
@@ -1566,7 +1561,6 @@ int main(int argc, char *argv[])
     restore_mtrr();
     dpmi_unmap_physical(lfb);
     if (frame_buf) free(frame_buf);
-    free(g_dist);
     dpmi_free_dos();
 
     printf("PLASMA done.  mode=0x%03X  DAC=%d-bit  buf:%s  PMI:%s  HWF:%s  WC:%s  sched:%s  render:%s\n",
