@@ -1595,8 +1595,9 @@ static void render_sprites(unsigned char *buf)
         sprHeight = (int)(DUCK_SIZE * VIEW_H / transformY);
         sprWidth  = sprHeight;
 
-        /* Vertical shift: duck at height d->z (0=ground, 0.5=eye level) */
-        vMoveScr = (int)((d->z - 0.5f) * VIEW_H / transformY) + g_pitch;
+        /* Vertical shift: duck at height d->z (0=ground, 0.5=eye level)
+         * Must subtract g_pitch so sprites shift same direction as walls */
+        vMoveScr = (int)((d->z - 0.5f) * VIEW_H / transformY) - g_pitch;
 
         drawStartY = -sprHeight / 2 + VIEW_H / 2 - vMoveScr;
         drawEndY   =  sprHeight / 2 + VIEW_H / 2 - vMoveScr;
@@ -1673,7 +1674,7 @@ static int try_shoot(void)
         halfSz = sprSz / 2;
 
         {
-            int vMoveScr = (int)((d->z - 0.5f) * VIEW_H / ty) + g_pitch;
+            int vMoveScr = (int)((d->z - 0.5f) * VIEW_H / ty) - g_pitch;
             scrY = VIEW_H / 2 - vMoveScr;
         }
 
