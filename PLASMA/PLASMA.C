@@ -631,6 +631,12 @@ void _flush_tlb(void);
     "db 0Fh, 22h, 0D8h"    \
     modify [eax]
 
+/* mov eax, cr0 = 0F 20 C0 (reg=000=CR0, rm=000=EAX) */
+unsigned long _read_cr0(void);
+#pragma aux _read_cr0 = \
+    "db 0Fh, 20h, 0C0h"    \
+    value [eax]
+
 #define MSR_MTRR_DEF_TYPE   0x2FF
 #define MSR_PAT             0x277
 
@@ -640,6 +646,10 @@ static unsigned long g_mtrr_save_base_lo, g_mtrr_save_base_hi;
 static unsigned long g_mtrr_save_mask_lo, g_mtrr_save_mask_hi;
 static int           g_mtrr_wc = 0;  /* 0=off, 1=set by us, 2=already set */
 static int           g_mtrr_replaced_uc = 0; /* 1 if we replaced a BIOS UC entry */
+
+/* PAT state for cleanup on exit */
+static unsigned long g_pat_save_lo = 0, g_pat_save_hi = 0;
+static int           g_pat_modified = 0; /* 1 if we changed PAT entry 3 */
 
 static unsigned long next_pow2(unsigned long v)
 {
@@ -760,70 +770,67 @@ static void restore_mtrr(void)
 }
 
 /* --------------------------------------------------------------------------
- * Page Table Entry fix for WC passthrough
+ * PAT Entry 3 fix for WC passthrough
  *
- * PMODE/W maps MMIO regions with PCD=1, PWT=1 in the PTE (UC strong).
- * On PAT-capable CPUs (Pentium III+), the effective memory type is:
+ * PMODE/W maps MMIO regions with PCD=1, PWT=1 in the PTE.
+ * On PAT-capable CPUs, PCD=1 PWT=1 PAT=0 selects PAT entry 3.
+ * The default PAT entry 3 is UC (strong), which BLOCKS MTRR WC.
  *
- *   PCD  PWT  PAT-bit  →  PAT index  →  Default PAT entry  →  Effective
- *    1    1      0          3              UC (strong)          UC wins over MTRR WC
- *    1    0      0          2              UC- (weak)           MTRR WC takes effect!
- *    0    0      0          0              WB                   MTRR WC takes effect
+ * Fix: change PAT entry 3 from UC (0x00) to UC- (0x07) via MSR 0x277.
+ * UC- defers to MTRR for the final memory type:
+ *   UC- + MTRR WC → effective WC  (what we want for the LFB)
+ *   UC- + MTRR UC → effective UC  (safe for other MMIO)
  *
- * Fix: clear PWT in PTEs covering the LFB.  UC- allows MTRR WC passthrough.
- * This is the standard method used by Linux/FreeBSD to enable WC on LFBs.
+ * This avoids fragile page table walking (which crashes in PMODE/W
+ * because CR3 holds a physical address that may not be linearly mapped).
  * -------------------------------------------------------------------------- */
-static int g_pte_fixed = 0;   /* count of PTEs fixed */
 
-static int fix_lfb_pte_for_wc(unsigned long lfb_va, unsigned long size)
+static int setup_pat_uc_minus(void)
 {
-    unsigned long cr3, *pgdir;
-    unsigned long va, end;
-    int fixed = 0;
+    unsigned long pat_lo, pat_hi, entry3;
 
-    if ((_get_cs() & 3) != 0) return 0;
-    if (!(_cpuid1_edx() & (1UL << 16))) return 0; /* no PAT support */
+    if ((_get_cs() & 3) != 0) return 0;       /* need ring 0 */
+    if (!(_cpuid1_edx() & (1UL << 16))) return 0; /* no PAT */
 
-    cr3 = _read_cr3();
-    pgdir = (unsigned long *)(cr3 & 0xFFFFF000UL);
-    va = lfb_va;
-    end = va + size;
+    pat_lo = _rdmsr_lo(MSR_PAT);
+    pat_hi = _rdmsr_hi(MSR_PAT);
 
-    while (va < end) {
-        unsigned long pde_idx = va >> 22;
-        unsigned long pde = pgdir[pde_idx];
+    /* Save for restore */
+    g_pat_save_lo = pat_lo;
+    g_pat_save_hi = pat_hi;
 
-        if (!(pde & 1)) {
-            va = (va + 0x400000UL) & ~0x3FFFFFUL;
-            continue;
-        }
+    /* Entry 3 = bits 24-31 of low dword (only bits 2:0 matter) */
+    entry3 = (pat_lo >> 24) & 7;
+    if (entry3 == 7) return -1;  /* already UC- */
+    if (entry3 == 1) return -1;  /* already WC */
 
-        if (pde & 0x80) {
-            /* 4MB page (PSE): PWT=bit3, PCD=bit4 */
-            if ((pde & 0x18) == 0x18) {
-                pgdir[pde_idx] = pde & ~0x08UL;  /* PWT=0 → UC- */
-                fixed++;
-            }
-            va = (va + 0x400000UL) & ~0x3FFFFFUL;
-        } else {
-            /* 4KB pages */
-            unsigned long *pt = (unsigned long *)(pde & 0xFFFFF000UL);
-            unsigned long j   = (va >> 12) & 0x3FF;
-            unsigned long lim = j + ((end - va + 0xFFF) >> 12);
-            if (lim > 1024) lim = 1024;
-            for (; j < lim; j++, va += 0x1000) {
-                unsigned long pte = pt[j];
-                if ((pte & 1) && (pte & 0x18) == 0x18) {
-                    pt[j] = pte & ~0x08UL;  /* PWT=0 → UC- */
-                    fixed++;
-                }
-            }
-        }
-    }
+    /* Change entry 3 from UC (0) to UC- (7) */
+    pat_lo = (pat_lo & 0x00FFFFFFUL) | (7UL << 24);
 
-    if (fixed > 0) _flush_tlb();
-    g_pte_fixed = fixed;
-    return fixed;
+    _disable();
+    _wbinvd();
+    _wrmsr_3(MSR_PAT, pat_lo, pat_hi);
+    _wbinvd();
+    _flush_tlb();
+    _enable();
+
+    g_pat_modified = 1;
+    return 1;
+}
+
+static void restore_pat(void)
+{
+    if (!g_pat_modified) return;
+    if ((_get_cs() & 3) != 0) return;
+
+    _disable();
+    _wbinvd();
+    _wrmsr_3(MSR_PAT, g_pat_save_lo, g_pat_save_hi);
+    _wbinvd();
+    _flush_tlb();
+    _enable();
+
+    g_pat_modified = 0;
 }
 
 /* --------------------------------------------------------------------------
@@ -837,14 +844,15 @@ static const char *mtrr_type_name(unsigned long type)
         case 4: return "WT";
         case 5: return "WP";
         case 6: return "WB";
+        case 7: return "UC-";
         default: return "??";
     }
 }
 
 static void dump_mtrr_info(unsigned long lfb_va, unsigned long map_size)
 {
-    unsigned long cap_lo, def_lo, def_hi, pat_lo, pat_hi;
-    unsigned long cr3;
+    unsigned long cap_lo, def_lo, pat_lo, pat_hi;
+    unsigned long cr0;
     int num_var, i;
 
     if ((_get_cs() & 3) != 0) {
@@ -856,7 +864,7 @@ static void dump_mtrr_info(unsigned long lfb_va, unsigned long map_size)
     cap_lo = _rdmsr_lo(MSR_MTRRCAP);
     num_var = (int)(cap_lo & 0xFF);
     def_lo = _rdmsr_lo(MSR_MTRR_DEF_TYPE);
-    def_hi = _rdmsr_hi(MSR_MTRR_DEF_TYPE);
+    cr0 = _read_cr0();
 
     printf("==========================================\n");
     printf(" MTRR / PAT Diagnostic\n");
@@ -868,13 +876,12 @@ static void dump_mtrr_info(unsigned long lfb_va, unsigned long map_size)
     printf(" DEF_TYPE     : %s (0x%02lX), MTRR_E=%d, FIX_E=%d\n",
            mtrr_type_name(def_lo), def_lo & 0xFF,
            (int)((def_lo >> 11) & 1), (int)((def_lo >> 10) & 1));
+    printf(" Paging       : %s\n", (cr0 & (1UL << 31)) ? "ON" : "OFF");
 
     printf(" Variable MTRRs:\n");
     for (i = 0; i < num_var && i < 8; i++) {
         unsigned long blo = _rdmsr_lo(MSR_MTRR_PHYSBASE0 + i * 2);
-        unsigned long bhi = _rdmsr_hi(MSR_MTRR_PHYSBASE0 + i * 2);
         unsigned long mlo = _rdmsr_lo(MSR_MTRR_PHYSMASK0 + i * 2);
-        unsigned long mhi = _rdmsr_hi(MSR_MTRR_PHYSMASK0 + i * 2);
         int valid = (mlo >> 11) & 1;
         if (valid) {
             unsigned long base = blo & 0xFFFFF000UL;
@@ -887,7 +894,7 @@ static void dump_mtrr_info(unsigned long lfb_va, unsigned long map_size)
         }
     }
 
-    /* PAT entries */
+    /* PAT entries (shows current state, after our modification if any) */
     if (_cpuid1_edx() & (1UL << 16)) {
         pat_lo = _rdmsr_lo(MSR_PAT);
         pat_hi = _rdmsr_hi(MSR_PAT);
@@ -897,38 +904,24 @@ static void dump_mtrr_info(unsigned long lfb_va, unsigned long map_size)
         for (i = 0; i < 4; i++)
             printf("%d=%s ", i + 4, mtrr_type_name((pat_hi >> (i * 8)) & 7));
         printf("\n");
+        if (g_pat_modified)
+            printf(" PAT fix      : entry 3 changed UC->UC- for WC passthrough\n");
     } else {
         printf(" PAT          : not supported\n");
     }
 
-    /* Page table entry for LFB */
+    /* Page table info -- skip walk since CR3 physical addr not linearly mapped */
     if (lfb_va) {
-        cr3 = _read_cr3();
-        {
-            unsigned long *pgdir = (unsigned long *)(cr3 & 0xFFFFF000UL);
-            unsigned long pde_idx = lfb_va >> 22;
-            unsigned long pde = pgdir[pde_idx];
-            printf(" LFB VA       : 0x%08lX\n", lfb_va);
-            printf(" PDE[%3lu]     : 0x%08lX  P=%d PS=%d PWT=%d PCD=%d\n",
-                   pde_idx, pde, (int)(pde & 1), (int)((pde >> 7) & 1),
-                   (int)((pde >> 3) & 1), (int)((pde >> 4) & 1));
-            if ((pde & 1) && !(pde & 0x80)) {
-                unsigned long *pt = (unsigned long *)(pde & 0xFFFFF000UL);
-                unsigned long pte_idx = (lfb_va >> 12) & 0x3FF;
-                unsigned long pte = pt[pte_idx];
-                int pat_idx = ((pte >> 3) & 1) + (((pte >> 4) & 1) << 1)
-                            + (((pte >> 7) & 1) << 2);
-                printf(" PTE[%3lu]     : 0x%08lX  PWT=%d PCD=%d PAT=%d → idx=%d\n",
-                       pte_idx, pte,
-                       (int)((pte >> 3) & 1), (int)((pte >> 4) & 1),
-                       (int)((pte >> 7) & 1), pat_idx);
-            }
-        }
+        printf(" LFB VA       : 0x%08lX\n", lfb_va);
+        if (!(cr0 & (1UL << 31)))
+            printf(" PTE          : paging OFF, MTRR type is effective directly\n");
+        else
+            printf(" PTE          : paging ON (PCD=1,PWT=1 -> PAT idx 3)\n");
     }
 
-    printf(" PTE fix      : %d entries patched (UC->UC-)\n", g_pte_fixed);
     printf("==========================================\n");
 }
+
 
 /* --------------------------------------------------------------------------
  * DAC width + VBE 4F09h palette
@@ -1536,14 +1529,15 @@ int main(int argc, char *argv[])
         printf("MTRR WC    : disabled by -nomtrr\n");
     }
 
-    /* ---- Fix page table entries for WC passthrough --------------------- */
-    if (g_mtrr_wc == 1) {
-        unsigned long map_size = use_doublebuf ? page_size * 2UL : page_size;
-        int nfix = fix_lfb_pte_for_wc((unsigned long)lfb, map_size);
-        if (nfix > 0)
-            printf("PTE fix    : %d entries UC->UC- for WC passthrough\n", nfix);
+    /* ---- PAT fix: entry 3 UC->UC- for WC passthrough ------------------- */
+    if (g_mtrr_wc >= 1) {
+        int pat_ok = setup_pat_uc_minus();
+        if (pat_ok == 1)
+            printf("PAT fix    : entry 3 UC->UC- (WC passthrough enabled)\n");
+        else if (pat_ok == -1)
+            printf("PAT fix    : not needed (entry 3 already UC- or WC)\n");
         else
-            printf("PTE fix    : not needed (already UC- or WB)\n");
+            printf("PAT fix    : not available\n");
     }
 
     /* ---- MTRR diagnostic dump (with -mtrrinfo flag) -------------------- */
@@ -1713,8 +1707,8 @@ int main(int argc, char *argv[])
         printf(" Ring         : %s\n", ring_str);
         printf(" PMI          : %s\n", pmi_str);
         printf(" MTRR WC      : %s\n", mtrr_str);
-        printf(" PTE fix      : %s\n",
-               g_pte_fixed > 0 ? "applied (UC->UC- for WC passthrough)" :
+        printf(" PAT fix      : %s\n",
+               g_pat_modified ? "entry 3 UC->UC- (WC passthrough)" :
                g_mtrr_wc ? "not needed" : "n/a");
         printf(" Page flip    : %s\n", flip_str);
         printf(" Sched flip   : %s\n", sched_str);
@@ -1951,19 +1945,21 @@ int main(int argc, char *argv[])
 
     /* ---- Cleanup ------------------------------------------------------- */
     vbe_set_text_mode();
+    restore_pat();
     restore_mtrr();
     dpmi_unmap_physical(lfb);
     if (frame_buf) free(frame_buf);
     free(g_dist);
     dpmi_free_dos();
 
-    printf("PLASMA done.  mode=0x%03X  DAC=%d-bit  buf:%s  PMI:%s  HWF:%s  WC:%s  sched:%s  render:%s\n",
+    printf("PLASMA done.  mode=0x%03X  DAC=%d-bit  buf:%s  PMI:%s  HWF:%s  WC:%s  PAT:%s  sched:%s  render:%s\n",
            target_mode, g_dac_bits,
            g_direct_vram ? (use_doublebuf ? "double" : "single") :
                            (use_doublebuf ? "triple" : "double"),
            g_pmi_ok ? "yes" : "no",
            g_hw_flip ? "yes" : "no",
            g_mtrr_wc == 1 ? "mtrr" : g_mtrr_wc == 2 ? "bios" : "no",
+           g_pat_modified ? "fix" : "no",
            g_sched_flip ? "yes" : "no",
            g_direct_vram ? "direct" : "sysram");
     return 0;

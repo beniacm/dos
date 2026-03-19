@@ -216,6 +216,7 @@ static const char *type_name(unsigned long t)
         case 4: return "WT  (Write-Through)";
         case 5: return "WP  (Write-Protect)";
         case 6: return "WB  (Write-Back)";
+        case 7: return "UC- (Uncacheable-minus)";
         default: return "??  (Unknown)";
     }
 }
@@ -482,104 +483,50 @@ int main(int argc, char *argv[])
     printf("  LFB virt    : 0x%08lX\n", lfb_va);
     printf("\n");
 
-    /* ---- Page table walk for LFB --------------------------------------- */
-    printf("Page Table Walk for LFB VA 0x%08lX:\n", lfb_va);
-    {
-        unsigned long *pgdir = (unsigned long *)(cr3 & 0xFFFFF000UL);
-        unsigned long pde_idx = lfb_va >> 22;
-        unsigned long pde = pgdir[pde_idx];
-        int pde_p   = pde & 1;
-        int pde_rw  = (pde >> 1) & 1;
-        int pde_us  = (pde >> 2) & 1;
-        int pde_pwt = (pde >> 3) & 1;
-        int pde_pcd = (pde >> 4) & 1;
-        int pde_ps  = (pde >> 7) & 1;
-
-        printf("  PDE[%lu] = 0x%08lX\n", pde_idx, pde);
-        printf("    P=%d R/W=%d U/S=%d PWT=%d PCD=%d PS=%d\n",
-               pde_p, pde_rw, pde_us, pde_pwt, pde_pcd, pde_ps);
-
-        if (!pde_p) {
-            printf("    NOT PRESENT - mapping failed?\n");
-        } else if (pde_ps) {
-            /* 4MB page */
-            int pde_pat = (pde >> 12) & 1;
-            int pat_idx = pde_pwt + (pde_pcd << 1) + (pde_pat << 2);
-            printf("    4MB page: phys=0x%08lX\n",
-                   pde & 0xFFC00000UL);
-            printf("    PAT index = PWT(%d) + 2*PCD(%d) + 4*PAT(%d) = %d\n",
-                   pde_pwt, pde_pcd, pde_pat, pat_idx);
-            if (edx_feat & (1UL << 16)) {
-                unsigned long pat_entry;
-                if (pat_idx < 4)
-                    pat_entry = (pat_lo >> (pat_idx * 8)) & 7;
-                else
-                    pat_entry = (pat_hi >> ((pat_idx - 4) * 8)) & 7;
-                printf("    PAT entry[%d] = %s\n", pat_idx, type_name(pat_entry));
-            }
-        } else {
-            /* 4KB pages */
-            unsigned long *pt = (unsigned long *)(pde & 0xFFFFF000UL);
-            unsigned long pte_idx = (lfb_va >> 12) & 0x3FF;
-            unsigned long pte = pt[pte_idx];
-            int pte_p   = pte & 1;
-            int pte_pwt = (pte >> 3) & 1;
-            int pte_pcd = (pte >> 4) & 1;
-            int pte_pat = (pte >> 7) & 1;
-            int pat_idx = pte_pwt + (pte_pcd << 1) + (pte_pat << 2);
-
-            printf("  PTE[%lu] = 0x%08lX\n", pte_idx, pte);
-            printf("    P=%d PWT=%d PCD=%d PAT=%d\n",
-                   pte_p, pte_pwt, pte_pcd, pte_pat);
-            printf("    phys = 0x%08lX\n", pte & 0xFFFFF000UL);
-            printf("    PAT index = PWT(%d) + 2*PCD(%d) + 4*PAT(%d) = %d\n",
-                   pte_pwt, pte_pcd, pte_pat, pat_idx);
-
-            if (edx_feat & (1UL << 16)) {
-                unsigned long pat_entry;
-                if (pat_idx < 4)
-                    pat_entry = (pat_lo >> (pat_idx * 8)) & 7;
-                else
-                    pat_entry = (pat_hi >> ((pat_idx - 4) * 8)) & 7;
-                printf("    PAT entry[%d] = %s\n", pat_idx, type_name(pat_entry));
-            }
-
-            /* Check a few more PTEs to see if they're consistent */
-            printf("\n  Neighboring PTEs:\n");
-            {
-                unsigned long j;
-                unsigned long start = (pte_idx > 2) ? pte_idx - 2 : 0;
-                unsigned long end = pte_idx + 5;
-                if (end > 1024) end = 1024;
-                for (j = start; j < end; j++) {
-                    unsigned long p = pt[j];
-                    printf("    PTE[%3lu] = 0x%08lX  P=%d PWT=%d PCD=%d PAT=%d%s\n",
-                           j, p, (int)(p & 1), (int)((p >> 3) & 1),
-                           (int)((p >> 4) & 1), (int)((p >> 7) & 1),
-                           j == pte_idx ? " <-- LFB" : "");
-                }
-            }
+    /* ---- Page table / PAT analysis for LFB ----------------------------- */
+    printf("Page Table / PAT Analysis for LFB VA 0x%08lX:\n", lfb_va);
+    if (!(cr0 & (1UL << 31))) {
+        printf("  Paging is OFF (CR0.PG=0)\n");
+        printf("  MTRR type is effective directly (no PTE/PAT override).\n");
+    } else {
+        printf("  Paging is ON (CR0.PG=1)\n");
+        printf("  PMODE/W typically sets PCD=1,PWT=1 for MMIO mappings.\n");
+        printf("  PCD=1,PWT=1,PAT=0 -> PAT index 3\n");
+        if (edx_feat & (1UL << 16)) {
+            unsigned long entry3 = (pat_lo >> 24) & 7;
+            printf("  PAT entry[3] = %s\n", type_name(entry3));
+            if (entry3 == 0)
+                printf("  ** PAT entry 3 = UC (strong) - blocks MTRR WC! **\n");
+            else if (entry3 == 7)
+                printf("  PAT entry 3 = UC- - MTRR WC passes through.\n");
+            else if (entry3 == 1)
+                printf("  PAT entry 3 = WC - write-combining active.\n");
         }
+        printf("  (Skipping page table walk: CR3 phys addr not\n");
+        printf("   linearly accessible in PMODE/W.)\n");
     }
     printf("\n");
 
     /* ---- MTRR match for LFB phys --------------------------------------- */
+    /* ---- MTRR match for LFB phys --------------------------------------- */
     if (edx_feat & (1UL << 12)) {
         int mtrr_type = -1;
         int match_slot = -1;
+        unsigned long cap_lo2, def_lo2;
+        int num_var2, i2;
 
-        cap_lo = _rdmsr_lo(MSR_MTRRCAP);
-        num_var = (int)(cap_lo & 0xFF);
-        def_lo = _rdmsr_lo(MSR_MTRR_DEF_TYPE);
+        cap_lo2 = _rdmsr_lo(MSR_MTRRCAP);
+        num_var2 = (int)(cap_lo2 & 0xFF);
+        def_lo2 = _rdmsr_lo(MSR_MTRR_DEF_TYPE);
 
-        for (i = 0; i < num_var && i < 16; i++) {
-            unsigned long blo = _rdmsr_lo(MSR_MTRR_PHYSBASE0 + i * 2);
-            unsigned long mlo = _rdmsr_lo(MSR_MTRR_PHYSMASK0 + i * 2);
+        for (i2 = 0; i2 < num_var2 && i2 < 16; i2++) {
+            unsigned long blo = _rdmsr_lo(MSR_MTRR_PHYSBASE0 + i2 * 2);
+            unsigned long mlo = _rdmsr_lo(MSR_MTRR_PHYSMASK0 + i2 * 2);
             if (!(mlo & 0x800)) continue;
             if ((lfb_phys & (mlo & 0xFFFFF000UL)) ==
                 (blo & 0xFFFFF000UL)) {
                 mtrr_type = (int)(blo & 0xFF);
-                match_slot = i;
+                match_slot = i2;
             }
         }
 
@@ -588,59 +535,44 @@ int main(int argc, char *argv[])
             printf("  Matched slot [%d]: type = %s\n",
                    match_slot, type_name(mtrr_type));
         } else {
-            mtrr_type = (int)(def_lo & 0xFF);
+            mtrr_type = (int)(def_lo2 & 0xFF);
             printf("  No variable MTRR match -> default type: %s\n",
                    type_name(mtrr_type));
         }
 
-        /* Compute effective type */
+        /* Compute effective type based on PAT entry 3 (assumed PCD=1,PWT=1) */
         if (edx_feat & (1UL << 16)) {
-            unsigned long *pgdir = (unsigned long *)(cr3 & 0xFFFFF000UL);
-            unsigned long pde = pgdir[lfb_va >> 22];
-            int pat_idx = 0;
+            int pat_idx = (cr0 & (1UL << 31)) ? 3 : 0;
             int pat_type_raw;
             const char *eff;
 
-            if ((pde & 1) && (pde & 0x80)) {
-                /* 4MB page */
-                pat_idx = ((pde >> 3) & 1) + (((pde >> 4) & 1) << 1)
-                        + (((pde >> 12) & 1) << 2);
-            } else if (pde & 1) {
-                unsigned long *pt = (unsigned long *)(pde & 0xFFFFF000UL);
-                unsigned long pte = pt[(lfb_va >> 12) & 0x3FF];
-                pat_idx = ((pte >> 3) & 1) + (((pte >> 4) & 1) << 1)
-                        + (((pte >> 7) & 1) << 2);
-            }
-
-            if (pat_idx < 4)
-                pat_type_raw = (int)((pat_lo >> (pat_idx * 8)) & 7);
-            else
-                pat_type_raw = (int)((pat_hi >> ((pat_idx - 4) * 8)) & 7);
-
-            /* Map UC- (which is type 7 in our effective_type function) */
-            if (pat_idx == 2 || pat_idx == 6) {
-                /* Default PAT entries 2 and 6 are UC- */
-                eff = effective_type(mtrr_type, 7); /* 7 = UC- sentinel */
+            if (!(cr0 & (1UL << 31))) {
+                /* Paging OFF: MTRR type directly effective */
+                eff = type_name(mtrr_type);
             } else {
+                /* Paging ON: use PAT entry 3 */
+                pat_type_raw = (int)((pat_lo >> (pat_idx * 8)) & 7);
                 eff = effective_type(mtrr_type, pat_type_raw);
             }
 
             printf("\n");
             printf("  EFFECTIVE MEMORY TYPE:\n");
             printf("    MTRR type      : %s\n", type_name(mtrr_type));
-            printf("    PAT index      : %d -> %s%s\n",
-                   pat_idx, type_name(pat_type_raw),
-                   (pat_idx == 2 || pat_idx == 6) ? " (UC-)" : "");
+            if (cr0 & (1UL << 31)) {
+                printf("    PAT entry[3]   : %s\n",
+                       type_name((pat_lo >> 24) & 7));
+            } else {
+                printf("    Paging         : OFF (MTRR type effective directly)\n");
+            }
             printf("    Combined       : %s\n", eff);
             printf("\n");
 
             if (mtrr_type == 1 && strcmp(eff, "UC") == 0) {
                 printf("  *** PROBLEM DETECTED ***\n");
-                printf("  MTRR is WC but PTE forces UC (PAT index %d = UC strong).\n",
-                       pat_idx);
-                printf("  FIX: Change PWT=1 to PWT=0 in PTE (UC- allows WC passthrough).\n");
-                printf("  PLASMA.EXE now does this automatically.\n");
-            } else if (mtrr_type == 1 && strcmp(eff, "WC") == 0) {
+                printf("  MTRR is WC but PAT entry 3 = UC (strong) blocks it.\n");
+                printf("  FIX: Run PLASMA.EXE which changes PAT entry 3 to UC-.\n");
+            } else if (mtrr_type == 1 && (strcmp(eff, "WC") == 0 ||
+                       strcmp(eff, type_name(mtrr_type)) == 0)) {
                 printf("  WC is active - write-combining should be working.\n");
             }
         }
