@@ -135,6 +135,7 @@ static int           g_direct_vram = 0;    /* non-zero to render direct to VRAM 
 static unsigned short g_vbe_version = 0;    /* raw VBE version (BCD)        */
 static int           g_pmi_ok       = 0;    /* non-zero when PMI page-flip  */
 static int           g_sched_flip   = 0;    /* VBE 3.0 scheduled flip (BL=02h) */
+static int           g_sched_req    = 0;    /* -sched flag (opt-in, ATI crashes) */
 static unsigned short g_pmi_rm_seg  = 0;    /* real-mode segment of PMI tbl */
 static unsigned short g_pmi_rm_off  = 0;    /* real-mode offset  of PMI tbl */
 static unsigned short g_pmi_size    = 0;    /* PMI table size in bytes      */
@@ -1344,6 +1345,10 @@ int main(int argc, char *argv[])
             stricmp(argv[i], "/mtrrinfo") == 0) {
             g_mtrr_info = 1;
         }
+        if (stricmp(argv[i], "-sched") == 0 ||
+            stricmp(argv[i], "/sched") == 0) {
+            g_sched_req = 1;
+        }
     }
 
     /* Conventional DOS memory:
@@ -1572,9 +1577,9 @@ int main(int argc, char *argv[])
                 }
             }
             /* Test VBE 3.0 scheduled flip (BL=02h).
-             * Use dy=HEIGHT (page 1) to avoid BIOSes that may reject
-             * a no-op flip to the already-displayed page. */
-            if (g_vbe3) {
+             * Opt-in via -sched: ATI ATOMBIOS crashes (exception 0Dh)
+             * on unsupported BL=02h subfunction. */
+            if (g_vbe3 && g_sched_req) {
                 int sched_ok;
                 if (g_pmi_ok)
                     sched_ok = pmi_schedule_display_start(0,

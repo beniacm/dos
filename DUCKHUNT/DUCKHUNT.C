@@ -16,7 +16,7 @@
  *   ESC           - Quit
  *
  * Command line:
- *   DUCKHUNT [-vbe2] [-pmi] [-nopmi] [-hwflip] [-nomtrr] [-mtrrinfo] [-vsync]
+ *   DUCKHUNT [-vbe2] [-pmi] [-nopmi] [-hwflip] [-sched] [-nomtrr] [-mtrrinfo] [-vsync]
  *
  * Requires: PMODE/W (ring 0), VBE 2.0+, mouse driver (CTMOUSE etc.)
  *
@@ -1885,6 +1885,7 @@ int main(int argc, char *argv[])
     int no_mtrr = 0, show_mtrrinfo = 0;
     int no_pmi = 1;   /* PMI off by default, -pmi enables */
     int hw_flip_requested = 0;
+    int sched_requested = 0;
     int running = 1;
     int prev_lmb = 0;
     float fps = 0.0f;
@@ -1902,6 +1903,7 @@ int main(int argc, char *argv[])
         else if (strcmp(argv[i], "-pmi") == 0) no_pmi = 0;
         else if (strcmp(argv[i], "-nopmi") == 0) no_pmi = 1;
         else if (strcmp(argv[i], "-hwflip") == 0) hw_flip_requested = 1;
+        else if (strcmp(argv[i], "-sched") == 0) sched_requested = 1;
         else if (strcmp(argv[i], "-vsync") == 0) g_vsync_on = 1;
     }
 
@@ -2046,8 +2048,8 @@ int main(int argc, char *argv[])
             g_pmi_ok = 0;
             vbe_set_display_start(0, 0, 0);
         }
-        /* Test scheduled flip */
-        if (g_use_doublebuf && g_vbe3) {
+        /* Test scheduled flip (opt-in: ATI ATOMBIOS crashes on BL=02h) */
+        if (g_use_doublebuf && g_vbe3 && sched_requested) {
             int sched_ok;
             if (g_pmi_ok)
                 sched_ok = pmi_schedule_display_start(0, (unsigned short)HEIGHT);
