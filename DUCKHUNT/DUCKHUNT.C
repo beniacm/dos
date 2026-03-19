@@ -663,8 +663,8 @@ static double g_rdtsc_mhz = 0.0;
 
 static void calibrate_rdtsc(void)
 {
-    volatile unsigned long far *bios_tick =
-        (volatile unsigned long far *)0x0046CUL;
+    volatile unsigned long *bios_tick =
+        (volatile unsigned long *)0x0046CUL;
     unsigned long t0, t1, lo0, hi0, lo1, hi1;
     unsigned long long c0, c1;
     double ticks;
@@ -1908,6 +1908,7 @@ int main(int argc, char *argv[])
     }
 
     draw_title();
+    printf("[1] DOS mem...\n");
 
     /* Conventional DOS memory for VBE calls:
      *   512 B VBEInfo + 256 B ModeInfo + 1024 B palette = 1792 B
@@ -1918,11 +1919,12 @@ int main(int argc, char *argv[])
     }
 
     /* RDTSC calibration */
-    printf("Calibrating RDTSC...\n");
+    printf("[2] RDTSC cal...\n");
     calibrate_rdtsc();
     printf("CPU: %.0f MHz\n", g_rdtsc_mhz);
 
     /* VBE init */
+    printf("[3] VBE info...\n");
     if (!vbe_get_info()) {
         dpmi_free_dos();
         printf("VBE BIOS not found\n");
@@ -1935,6 +1937,7 @@ int main(int argc, char *argv[])
     if (g_force_vbe2) g_vbe3 = 0;
     if (hw_flip_requested) g_hw_flip = 1;
 
+    printf("[4] Mode info...\n");
     if (!vbe_get_mode_info(TARGET_MODE)) {
         dpmi_free_dos();
         printf("Mode 0x%03X not supported\n", TARGET_MODE);
@@ -1959,6 +1962,7 @@ int main(int argc, char *argv[])
     printf("LFB phys=0x%08lX  pitch=%d  dblbuf=%s\n",
            lfb_phys, g_lfb_pitch, g_use_doublebuf ? "YES" : "NO");
 
+    printf("[5] Map LFB...\n");
     /* Map LFB */
     lfb = (unsigned char *)dpmi_map_physical(lfb_phys, map_size);
     if (!lfb) {
@@ -1968,6 +1972,7 @@ int main(int argc, char *argv[])
     }
 
     /* MTRR WC */
+    printf("[6] MTRR...\n");
     if (!no_mtrr) {
         int wc = setup_mtrr_wc(lfb_phys, total_vram);
         if (wc == 1)
@@ -1979,6 +1984,7 @@ int main(int argc, char *argv[])
     }
 
     /* PAT fix */
+    printf("[7] PAT...\n");
     if (g_mtrr_wc >= 1) {
         int pat = setup_pat_uc_minus();
         if (pat == 1)
@@ -1988,6 +1994,7 @@ int main(int argc, char *argv[])
     }
 
     /* PMI init */
+    printf("[8] PMI...\n");
     if (g_vbe3 && !no_pmi) {
         if ((_get_cs() & 3) != 0) {
             printf("PMI        : skipped (ring 3)\n");
@@ -2004,6 +2011,7 @@ int main(int argc, char *argv[])
     }
 
     /* System RAM frame buffer */
+    printf("[9] malloc...\n");
     frame_buf = (unsigned char *)malloc(WIDTH * HEIGHT);
     if (!frame_buf) {
         dpmi_unmap_physical(lfb);
@@ -2014,14 +2022,16 @@ int main(int argc, char *argv[])
     memset(frame_buf, 0, WIDTH * HEIGHT);
 
     /* Init font (before mode set, uses INT 10h) */
+    printf("[10] font...\n");
     init_font();
 
     /* Generate assets */
-    printf("Generating textures...\n");
+    printf("[11] textures...\n");
     generate_textures();
     generate_duck_sprites();
 
     /* Init mouse */
+    printf("[12] mouse...\n");
     g_mouse_ok = mouse_init();
     printf("Mouse      : %s\n", g_mouse_ok ? "OK" : "not found (keyboard only)");
 
@@ -2030,10 +2040,11 @@ int main(int argc, char *argv[])
     spawn_round_ducks(g_round);
     printf("Ducks      : %d spawned for round %d\n", g_ducks_alive, g_round);
 
-    printf("\nPress any key to start...\n");
+    printf("[13] Press key...\n");
     getch();
 
     /* Set VBE mode */
+    printf("[14] Set mode...");
     if (!vbe_set_mode(TARGET_MODE)) {
         free(frame_buf);
         dpmi_unmap_physical(lfb);
