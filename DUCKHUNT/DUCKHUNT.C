@@ -16,7 +16,7 @@
  *   ESC           - Quit
  *
  * Command line:
- *   DUCKHUNT [-nomtrr] [-mtrrinfo]
+ *   DUCKHUNT [-vbe2] [-pmi] [-nopmi] [-hwflip] [-nomtrr] [-mtrrinfo] [-vsync]
  *
  * Requires: PMODE/W (ring 0), VBE 2.0+, mouse driver (CTMOUSE etc.)
  *
@@ -232,6 +232,30 @@ static ModeInfoBlock g_mib;
 static unsigned long g_lfb_phys = 0;
 static int           g_lfb_pitch = 0;
 
+/* VBE 3.0 / PMI state */
+static int           g_vbe3 = 0;
+static int           g_force_vbe2 = 0;
+static int           g_pmi_ok = 0;
+static unsigned short g_pmi_rm_seg = 0;
+static unsigned short g_pmi_rm_off = 0;
+static unsigned short g_pmi_size = 0;
+static unsigned short g_pmi_setw_off = 0;
+static unsigned short g_pmi_setds_off = 0;
+static unsigned short g_pmi_setpal_off = 0;
+static unsigned short g_vbe_version = 0;
+
+/* Page flip state */
+static int           g_use_doublebuf = 0;
+static int           g_back_page = 0;
+static unsigned long g_page_size = 0;
+static int           g_sched_flip = 0;
+static int           g_vsync_on = 0;
+
+/* Hardware flip (direct GPU register) */
+static int           g_hw_flip = 0;
+static unsigned short g_gpu_iobase = 0;
+static unsigned long g_fb_phys = 0;
+
 static int vbe_get_info(void)
 {
     RMI rmi;
@@ -344,6 +368,225 @@ static void set_palette_block(int start, int count, unsigned char *rgb)
     rmi.es  = g_dos_seg;
     rmi.edi = 0;
     dpmi_real_int(0x10, &rmi);
+}
+
+/* ========================================================================
+ *  VBE PAGE FLIP (4F07h)
+ * ======================================================================== */
+
+static int vbe_set_display_start(unsigned short cx, unsigned short dy, int wait)
+{
+    RMI rmi;
+    memset(&rmi, 0, sizeof(rmi));
+    rmi.eax = 0x4F07;
+    rmi.ebx = wait ? 0x0080UL : 0x0000UL;
+    rmi.ecx = (unsigned long)cx;
+    rmi.edx = (unsigned long)dy;
+    if (!dpmi_real_int(0x10, &rmi)) return 0;
+    return ((rmi.eax & 0xFFFF) == 0x004F);
+}
+
+static int vbe_schedule_display_start(unsigned short cx, unsigned short dy)
+{
+    RMI rmi;
+    memset(&rmi, 0, sizeof(rmi));
+    rmi.eax = 0x4F07;
+    rmi.ebx = 0x0002;
+    rmi.ecx = (unsigned long)cx;
+    rmi.edx = (unsigned long)dy;
+    if (!dpmi_real_int(0x10, &rmi)) return 0;
+    return ((rmi.eax & 0xFFFF) == 0x004F);
+}
+
+static int vbe_is_flip_complete(void)
+{
+    RMI rmi;
+    memset(&rmi, 0, sizeof(rmi));
+    rmi.eax = 0x4F07;
+    rmi.ebx = 0x0004;
+    if (!dpmi_real_int(0x10, &rmi)) return 1;
+    if ((rmi.eax & 0xFFFF) != 0x004F) return 1;
+    return ((rmi.ebx & 0xFF00) == 0);
+}
+
+/* ========================================================================
+ *  VBE 3.0 PROTECTED MODE INTERFACE (PMI)
+ * ======================================================================== */
+
+static int query_pmi(void)
+{
+    RMI rmi;
+    unsigned long pmi_flat;
+    memset(&rmi, 0, sizeof(rmi));
+    rmi.eax = 0x4F0A;
+    rmi.ebx = 0x0000;
+    if (!dpmi_real_int(0x10, &rmi)) return 0;
+    if ((rmi.eax & 0xFFFF) != 0x004F) return 0;
+    g_pmi_rm_seg = (unsigned short)rmi.es;
+    g_pmi_rm_off = (unsigned short)(rmi.edi & 0xFFFF);
+    g_pmi_size   = (unsigned short)(rmi.ecx & 0xFFFF);
+    if (g_pmi_size == 0) return 0;
+    pmi_flat = (unsigned long)g_pmi_rm_seg * 16 + g_pmi_rm_off;
+    g_pmi_setw_off   = *(unsigned short *)(pmi_flat + 0);
+    g_pmi_setds_off  = *(unsigned short *)(pmi_flat + 2);
+    g_pmi_setpal_off = *(unsigned short *)(pmi_flat + 4);
+    return 1;
+}
+
+unsigned long _pmi_call4(unsigned long entry, unsigned long eax,
+                         unsigned long ebx,  unsigned long ecx,
+                         unsigned long edx);
+#pragma aux _pmi_call4 = \
+    "call esi"           \
+    parm [esi] [eax] [ebx] [ecx] [edx] \
+    value [eax]          \
+    modify [ebx ecx edx esi edi]
+
+unsigned long _pmi_call4_ebx(unsigned long entry, unsigned long eax,
+                              unsigned long ebx,  unsigned long ecx,
+                              unsigned long edx);
+#pragma aux _pmi_call4_ebx = \
+    "call esi"               \
+    parm [esi] [eax] [ebx] [ecx] [edx] \
+    value [ebx]              \
+    modify [eax ecx edx esi edi]
+
+static int pmi_set_display_start(unsigned short cx, unsigned short dy, int wait)
+{
+    unsigned long entry = (unsigned long)g_pmi_rm_seg * 16
+                        + g_pmi_rm_off + g_pmi_setds_off;
+    unsigned long result;
+    result = _pmi_call4(entry, 0x4F07,
+                        wait ? 0x0080UL : 0x0000UL,
+                        (unsigned long)cx,
+                        (unsigned long)dy);
+    return ((result & 0xFFFF) == 0x004F);
+}
+
+static int pmi_schedule_display_start(unsigned short cx, unsigned short dy)
+{
+    unsigned long entry = (unsigned long)g_pmi_rm_seg * 16
+                        + g_pmi_rm_off + g_pmi_setds_off;
+    unsigned long result;
+    result = _pmi_call4(entry, 0x4F07, 0x0002UL,
+                        (unsigned long)cx,
+                        (unsigned long)dy);
+    return ((result & 0xFFFF) == 0x004F);
+}
+
+static int pmi_is_flip_complete(void)
+{
+    unsigned long entry = (unsigned long)g_pmi_rm_seg * 16
+                        + g_pmi_rm_off + g_pmi_setds_off;
+    unsigned long ebx_out;
+    ebx_out = _pmi_call4_ebx(entry, 0x4F07, 0x0004UL, 0, 0);
+    return ((ebx_out & 0xFF00) == 0);
+}
+
+/* ========================================================================
+ *  GPU REGISTER ACCESS / HARDWARE FLIP (R500)
+ * ======================================================================== */
+
+#define R5_D1GRPH_PRIMARY_SURFACE_ADDRESS   0x6110
+#define R5_D1GRPH_SECONDARY_SURFACE_ADDRESS 0x6118
+#define R5_D1GRPH_UPDATE                    0x6144
+#define R5_D1GRPH_SURFACE_UPDATE_PENDING    (1UL << 2)
+#define R5_D1GRPH_SURFACE_UPDATE_LOCK       (1UL << 16)
+
+void _gpu_outpd(unsigned short port, unsigned long val);
+#pragma aux _gpu_outpd = "out dx, eax" parm [dx] [eax] modify exact []
+
+unsigned long _gpu_inpd(unsigned short port);
+#pragma aux _gpu_inpd = "in eax, dx" parm [dx] value [eax] modify exact []
+
+static unsigned long gpu_reg_read(unsigned long reg)
+{
+    _gpu_outpd(g_gpu_iobase, reg);
+    return _gpu_inpd(g_gpu_iobase + 4);
+}
+
+static void gpu_reg_write(unsigned long reg, unsigned long val)
+{
+    _gpu_outpd(g_gpu_iobase, reg);
+    _gpu_outpd(g_gpu_iobase + 4, val);
+}
+
+static int detect_gpu_iobase(unsigned long lfb_phys)
+{
+    unsigned int bus, dev;
+    unsigned long addr, bar;
+    int i, found_lfb;
+    unsigned short io_base;
+    for (bus = 0; bus < 16; bus++) {
+        for (dev = 0; dev < 32; dev++) {
+            addr = 0x80000000UL | ((unsigned long)bus << 16)
+                 | ((unsigned long)dev << 11);
+            _gpu_outpd(0x0CF8, addr);
+            if ((_gpu_inpd(0x0CFC) & 0xFFFF) == 0xFFFF) continue;
+            found_lfb = 0;
+            io_base   = 0;
+            for (i = 0; i < 6; i++) {
+                _gpu_outpd(0x0CF8, addr | (unsigned long)(0x10 + i * 4));
+                bar = _gpu_inpd(0x0CFC);
+                if (bar & 1) {
+                    if (!io_base)
+                        io_base = (unsigned short)(bar & ~0xFFUL);
+                } else if ((bar & 0xFFF00000UL) == (lfb_phys & 0xFFF00000UL)
+                        && (bar & 0xFFF00000UL) != 0) {
+                    found_lfb = 1;
+                }
+            }
+            if (found_lfb && io_base) {
+                g_gpu_iobase = io_base;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void hw_page_flip(unsigned long page_phys_addr)
+{
+    unsigned long lock;
+    lock = gpu_reg_read(R5_D1GRPH_UPDATE);
+    gpu_reg_write(R5_D1GRPH_UPDATE, lock | R5_D1GRPH_SURFACE_UPDATE_LOCK);
+    gpu_reg_write(R5_D1GRPH_PRIMARY_SURFACE_ADDRESS, page_phys_addr);
+    gpu_reg_write(R5_D1GRPH_SECONDARY_SURFACE_ADDRESS, page_phys_addr);
+    lock = gpu_reg_read(R5_D1GRPH_UPDATE);
+    gpu_reg_write(R5_D1GRPH_UPDATE, lock & ~R5_D1GRPH_SURFACE_UPDATE_LOCK);
+}
+
+static int hw_is_flip_done(void)
+{
+    return !(gpu_reg_read(R5_D1GRPH_UPDATE) & R5_D1GRPH_SURFACE_UPDATE_PENDING);
+}
+
+/* ========================================================================
+ *  VSYNC WAIT
+ * ======================================================================== */
+
+#define VGA_STAT1 0x03DA
+
+static void wait_vsync(void)
+{
+    while (  inp(VGA_STAT1) & 0x08) {}
+    while (!(inp(VGA_STAT1) & 0x08)) {}
+}
+
+/* ========================================================================
+ *  LFB BLIT HELPER
+ * ======================================================================== */
+
+static void blit_to_lfb(unsigned char *dst, int lfb_pitch,
+                        const unsigned char *src)
+{
+    if (lfb_pitch == WIDTH) {
+        memcpy(dst, src, (unsigned long)WIDTH * HEIGHT);
+    } else {
+        int y;
+        for (y = 0; y < HEIGHT; y++)
+            memcpy(dst + y * lfb_pitch, src + y * WIDTH, WIDTH);
+    }
 }
 
 /* ========================================================================
@@ -1522,11 +1765,13 @@ static void render_hud(unsigned char *buf, float fps)
     draw_str_bg(buf, WIDTH, WIDTH - 96, y0 + 8, msg,
                 PAL(HUE_MOSS, 12), PAL(HUE_STONE, 3));
 
-    /* WC / MTRR status */
-    sprintf(msg, "WC:%s PAT:%s",
+    /* WC / MTRR / PMI / HW status */
+    sprintf(msg, "WC:%s PAT:%s HWF:%s PMI:%s",
             g_mtrr_wc ? "ON" : "OFF",
-            g_pat_modified ? "FIX" : "---");
-    draw_str_bg(buf, WIDTH, WIDTH - 200, y0 + 24, msg,
+            g_pat_modified ? "FIX" : "---",
+            g_hw_flip ? "ON" : "---",
+            g_pmi_ok ? "ON" : "---");
+    draw_str_bg(buf, WIDTH, WIDTH - 300, y0 + 24, msg,
                 PAL(HUE_TEAL, 10), PAL(HUE_STONE, 3));
 
     /* Minimap */
@@ -1638,6 +1883,8 @@ int main(int argc, char *argv[])
     unsigned long lfb_phys, map_size;
     unsigned long total_vram;
     int no_mtrr = 0, show_mtrrinfo = 0;
+    int no_pmi = 1;   /* PMI off by default, -pmi enables */
+    int hw_flip_requested = 0;
     int running = 1;
     int prev_lmb = 0;
     float fps = 0.0f;
@@ -1651,6 +1898,11 @@ int main(int argc, char *argv[])
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-nomtrr") == 0) no_mtrr = 1;
         else if (strcmp(argv[i], "-mtrrinfo") == 0) show_mtrrinfo = 1;
+        else if (strcmp(argv[i], "-vbe2") == 0) g_force_vbe2 = 1;
+        else if (strcmp(argv[i], "-pmi") == 0) no_pmi = 0;
+        else if (strcmp(argv[i], "-nopmi") == 0) no_pmi = 1;
+        else if (strcmp(argv[i], "-hwflip") == 0) hw_flip_requested = 1;
+        else if (strcmp(argv[i], "-vsync") == 0) g_vsync_on = 1;
     }
 
     draw_title();
@@ -1672,7 +1924,12 @@ int main(int argc, char *argv[])
         printf("VBE BIOS not found\n");
         return 1;
     }
-    printf("VBE %d.%d\n", g_vbi.version >> 8, g_vbi.version & 0xFF);
+    printf("VBE %d.%d%s\n", g_vbi.version >> 8, g_vbi.version & 0xFF,
+           (g_vbi.version >= 0x0300 && !g_force_vbe2) ? " (VBE3)" : "");
+    g_vbe_version = g_vbi.version;
+    g_vbe3 = (g_vbi.version >= 0x0300);
+    if (g_force_vbe2) g_vbe3 = 0;
+    if (hw_flip_requested) g_hw_flip = 1;
 
     if (!vbe_get_mode_info(TARGET_MODE)) {
         dpmi_free_dos();
@@ -1689,10 +1946,14 @@ int main(int argc, char *argv[])
     lfb_phys = g_mib.phys_base;
     g_lfb_pitch = g_mib.bytes_per_line;
     if (g_lfb_pitch == 0) g_lfb_pitch = WIDTH;
-    map_size = (unsigned long)g_lfb_pitch * HEIGHT;
+    g_page_size = (unsigned long)g_lfb_pitch * HEIGHT;
     total_vram = (unsigned long)g_vbi.total_memory * 65536UL;
+    if (total_vram >= g_page_size * 2UL)
+        g_use_doublebuf = 1;
+    map_size = g_use_doublebuf ? g_page_size * 2UL : g_page_size;
 
-    printf("LFB phys=0x%08lX  pitch=%d\n", lfb_phys, g_lfb_pitch);
+    printf("LFB phys=0x%08lX  pitch=%d  dblbuf=%s\n",
+           lfb_phys, g_lfb_pitch, g_use_doublebuf ? "YES" : "NO");
 
     /* Map LFB */
     lfb = (unsigned char *)dpmi_map_physical(lfb_phys, map_size);
@@ -1720,6 +1981,22 @@ int main(int argc, char *argv[])
             printf("PAT fix    : entry 3 UC->UC- (WC passthrough)\n");
         else if (pat == -1)
             printf("PAT fix    : not needed\n");
+    }
+
+    /* PMI init */
+    if (g_vbe3 && !no_pmi) {
+        if ((_get_cs() & 3) != 0) {
+            printf("PMI        : skipped (ring 3)\n");
+        } else {
+            g_pmi_ok = query_pmi();
+            if (g_pmi_ok) {
+                unsigned long entry = (unsigned long)g_pmi_rm_seg * 16
+                                    + g_pmi_rm_off + g_pmi_setds_off;
+                printf("PMI        : available (entry 0x%08lX)\n", entry);
+            } else {
+                printf("PMI        : not available\n");
+            }
+        }
     }
 
     /* System RAM frame buffer */
@@ -1761,11 +2038,63 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* Test VBE 4F07h page flip */
+    if (g_use_doublebuf) {
+        if (!vbe_set_display_start(0, 0, 0)) {
+            g_use_doublebuf = 0;
+        } else if (g_pmi_ok && !pmi_set_display_start(0, 0, 0)) {
+            g_pmi_ok = 0;
+            vbe_set_display_start(0, 0, 0);
+        }
+        /* Test scheduled flip */
+        if (g_use_doublebuf && g_vbe3) {
+            int sched_ok;
+            if (g_pmi_ok)
+                sched_ok = pmi_schedule_display_start(0, (unsigned short)HEIGHT);
+            else
+                sched_ok = vbe_schedule_display_start(0, (unsigned short)HEIGHT);
+            if (sched_ok) {
+                g_sched_flip = 1;
+                if (g_pmi_ok) {
+                    while (!pmi_is_flip_complete()) {}
+                    pmi_set_display_start(0, 0, 0);
+                } else {
+                    while (!vbe_is_flip_complete()) {}
+                    vbe_set_display_start(0, 0, 0);
+                }
+            }
+        }
+    }
+
+    /* Test HW flip */
+    if (g_hw_flip && g_use_doublebuf) {
+        if ((_get_cs() & 3) != 0) {
+            g_hw_flip = 0;
+        } else if (!detect_gpu_iobase(lfb_phys)) {
+            g_hw_flip = 0;
+        } else {
+            unsigned long cur = gpu_reg_read(R5_D1GRPH_PRIMARY_SURFACE_ADDRESS);
+            if ((cur & 0xFFF00000UL) != (lfb_phys & 0xFFF00000UL)) {
+                g_hw_flip = 0;
+            } else {
+                g_fb_phys = lfb_phys;
+            }
+        }
+    } else {
+        g_hw_flip = 0;
+    }
+
     /* Try 8-bit DAC */
     vbe_set_dac_width(8);
 
     /* Set palette */
     setup_palette();
+
+    /* Set initial display start for double buffering */
+    if (g_use_doublebuf) {
+        vbe_set_display_start(0, 0, 0);
+        g_back_page = 1;
+    }
 
     /* Install keyboard handler */
     install_keyboard();
@@ -1845,18 +2174,54 @@ int main(int argc, char *argv[])
         draw_crosshair(frame_buf);
         render_hud(frame_buf, fps);
 
-        /* Blit to LFB */
-        if (g_lfb_pitch == WIDTH) {
-            memcpy(lfb, frame_buf, WIDTH * HEIGHT);
+        /* Blit and flip */
+        if (g_use_doublebuf) {
+            if (g_hw_flip) {
+                if (g_vsync_on)
+                    while (!hw_is_flip_done()) {}
+                blit_to_lfb(lfb + (unsigned long)g_back_page * g_page_size,
+                            g_lfb_pitch, frame_buf);
+                hw_page_flip(g_fb_phys + (unsigned long)g_back_page * g_page_size);
+            } else if (g_sched_flip) {
+                if (g_pmi_ok)
+                    while (!pmi_is_flip_complete()) {}
+                else
+                    while (!vbe_is_flip_complete()) {}
+                blit_to_lfb(lfb + (unsigned long)g_back_page * g_page_size,
+                            g_lfb_pitch, frame_buf);
+                if (g_vsync_on) {
+                    if (g_pmi_ok)
+                        pmi_schedule_display_start(0, (unsigned short)(g_back_page * HEIGHT));
+                    else
+                        vbe_schedule_display_start(0, (unsigned short)(g_back_page * HEIGHT));
+                } else {
+                    if (g_pmi_ok)
+                        pmi_set_display_start(0, (unsigned short)(g_back_page * HEIGHT), 0);
+                    else
+                        vbe_set_display_start(0, (unsigned short)(g_back_page * HEIGHT), 0);
+                }
+            } else {
+                blit_to_lfb(lfb + (unsigned long)g_back_page * g_page_size,
+                            g_lfb_pitch, frame_buf);
+                if (g_pmi_ok)
+                    pmi_set_display_start(0, (unsigned short)(g_back_page * HEIGHT), 0);
+                else
+                    vbe_set_display_start(0, (unsigned short)(g_back_page * HEIGHT), 0);
+                if (g_vsync_on)
+                    wait_vsync();
+            }
+            g_back_page = 1 - g_back_page;
         } else {
-            int row;
-            for (row = 0; row < HEIGHT; row++)
-                memcpy(lfb + row * g_lfb_pitch, frame_buf + row * WIDTH, WIDTH);
+            if (g_vsync_on)
+                wait_vsync();
+            blit_to_lfb(lfb, g_lfb_pitch, frame_buf);
         }
     }
 
     /* ---- Cleanup ---- */
     restore_keyboard();
+    if (g_use_doublebuf)
+        vbe_set_display_start(0, 0, 0);
     vbe_set_text_mode();
     restore_pat();
     restore_mtrr();
@@ -1866,5 +2231,13 @@ int main(int argc, char *argv[])
 
     printf("QUACK HUNT done. Score: %d  Round: %d  Shots: %d\n",
            g_score, g_round, g_shots_fired);
+    printf("  WC:%s PAT:%s PMI:%s HWF:%s DBLBUF:%s SCHED:%s VSYNC:%s\n",
+           g_mtrr_wc ? "ON" : "OFF",
+           g_pat_modified ? "FIX" : "---",
+           g_pmi_ok ? "ON" : "---",
+           g_hw_flip ? "ON" : "---",
+           g_use_doublebuf ? "ON" : "---",
+           g_sched_flip ? "ON" : "---",
+           g_vsync_on ? "ON" : "---");
     return 0;
 }
