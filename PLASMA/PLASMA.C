@@ -121,7 +121,7 @@ static unsigned short g_dos_sel = 0;
 /* VBE 3.0 / PMI state */
 static int           g_vbe3         = 0;    /* non-zero when VBE >= 3.0     */
 static int           g_force_vbe2   = 0;    /* non-zero to disable VBE 3.0  */
-static int           g_no_pmi      = 0;    /* non-zero to skip PMI         */
+static int           g_no_pmi      = 1;    /* 0=use PMI, 1=skip (default: skip, use -pmi to enable) */
 static int           g_no_mtrr     = 0;    /* non-zero to skip MTRR WC     */
 static int           g_direct_vram = 0;    /* non-zero to render direct to VRAM (slow, for comparison) */
 static unsigned short g_vbe_version = 0;    /* raw VBE version (BCD)        */
@@ -803,6 +803,10 @@ int main(int argc, char *argv[])
             stricmp(argv[i], "/vbe2") == 0) {
             g_force_vbe2 = 1;
         }
+        if (stricmp(argv[i], "-pmi") == 0 ||
+            stricmp(argv[i], "/pmi") == 0) {
+            g_no_pmi = 0;
+        }
         if (stricmp(argv[i], "-nopmi") == 0 ||
             stricmp(argv[i], "/nopmi") == 0) {
             g_no_pmi = 1;
@@ -859,7 +863,7 @@ int main(int argc, char *argv[])
         else
             printf("PMI        : not available\n");
     } else if (g_no_pmi) {
-        printf("PMI        : disabled by -nopmi\n");
+        printf("PMI        : disabled (use -pmi to enable; may crash on ATI ATOMBIOS)\n");
     }
 
     {
