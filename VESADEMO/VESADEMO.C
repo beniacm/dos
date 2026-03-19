@@ -143,6 +143,7 @@ static int       g_num_modes = 0;
 /* ===== VBE 3.0 state ===== */
 static int           g_vbe3         = 0;    /* non-zero when VBE >= 3.0     */
 static int           g_no_crtc      = 0;    /* non-zero to skip CRTC override */
+static int           g_force_vbe2   = 0;    /* non-zero to disable VBE 3.0  */
 static unsigned short g_vbe_version = 0;    /* raw VBE version (BCD)        */
 static int           g_pmi_ok       = 0;    /* non-zero when PMI available  */
 static unsigned short g_pmi_rm_seg  = 0;    /* real-mode segment of PMI tbl */
@@ -746,6 +747,10 @@ int main(int argc, char *argv[])
             stricmp(argv[i], "/nocrtc") == 0) {
             g_no_crtc = 1;
         }
+        if (stricmp(argv[i], "-vbe2") == 0 ||
+            stricmp(argv[i], "/vbe2") == 0) {
+            g_force_vbe2 = 1;
+        }
     }
 
     printf("VESADEMO - VESA LFB 8bpp Resolution Demo\n");
@@ -772,10 +777,13 @@ int main(int argc, char *argv[])
 
     g_vbe_version = vbe.vbe_version;
     g_vbe3        = (vbe.vbe_version >= 0x0300);
+    if (g_force_vbe2)
+        g_vbe3 = 0;
 
     printf("VBE version : %d.%d%s\n",
            vbe.vbe_version >> 8, vbe.vbe_version & 0xFF,
-           g_vbe3 ? " (VBE 3.0 features enabled)" : "");
+           g_vbe3 ? " (VBE 3.0 features enabled)" :
+           g_force_vbe2 ? " (VBE 3.0 disabled by -vbe2)" : "");
     if (g_no_crtc)
         printf("CRTC override: disabled by -nocrtc flag\n");
     printf("Video memory: %u KB\n", (unsigned)vbe.total_memory * 64);

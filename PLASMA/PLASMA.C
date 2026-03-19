@@ -7,14 +7,24 @@
  *   - VBE 2.0+ linear frame buffer in 1024x768 8bpp
  *   - VBE 4F09h palette programming (works on Radeon in VESA modes)
  *   - VBE 2.0 hardware double buffering via INT 10h AX=4F07h page flip
- *     (renders directly into back VRAM page; works in 32-bit protected
- *      mode via DPMI INT 31h AX=0300h real-mode call emulation)
+ *     (renders into system RAM, blits to VRAM back page, then flips)
+ *   - VBE 3.0 Protected Mode Interface (PMI) for faster page flip via
+ *     DPMI 0301h direct procedure call (bypasses INT 10h dispatch)
  *   - Falls back to single-buffer + blit if VRAM < 2 pages or 4F07h fails
  *   - Vertical retrace sync to eliminate frame tearing
  *
+ * Performance note:
+ *   Rendering is always done into cached system RAM, then blitted to VRAM.
+ *   Direct VRAM writes are extremely slow (~100ns/byte uncached), which
+ *   limited frame rate to ~13 FPS on real hardware.  The system RAM + blit
+ *   approach uses fast cached writes and WC-friendly sequential memcpy.
+ *
  * Controls:
- *   V   = toggle vsync on/off  (watch for tear line when OFF)
- *   ESC = quit
+ *   V     = toggle vsync on/off  (watch for tear line when OFF)
+ *   ESC   = quit
+ *
+ * Options:
+ *   -vbe2 = force VBE 2.0 mode (disable VBE 3.0 PMI)
  *
  * Build:
  *   wcc386 -bt=dos -3r -ox -s -zq PLASMA.C
@@ -105,6 +115,18 @@ typedef struct {
 
 static unsigned short g_dos_seg = 0;
 static unsigned short g_dos_sel = 0;
+
+/* VBE 3.0 / PMI state */
+static int           g_vbe3         = 0;    /* non-zero when VBE >= 3.0     */
+static int           g_force_vbe2   = 0;    /* non-zero to disable VBE 3.0  */
+static unsigned short g_vbe_version = 0;    /* raw VBE version (BCD)        */
+static int           g_pmi_ok       = 0;    /* non-zero when PMI page-flip  */
+static unsigned short g_pmi_rm_seg  = 0;    /* real-mode segment of PMI tbl */
+static unsigned short g_pmi_rm_off  = 0;    /* real-mode offset  of PMI tbl */
+static unsigned short g_pmi_size    = 0;    /* PMI table size in bytes      */
+static unsigned short g_pmi_setw_off  = 0;  /* SetWindow entry offset       */
+static unsigned short g_pmi_setds_off = 0;  /* SetDisplayStart entry offset */
+static unsigned short g_pmi_setpal_off= 0;  /* SetPrimaryPalette offset     */
 
 static unsigned char *dos_buf(void)
 {
@@ -252,6 +274,72 @@ static int vbe_set_display_start(unsigned short cx, unsigned short dy,
     rmi.ecx = (unsigned long)cx;
     rmi.edx = (unsigned long)dy;
     if (!dpmi_real_int(0x10, &rmi)) return 0;
+    return ((rmi.eax & 0xFFFF) == 0x004F);
+}
+
+/*
+ * VBE 3.0: query Protected Mode Interface via INT 10h AX=4F0Ah.
+ * Fills g_pmi_* globals.  Returns 1 on success, 0 if unavailable.
+ */
+static int query_pmi(void)
+{
+    RMI rmi;
+    unsigned long pmi_flat;
+
+    memset(&rmi, 0, sizeof(rmi));
+    rmi.eax = 0x4F0A;
+    rmi.ebx = 0x0000;   /* BL=00: get PM interface info */
+    if (!dpmi_real_int(0x10, &rmi)) return 0;
+    if ((rmi.eax & 0xFFFF) != 0x004F) return 0;
+
+    g_pmi_rm_seg = (unsigned short)rmi.es;
+    g_pmi_rm_off = (unsigned short)(rmi.edi & 0xFFFF);
+    g_pmi_size   = (unsigned short)(rmi.ecx & 0xFFFF);
+
+    if (g_pmi_size == 0) return 0;
+
+    /* Read entry offsets from the PMI table header (first 6 bytes) */
+    pmi_flat = (unsigned long)g_pmi_rm_seg * 16 + g_pmi_rm_off;
+    g_pmi_setw_off   = *(unsigned short *)(pmi_flat + 0);
+    g_pmi_setds_off  = *(unsigned short *)(pmi_flat + 2);
+    g_pmi_setpal_off = *(unsigned short *)(pmi_flat + 4);
+
+    return 1;
+}
+
+/* Call a real-mode far procedure via DPMI 0301h.
+ * Avoids INT 10h dispatch overhead vs dpmi_real_int (0300h). */
+static int dpmi_call_rm_proc(RMI *rmi)
+{
+    union REGS  r;
+    struct SREGS sr;
+    segread(&sr);
+    memset(&r, 0, sizeof(r));
+    r.x.eax = 0x0301;
+    r.x.ebx = 0;          /* BH = flags = 0 */
+    r.x.ecx = 0;          /* no stack words to copy */
+    r.x.edi = (unsigned int)rmi;
+    int386x(0x31, &r, &r, &sr);
+    return !(r.x.cflag);
+}
+
+/*
+ * VBE 3.0 PMI page flip: call SetDisplayStart entry directly via
+ * DPMI 0301h (call real-mode far procedure).  Bypasses the INT 10h
+ * dispatch and VBE function-number lookup — faster per-frame.
+ */
+static int pmi_set_display_start(unsigned short cx, unsigned short dy,
+                                 int wait)
+{
+    RMI rmi;
+    memset(&rmi, 0, sizeof(rmi));
+    rmi.eax = 0x4F07;
+    rmi.ebx = wait ? 0x0080UL : 0x0000UL;
+    rmi.ecx = (unsigned long)cx;
+    rmi.edx = (unsigned long)dy;
+    rmi.cs  = g_pmi_rm_seg;
+    rmi.ip  = g_pmi_rm_off + g_pmi_setds_off;
+    if (!dpmi_call_rm_proc(&rmi)) return 0;
     return ((rmi.eax & 0xFFFF) == 0x004F);
 }
 
@@ -505,7 +593,7 @@ static void blit_to_lfb(unsigned char *lfb, int lfb_pitch,
  * Main
  * -------------------------------------------------------------------------- */
 
-int main(void)
+int main(int argc, char *argv[])
 {
     VBEInfo    vbi;
     VBEModeInfo vbmi;
@@ -513,7 +601,7 @@ int main(void)
     int            lfb_pitch;
     unsigned long  lfb_phys;
     unsigned char *lfb;
-    unsigned char *frame_buf;       /* system-RAM fallback buffer       */
+    unsigned char *frame_buf;       /* system-RAM render buffer          */
     unsigned char  pal[256*4];
     unsigned char *font;
     char           msg[96];
@@ -525,9 +613,18 @@ int main(void)
     unsigned long  frame_count, last_ticks, now, elapsed;
     float          fps;
     volatile unsigned long *bios_ticks;
+    int            i;
 
     /* BIOS timer-tick counter at flat address 0x46C  (~18.2 ticks/sec) */
     bios_ticks = (volatile unsigned long *)0x46CUL;
+
+    /* Parse command-line flags */
+    for (i = 1; i < argc; i++) {
+        if (stricmp(argv[i], "-vbe2") == 0 ||
+            stricmp(argv[i], "/vbe2") == 0) {
+            g_force_vbe2 = 1;
+        }
+    }
 
     /* Conventional DOS memory:
      *   512 B VBEInfo  + 256 B ModeInfo  + 1024 B palette = 1792 B
@@ -549,6 +646,27 @@ int main(void)
         dpmi_free_dos();
         printf("VBE 2.0+ required (detected version %04X)\n", vbi.vbe_version);
         return 1;
+    }
+
+    g_vbe_version = vbi.vbe_version;
+    g_vbe3        = (vbi.vbe_version >= 0x0300);
+    if (g_force_vbe2)
+        g_vbe3 = 0;
+
+    printf("VBE version : %d.%d%s\n",
+           vbi.vbe_version >> 8, vbi.vbe_version & 0xFF,
+           g_vbe3 ? " (VBE 3.0)" :
+           g_force_vbe2 ? " (VBE 3.0 disabled by -vbe2)" : "");
+    printf("Video memory: %u KB\n", (unsigned)vbi.total_memory * 64);
+
+    /* VBE 3.0: query Protected Mode Interface */
+    if (g_vbe3) {
+        g_pmi_ok = query_pmi();
+        if (g_pmi_ok)
+            printf("PMI        : available at %04X:%04X  SetDisplayStart=%04X\n",
+                   g_pmi_rm_seg, g_pmi_rm_off, g_pmi_setds_off);
+        else
+            printf("PMI        : not available\n");
     }
 
     {
@@ -619,16 +737,20 @@ int main(void)
         return 1;
     }
 
-    /* ---- Allocate system-RAM frame buffer (fallback only) ------------- */
-    frame_buf = NULL;
-    if (!use_doublebuf) {
-        frame_buf = (unsigned char *)malloc(PIXELS);
-        if (!frame_buf) {
-            free(g_dist);
-            dpmi_free_dos();
-            printf("Out of memory (frame buffer)\n");
-            return 1;
-        }
+    /* ---- Allocate system-RAM frame buffer (always needed) ------------- */
+    /*
+     * Rendering plasma directly into VRAM is extremely slow because LFB
+     * writes are uncached (UC) or write-combining (WC).  Individual byte
+     * writes at ~100ns each × 786K pixels ≈ 78ms/frame → ~13 FPS.
+     * Instead, always render into fast cached system RAM, then blit to
+     * VRAM in one sequential burst (WC-friendly memcpy).
+     */
+    frame_buf = (unsigned char *)malloc(PIXELS);
+    if (!frame_buf) {
+        free(g_dist);
+        dpmi_free_dos();
+        printf("Out of memory (frame buffer)\n");
+        return 1;
     }
 
     printf("Initialising plasma tables...\n");
@@ -663,18 +785,17 @@ int main(void)
         if (!vbe_set_display_start(0, 0, 0)) {
             printf("4F07h not supported - falling back to single-buffer\n");
             use_doublebuf = 0;
-            /* re-alloc system RAM frame buffer */
-            frame_buf = (unsigned char *)malloc(PIXELS);
-            if (!frame_buf) {
-                vbe_set_text_mode();
-                dpmi_unmap_physical(lfb);
-                free(g_dist);
-                dpmi_free_dos();
-                printf("Out of memory (frame buffer fallback)\n");
-                return 1;
-            }
         } else {
             back_page = 1;   /* start rendering into page 1 */
+            /* Test PMI SetDisplayStart if available */
+            if (g_pmi_ok) {
+                if (!pmi_set_display_start(0, 0, 0)) {
+                    printf("PMI SetDisplayStart failed - using standard 4F07h\n");
+                    g_pmi_ok = 0;
+                    /* Reset display start via standard call */
+                    vbe_set_display_start(0, 0, 0);
+                }
+            }
         }
     }
 
@@ -696,18 +817,6 @@ int main(void)
 
     while (running) {
 
-        unsigned char *back_fb;
-        int            back_pitch;
-
-        /* Pointer and pitch for the buffer we render into this frame */
-        if (use_doublebuf) {
-            back_fb    = lfb + (unsigned long)back_page * page_size;
-            back_pitch = lfb_pitch;
-        } else {
-            back_fb    = frame_buf;
-            back_pitch = WIDTH;
-        }
-
         /* --- Keyboard --------------------------------------------------- */
         while (kbhit()) {
             int k = getch();
@@ -718,40 +827,44 @@ int main(void)
             }
         }
 
-        /* --- Render plasma directly into back buffer -------------------- */
-        render_plasma(back_fb, back_pitch, t);
+        /* --- Render plasma into system RAM (fast cached writes) --------- */
+        render_plasma(frame_buf, WIDTH, t);
 
-        /* --- HUD overlay ------------------------------------------------ */
+        /* --- HUD overlay (into system RAM) ------------------------------ */
         {
             const char *sync_str = vsync_on ? "ON " : "OFF";
             const char *buf_str  = use_doublebuf ? "DBL" : "SGL";
-            sprintf(msg, "VSYNC:%s BUF:%s FPS:%5.1f  [V]=toggle [ESC]=quit",
-                    sync_str, buf_str, fps);
-            draw_str_bg(back_fb, back_pitch, 4, 4, msg, 255, 0, font);
+            const char *pmi_str  = g_pmi_ok ? "YES" : "NO ";
+            sprintf(msg, "VSYNC:%s BUF:%s PMI:%s FPS:%5.1f  [V]=toggle [ESC]=quit",
+                    sync_str, buf_str, pmi_str, fps);
+            draw_str_bg(frame_buf, WIDTH, 4, 4, msg, 255, 0, font);
         }
 
         if (vsync_on) {
-            draw_str_2x(back_fb, back_pitch, 4, 16,
+            draw_str_2x(frame_buf, WIDTH, 4, 16,
                         "VSYNC ON  - tearing suppressed   ",
                         200, 0, font);
         } else {
-            draw_str_2x(back_fb, back_pitch, 4, 16,
+            draw_str_2x(frame_buf, WIDTH, 4, 16,
                         "VSYNC OFF - watch for tear line! ",
                         240, 0, font);
         }
 
         /* --- Present frame ---------------------------------------------- */
         if (use_doublebuf) {
-            /* VBE 4F07h page flip: swap displayed page, optionally wait
-             * for vsync.  With wait=1 the BIOS blocks until the next
-             * vertical retrace before switching — zero tearing.
-             * With wait=0 the flip is immediate — may produce a tear.
-             * Either way NO software spin-wait loop is needed.            */
-            vbe_set_display_start(0, (unsigned short)(back_page * HEIGHT),
-                                  vsync_on);
+            /* Blit from system RAM to VRAM back page (sequential, WC-fast) */
+            blit_to_lfb(lfb + (unsigned long)back_page * page_size,
+                        lfb_pitch, frame_buf);
+            /* Page flip: use PMI (faster) or standard VBE 4F07h */
+            if (g_pmi_ok)
+                pmi_set_display_start(0, (unsigned short)(back_page * HEIGHT),
+                                      vsync_on);
+            else
+                vbe_set_display_start(0, (unsigned short)(back_page * HEIGHT),
+                                      vsync_on);
             back_page = 1 - back_page;          /* toggle for next frame   */
         } else {
-            /* Single-buffer fallback: optional software vsync + blit     */
+            /* Single-buffer: optional software vsync + blit              */
             if (vsync_on)
                 wait_vsync();
             blit_to_lfb(lfb, lfb_pitch, frame_buf);
@@ -778,7 +891,9 @@ int main(void)
     free(g_dist);
     dpmi_free_dos();
 
-    printf("PLASMA done.  mode=0x%03X  DAC=%d-bit  buf:%s\n",
-           target_mode, g_dac_bits, use_doublebuf ? "double" : "single");
+    printf("PLASMA done.  mode=0x%03X  DAC=%d-bit  buf:%s  PMI:%s\n",
+           target_mode, g_dac_bits,
+           use_doublebuf ? "double" : "single",
+           g_pmi_ok ? "yes" : "no");
     return 0;
 }
