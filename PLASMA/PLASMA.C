@@ -126,6 +126,7 @@ static int           g_no_mtrr     = 0;    /* non-zero to skip MTRR WC     */
 static int           g_direct_vram = 0;    /* non-zero to render direct to VRAM (slow, for comparison) */
 static unsigned short g_vbe_version = 0;    /* raw VBE version (BCD)        */
 static int           g_pmi_ok       = 0;    /* non-zero when PMI page-flip  */
+static int           g_sched_flip   = 0;    /* VBE 3.0 scheduled flip (BL=02h) */
 static unsigned short g_pmi_rm_seg  = 0;    /* real-mode segment of PMI tbl */
 static unsigned short g_pmi_rm_off  = 0;    /* real-mode offset  of PMI tbl */
 static unsigned short g_pmi_size    = 0;    /* PMI table size in bytes      */
@@ -269,6 +270,16 @@ static void vbe_set_text_mode(void)
  * INT 31h AX=0300h (simulate real-mode interrupt), exactly the same
  * mechanism used for all other VBE calls in this program.
  */
+/*
+ * VBE 4F07h: Set/Get Display Start
+ *
+ * BL=00h: set display start immediately (may tear)
+ * BL=02h: VBE 3.0 scheduled flip — sets start address to take effect at
+ *         next vsync, returns immediately (non-blocking, tear-free)
+ * BL=04h: VBE 3.0 get scheduled flip status
+ *         returns BH: 0 = flip completed, 1 = flip still pending
+ * BL=80h: wait for vsync then set display start (blocking, tear-free)
+ */
 static int vbe_set_display_start(unsigned short cx, unsigned short dy,
                                  int wait)
 {
@@ -280,6 +291,32 @@ static int vbe_set_display_start(unsigned short cx, unsigned short dy,
     rmi.edx = (unsigned long)dy;
     if (!dpmi_real_int(0x10, &rmi)) return 0;
     return ((rmi.eax & 0xFFFF) == 0x004F);
+}
+
+/* VBE 3.0: schedule display start at next vsync (BL=02h, non-blocking). */
+static int vbe_schedule_display_start(unsigned short cx, unsigned short dy)
+{
+    RMI rmi;
+    memset(&rmi, 0, sizeof(rmi));
+    rmi.eax = 0x4F07;
+    rmi.ebx = 0x0002;
+    rmi.ecx = (unsigned long)cx;
+    rmi.edx = (unsigned long)dy;
+    if (!dpmi_real_int(0x10, &rmi)) return 0;
+    return ((rmi.eax & 0xFFFF) == 0x004F);
+}
+
+/* VBE 3.0: check if the last scheduled flip has completed (BL=04h).
+ * Returns 1 = flip done, 0 = still pending or error. */
+static int vbe_is_flip_complete(void)
+{
+    RMI rmi;
+    memset(&rmi, 0, sizeof(rmi));
+    rmi.eax = 0x4F07;
+    rmi.ebx = 0x0004;
+    if (!dpmi_real_int(0x10, &rmi)) return 1; /* assume done on error */
+    if ((rmi.eax & 0xFFFF) != 0x004F) return 1;
+    return ((rmi.ebx & 0xFF00) == 0);  /* BH=0 means flip complete */
 }
 
 /*
@@ -335,6 +372,16 @@ unsigned long _pmi_call4(unsigned long entry, unsigned long eax,
     value [eax]          \
     modify [ebx ecx edx esi edi]
 
+/* Same as above but returns EBX (for 4F07h BL=04h status check). */
+unsigned long _pmi_call4_ebx(unsigned long entry, unsigned long eax,
+                              unsigned long ebx,  unsigned long ecx,
+                              unsigned long edx);
+#pragma aux _pmi_call4_ebx = \
+    "call esi"               \
+    parm [esi] [eax] [ebx] [ecx] [edx] \
+    value [ebx]              \
+    modify [eax ecx edx esi edi]
+
 static int pmi_set_display_start(unsigned short cx, unsigned short dy,
                                  int wait)
 {
@@ -346,6 +393,28 @@ static int pmi_set_display_start(unsigned short cx, unsigned short dy,
                         (unsigned long)cx,
                         (unsigned long)dy);
     return ((result & 0xFFFF) == 0x004F);
+}
+
+/* PMI: schedule display start at next vsync (BL=02h, non-blocking). */
+static int pmi_schedule_display_start(unsigned short cx, unsigned short dy)
+{
+    unsigned long entry = (unsigned long)g_pmi_rm_seg * 16
+                        + g_pmi_rm_off + g_pmi_setds_off;
+    unsigned long result;
+    result = _pmi_call4(entry, 0x4F07, 0x0002UL,
+                        (unsigned long)cx,
+                        (unsigned long)dy);
+    return ((result & 0xFFFF) == 0x004F);
+}
+
+/* PMI: check if the last scheduled flip has completed (BL=04h). */
+static int pmi_is_flip_complete(void)
+{
+    unsigned long entry = (unsigned long)g_pmi_rm_seg * 16
+                        + g_pmi_rm_off + g_pmi_setds_off;
+    unsigned long ebx_out;
+    ebx_out = _pmi_call4_ebx(entry, 0x4F07, 0x0004UL, 0, 0);
+    return ((ebx_out & 0xFF00) == 0);  /* BH=0 means flip complete */
 }
 
 /* --------------------------------------------------------------------------
@@ -1023,6 +1092,20 @@ int main(int argc, char *argv[])
                     vbe_set_display_start(0, 0, 0);
                 }
             }
+            /* Test VBE 3.0 scheduled flip (BL=02h) for true triple buffering */
+            if (g_vbe3) {
+                int sched_ok;
+                if (g_pmi_ok)
+                    sched_ok = pmi_schedule_display_start(0, 0);
+                else
+                    sched_ok = vbe_schedule_display_start(0, 0);
+                if (sched_ok) {
+                    g_sched_flip = 1;
+                    printf("Sched flip : VBE 3.0 BL=02h supported (non-blocking vsync)\n");
+                } else {
+                    printf("Sched flip : VBE 3.0 BL=02h not supported\n");
+                }
+            }
         }
     }
 
@@ -1077,7 +1160,8 @@ int main(int argc, char *argv[])
 
             /* --- HUD overlay (into system RAM) -------------------------- */
             {
-                const char *sync_str = vsync_on ? "ON " : "OFF";
+                const char *sync_str = vsync_on ?
+                    (g_sched_flip ? "SCH" : "ON ") : "OFF";
                 const char *buf_str  = g_direct_vram ?
                                        (use_doublebuf ? "DBL" : "SGL") :
                                        (use_doublebuf ? "TRP" : "DBL");
@@ -1088,7 +1172,11 @@ int main(int argc, char *argv[])
                 draw_str_bg(frame_buf, WIDTH, 4, 4, msg, 255, 0, font);
             }
 
-            if (vsync_on) {
+            if (vsync_on && g_sched_flip) {
+                draw_str_2x(frame_buf, WIDTH, 4, 16,
+                            "VSYNC SCHED - non-blocking flip  ",
+                            180, 0, font);
+            } else if (vsync_on) {
                 draw_str_2x(frame_buf, WIDTH, 4, 16,
                             "VSYNC ON  - tearing suppressed   ",
                             200, 0, font);
@@ -1100,14 +1188,38 @@ int main(int argc, char *argv[])
 
             /* --- Present frame ------------------------------------------ */
             if (use_doublebuf) {
+                /* Wait for previous scheduled flip to complete before
+                 * overwriting the back page that may still be displayed. */
+                if (g_sched_flip) {
+                    if (g_pmi_ok) {
+                        while (!pmi_is_flip_complete()) {}
+                    } else {
+                        while (!vbe_is_flip_complete()) {}
+                    }
+                }
+
                 blit_to_lfb(lfb + (unsigned long)back_page * page_size,
                             lfb_pitch, frame_buf);
-                if (g_pmi_ok)
-                    pmi_set_display_start(0,
-                        (unsigned short)(back_page * HEIGHT), vsync_on);
-                else
-                    vbe_set_display_start(0,
-                        (unsigned short)(back_page * HEIGHT), vsync_on);
+
+                if (g_sched_flip && vsync_on) {
+                    /* VBE 3.0 non-blocking scheduled flip: schedule the
+                     * page flip for the next vsync and return immediately.
+                     * CPU can start rendering the next frame right away. */
+                    if (g_pmi_ok)
+                        pmi_schedule_display_start(0,
+                            (unsigned short)(back_page * HEIGHT));
+                    else
+                        vbe_schedule_display_start(0,
+                            (unsigned short)(back_page * HEIGHT));
+                } else {
+                    /* VBE 2.0 path: blocking vsync or immediate flip */
+                    if (g_pmi_ok)
+                        pmi_set_display_start(0,
+                            (unsigned short)(back_page * HEIGHT), vsync_on);
+                    else
+                        vbe_set_display_start(0,
+                            (unsigned short)(back_page * HEIGHT), vsync_on);
+                }
                 back_page = 1 - back_page;
             } else {
                 if (vsync_on)
