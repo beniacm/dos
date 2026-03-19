@@ -1431,18 +1431,23 @@ int main(int argc, char *argv[])
         if (g_bench_combined_ms > 0.0) {
             double r_pct = g_bench_render_ms   / g_bench_combined_ms * 100.0;
             double b_pct = g_bench_blit_ms     / g_bench_combined_ms * 100.0;
-            unsigned long blit_mbs = (unsigned long)(
-                PIXELS / 1024.0 / 1024.0 / (g_bench_blit_ms / 1000.0));
+            unsigned long blit_mbs = g_bench_blit_ms > 0.0
+                ? (unsigned long)(PIXELS / 1024.0 / 1024.0 / (g_bench_blit_ms / 1000.0))
+                : 0UL;
             const char *bn = (r_pct >= 60.0) ? "RENDER" :
                              (b_pct >= 60.0) ? "BLIT"   : "balanced";
             printf("==========================================\n");
             printf(" Benchmark (%d frames, sysram+blit)\n", BENCH_FRAMES);
             printf("  Render : %5.2f ms  %4.0f FPS  (%3.0f%%)\n",
                    g_bench_render_ms,
-                   1000.0 / g_bench_render_ms, r_pct);
-            printf("  Blit   : %5.2f ms  %4.0f FPS  (%3.0f%%)  %lu MB/s\n",
-                   g_bench_blit_ms,
-                   1000.0 / g_bench_blit_ms, b_pct, blit_mbs);
+                   g_bench_render_ms > 0.0 ? 1000.0 / g_bench_render_ms : 0.0,
+                   r_pct);
+            if (g_bench_blit_ms > 0.0)
+                printf("  Blit   : %5.2f ms  %4.0f FPS  (%3.0f%%)  %lu MB/s\n",
+                       g_bench_blit_ms,
+                       1000.0 / g_bench_blit_ms, b_pct, blit_mbs);
+            else
+                printf("  Blit   :  0.00 ms  <1 tick (too fast to measure)\n");
             printf("  Total  : %5.2f ms  %4.0f FPS  bottleneck: %s\n",
                    g_bench_combined_ms,
                    1000.0 / g_bench_combined_ms, bn);
