@@ -36,6 +36,7 @@
 #include <string.h>
 #include <math.h>
 #include <conio.h>
+#include <dos.h>
 #include <i86.h>
 
 /* --------------------------------------------------------------------------
@@ -341,6 +342,180 @@ static int pmi_set_display_start(unsigned short cx, unsigned short dy,
     rmi.ip  = g_pmi_rm_off + g_pmi_setds_off;
     if (!dpmi_call_rm_proc(&rmi)) return 0;
     return ((rmi.eax & 0xFFFF) == 0x004F);
+}
+
+/* --------------------------------------------------------------------------
+ * MTRR Write-Combining for LFB
+ *
+ * When running at ring 0 (PMODE/W), programs a CPU variable-range MTRR to
+ * mark the LFB physical address range as write-combining (WC).  The CPU
+ * then combines sequential byte/word/dword writes into full cache-line
+ * burst transactions over PCI/PCIe — typically ~10x faster VRAM blits.
+ *
+ * When running at ring 3 (DOS4GW), MTRR setup is skipped since
+ * RDMSR/WRMSR are privileged (ring-0) instructions.
+ * -------------------------------------------------------------------------- */
+
+#define MSR_MTRRCAP         0xFE
+#define MSR_MTRR_PHYSBASE0  0x200
+#define MSR_MTRR_PHYSMASK0  0x201
+#define MTRR_TYPE_WC        1
+
+/* Inline helpers for privileged CPU instructions (ring 0 only).
+ * Use raw opcodes to avoid assembler version dependencies. */
+
+unsigned short _get_cs(void);
+#pragma aux _get_cs = "mov ax, cs" value [ax]
+
+int _has_cpuid(void);
+#pragma aux _has_cpuid = \
+    "pushfd"           \
+    "pop eax"          \
+    "mov ecx, eax"     \
+    "xor eax, 200000h" \
+    "push eax"         \
+    "popfd"            \
+    "pushfd"           \
+    "pop eax"          \
+    "xor eax, ecx"     \
+    "shr eax, 21"      \
+    "and eax, 1"       \
+    value [eax]        \
+    modify [ecx]
+
+unsigned long _cpuid1_edx(void);
+#pragma aux _cpuid1_edx = \
+    "mov eax, 1"       \
+    "db 0Fh, 0A2h"     \
+    value [edx]         \
+    modify [eax ebx ecx]
+
+unsigned long _rdmsr_lo(unsigned long);
+#pragma aux _rdmsr_lo = \
+    "db 0Fh, 32h"      \
+    parm [ecx]          \
+    value [eax]         \
+    modify [edx]
+
+unsigned long _rdmsr_hi(unsigned long);
+#pragma aux _rdmsr_hi = \
+    "db 0Fh, 32h"      \
+    parm [ecx]          \
+    value [edx]         \
+    modify [eax]
+
+void _wrmsr_3(unsigned long, unsigned long, unsigned long);
+#pragma aux _wrmsr_3 = \
+    "db 0Fh, 30h"      \
+    parm [ecx] [eax] [edx]
+
+void _wbinvd(void);
+#pragma aux _wbinvd = "db 0Fh, 09h"
+
+/* MTRR state for cleanup on exit */
+static int           g_mtrr_slot = -1;
+static unsigned long g_mtrr_save_base_lo, g_mtrr_save_base_hi;
+static unsigned long g_mtrr_save_mask_lo, g_mtrr_save_mask_hi;
+static int           g_mtrr_wc = 0;  /* 0=off, 1=set by us, 2=already set */
+
+static unsigned long next_pow2(unsigned long v)
+{
+    v--;
+    v |= v >> 1;  v |= v >> 2;
+    v |= v >> 4;  v |= v >> 8;
+    v |= v >> 16;
+    return v + 1;
+}
+
+/*
+ * Set up MTRR write-combining for [phys_addr, phys_addr + vram_bytes).
+ *  Returns:  1 = WC enabled by us
+ *           -1 = WC already active (BIOS/chipset)
+ *            0 = not possible (ring 3, no MTRR, no free slot, etc.)
+ */
+static int setup_mtrr_wc(unsigned long phys_addr, unsigned long vram_bytes)
+{
+    unsigned long cap_lo, size, mask_val;
+    int num_var, i;
+
+    /* Ring 0 required for RDMSR/WRMSR */
+    if ((_get_cs() & 3) != 0) return 0;
+
+    if (!_has_cpuid()) return 0;
+
+    /* CPUID.1 EDX bit 12 = MTRR support */
+    if (!(_cpuid1_edx() & (1UL << 12))) return 0;
+
+    /* MTRRCAP: bits 7:0 = # variable MTRRs, bit 10 = WC type supported */
+    cap_lo = _rdmsr_lo(MSR_MTRRCAP);
+    num_var = (int)(cap_lo & 0xFF);
+    if (!(cap_lo & (1UL << 10))) return 0;
+    if (num_var == 0) return 0;
+
+    /* Check if an existing MTRR already covers our LFB as WC */
+    for (i = 0; i < num_var; i++) {
+        unsigned long mlo = _rdmsr_lo(MSR_MTRR_PHYSMASK0 + i * 2);
+        unsigned long blo = _rdmsr_lo(MSR_MTRR_PHYSBASE0 + i * 2);
+        if (!(mlo & 0x800)) continue;              /* not valid          */
+        if ((blo & 0xFF) != MTRR_TYPE_WC) continue; /* not WC            */
+        if ((phys_addr & (mlo & 0xFFFFF000UL)) ==
+            (blo & 0xFFFFF000UL)) {
+            g_mtrr_wc = 2;
+            return -1;                             /* already WC         */
+        }
+    }
+
+    /* Round VRAM size to power-of-2 (MTRR size constraint) */
+    size = next_pow2(vram_bytes);
+    if (phys_addr & (size - 1)) return 0;  /* must be naturally aligned */
+
+    mask_val = ~(size - 1) & 0xFFFFF000UL;
+
+    /* Find a free variable-range MTRR slot (valid bit clear) */
+    for (i = 0; i < num_var; i++) {
+        unsigned long mlo = _rdmsr_lo(MSR_MTRR_PHYSMASK0 + i * 2);
+        if (mlo & 0x800) continue;   /* slot in use */
+
+        /* Save original values for cleanup */
+        g_mtrr_save_base_lo = _rdmsr_lo(MSR_MTRR_PHYSBASE0 + i * 2);
+        g_mtrr_save_base_hi = _rdmsr_hi(MSR_MTRR_PHYSBASE0 + i * 2);
+        g_mtrr_save_mask_lo = mlo;
+        g_mtrr_save_mask_hi = _rdmsr_hi(MSR_MTRR_PHYSMASK0 + i * 2);
+        g_mtrr_slot = i;
+
+        /* Program MTRR: CLI, flush caches, write, flush, STI */
+        _disable();
+        _wbinvd();
+        _wrmsr_3(MSR_MTRR_PHYSBASE0 + i * 2,
+                 (phys_addr & 0xFFFFF000UL) | MTRR_TYPE_WC, 0);
+        _wrmsr_3(MSR_MTRR_PHYSMASK0 + i * 2,
+                 mask_val | 0x800, 0);
+        _wbinvd();
+        _enable();
+
+        g_mtrr_wc = 1;
+        return 1;
+    }
+
+    return 0;   /* no free slot */
+}
+
+static void restore_mtrr(void)
+{
+    if (g_mtrr_slot < 0) return;
+    if ((_get_cs() & 3) != 0) return;
+
+    _disable();
+    _wbinvd();
+    _wrmsr_3(MSR_MTRR_PHYSBASE0 + g_mtrr_slot * 2,
+             g_mtrr_save_base_lo, g_mtrr_save_base_hi);
+    _wrmsr_3(MSR_MTRR_PHYSMASK0 + g_mtrr_slot * 2,
+             g_mtrr_save_mask_lo, g_mtrr_save_mask_hi);
+    _wbinvd();
+    _enable();
+
+    g_mtrr_slot = -1;
+    g_mtrr_wc = 0;
 }
 
 /* --------------------------------------------------------------------------
@@ -770,6 +945,21 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    /* ---- MTRR Write-Combining for LFB --------------------------------- */
+    {
+        unsigned long total_vram = (unsigned long)vbi.total_memory * 65536UL;
+        int wc = setup_mtrr_wc(lfb_phys, total_vram);
+        if (wc == 1)
+            printf("MTRR WC    : enabled (slot %d, %luMB at 0x%08lX)\n",
+                   g_mtrr_slot, next_pow2(total_vram) >> 20, lfb_phys);
+        else if (wc == -1)
+            printf("MTRR WC    : already active (BIOS/chipset)\n");
+        else if ((_get_cs() & 3) != 0)
+            printf("MTRR WC    : skipped (ring 3 — use PMODE/W for ring 0)\n");
+        else
+            printf("MTRR WC    : not available\n");
+    }
+
     /* ---- Set video mode ------------------------------------------------ */
     if (!vbe_set_mode(target_mode)) {
         dpmi_unmap_physical(lfb);
@@ -835,8 +1025,9 @@ int main(int argc, char *argv[])
             const char *sync_str = vsync_on ? "ON " : "OFF";
             const char *buf_str  = use_doublebuf ? "DBL" : "SGL";
             const char *pmi_str  = g_pmi_ok ? "YES" : "NO ";
-            sprintf(msg, "VSYNC:%s BUF:%s PMI:%s FPS:%5.1f  [V]=toggle [ESC]=quit",
-                    sync_str, buf_str, pmi_str, fps);
+            const char *wc_str   = g_mtrr_wc ? "YES" : "NO ";
+            sprintf(msg, "VSYNC:%s BUF:%s PMI:%s WC:%s FPS:%5.1f  [V]=vsync [ESC]=quit",
+                    sync_str, buf_str, pmi_str, wc_str, fps);
             draw_str_bg(frame_buf, WIDTH, 4, 4, msg, 255, 0, font);
         }
 
@@ -886,14 +1077,16 @@ int main(int argc, char *argv[])
 
     /* ---- Cleanup ------------------------------------------------------- */
     vbe_set_text_mode();
+    restore_mtrr();
     dpmi_unmap_physical(lfb);
     free(frame_buf);
     free(g_dist);
     dpmi_free_dos();
 
-    printf("PLASMA done.  mode=0x%03X  DAC=%d-bit  buf:%s  PMI:%s\n",
+    printf("PLASMA done.  mode=0x%03X  DAC=%d-bit  buf:%s  PMI:%s  WC:%s\n",
            target_mode, g_dac_bits,
            use_doublebuf ? "double" : "single",
-           g_pmi_ok ? "yes" : "no");
+           g_pmi_ok ? "yes" : "no",
+           g_mtrr_wc == 1 ? "mtrr" : g_mtrr_wc == 2 ? "bios" : "no");
     return 0;
 }
