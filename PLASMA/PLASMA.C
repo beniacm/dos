@@ -41,6 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include <conio.h>
 #include <dos.h>
 #include <i86.h>
@@ -875,35 +876,35 @@ static void wait_vsync(void)
 static unsigned char  g_sintab[256];         /* 256 B — always L1-hot       */
 static unsigned char  g_xdist[WIDTH];        /* 1 KB — always L1-hot        */
 static unsigned char  g_ydist[HEIGHT];       /* 768 B — always L1-hot       */
+static unsigned char *g_dist  = NULL;        /* WIDTH*HEIGHT Euclidean dist  */
 
-/*
- * Precompute sine table and two 1-D distance tables (x and y axes).
- * These replace the old WIDTH*HEIGHT (768 KB) Euclidean distance table.
- * Combined size: 256 + 1024 + 768 = 2048 bytes — fits entirely in L1 cache.
- *
- * Distance metric: anisotropic Chebyshev — each axis is independently
- * normalised to [0, 255], then max(xd, yd) is taken per pixel.
- * This produces concentric rounded-rectangle rings instead of circles;
- * visually indistinguishable in the full plasma with 3 other wave components.
- * Eliminates the dependent-load bottleneck (sintab[dist_row[x]]) that was
- * the primary cause of L2 stalls on Pentium D (768 KB > 16 KB L1).
- */
 static void init_plasma_tables(void)
 {
     int x, y;
-    int cx = WIDTH  / 2;   /* 512 */
-    int cy = HEIGHT / 2;   /* 384 */
+    double cx   = WIDTH  / 2.0;
+    double cy   = HEIGHT / 2.0;
+    double maxd = sqrt(cx*cx + cy*cy);
+    int icx = WIDTH  / 2;
+    int icy = HEIGHT / 2;
 
     for (x = 0; x < 256; x++)
         g_sintab[x] = (unsigned char)((sin(x * 6.283185307 / 256.0) + 1.0) * 127.5);
 
-    /* x-axis: 0 at centre, 255 at left/right edges */
-    for (x = 0; x < WIDTH; x++)
-        g_xdist[x] = (unsigned char)((abs(x - cx) * 255 + cx - 1) / cx);
+    /* Euclidean distance table (768 KB — primary radial wave) */
+    for (y = 0; y < HEIGHT; y++) {
+        double dy = y - cy;
+        for (x = 0; x < WIDTH; x++) {
+            double dx = x - cx;
+            double d  = sqrt(dx*dx + dy*dy) / maxd * 255.0;
+            g_dist[y * WIDTH + x] = (unsigned char)(d > 255.0 ? 255.0 : d);
+        }
+    }
 
-    /* y-axis: 0 at centre, 255 at top/bottom edges */
+    /* 1-D Chebyshev tables (2 KB total — kept for reference/future use) */
+    for (x = 0; x < WIDTH;  x++)
+        g_xdist[x] = (unsigned char)((abs(x - icx) * 255 + icx - 1) / icx);
     for (y = 0; y < HEIGHT; y++)
-        g_ydist[y] = (unsigned char)((abs(y - cy) * 255 + cy - 1) / cy);
+        g_ydist[y] = (unsigned char)((abs(y - icy) * 255 + icy - 1) / icy);
 }
 
 /*
@@ -918,23 +919,22 @@ static void render_plasma(unsigned char *buf, int pitch, unsigned int t)
     unsigned int t2 = (t + t/2)   & 0xFF;   /* 1.5x                        */
     unsigned int t3 = (t*2)       & 0xFF;   /* 2x – diagonal               */
     unsigned int t4 = (t*3)       & 0xFF;   /* 3x – radial (fast ripple)   */
+    const unsigned char *dist_row = g_dist;
 
     for (y = 0; y < HEIGHT; y++) {
         unsigned char *dst = buf + (unsigned long)y * pitch;
         int vy    = (int)g_sintab[((unsigned int)(y >> 1) + t1) & 0xFF];
         int dbase = (y >> 1) & 0xFF;
-        unsigned int yd = g_ydist[y];   /* L1-hot, loaded once per row     */
 
         for (x = 0; x < WIDTH; x++) {
-            unsigned int xd = g_xdist[x];   /* L1-hot, sequential          */
-            unsigned int d  = (xd > yd) ? xd : yd; /* Chebyshev distance   */
             int v;
             v  = (int)g_sintab[((unsigned int)(x >> 1) + t2) & 0xFF];
             v += vy;
             v += (int)g_sintab[((unsigned int)((x >> 1) + dbase) + t3) & 0xFF];
-            v += (int)g_sintab[(d + t4) & 0xFF];
+            v += (int)g_sintab[((unsigned int)dist_row[x] + t4) & 0xFF];
             dst[x] = (unsigned char)(v >> 2);
         }
+        dist_row += WIDTH;
     }
 }
 
@@ -976,6 +976,95 @@ static void blit_to_lfb(unsigned char *lfb, int lfb_pitch,
             memcpy(lfb + (unsigned long)y * lfb_pitch,
                    src + (unsigned long)y * WIDTH, WIDTH);
     }
+}
+
+/* --------------------------------------------------------------------------
+ * Startup performance benchmark
+ *
+ * Runs before the demo loop to show where the time goes.
+ * Called after LFB is mapped and MTRR WC is set up.
+ * Measures render, blit, and render+blit in isolation.
+ * -------------------------------------------------------------------------- */
+
+#define BENCH_FRAMES 100
+
+static void run_benchmark(unsigned char *lfb, int lfb_pitch)
+{
+    clock_t  t0, t1;
+    double   render_ms, blit_ms, combined_ms;
+    double   render_fps, blit_fps, combined_fps;
+    unsigned char *tmp;
+    int      i;
+    const char *bottleneck;
+
+    /* Allocate a temporary sysram buffer if needed */
+    tmp = (unsigned char *)malloc(PIXELS);
+    if (!tmp) {
+        printf("  (benchmark skipped: out of memory)\n");
+        return;
+    }
+    memset(tmp, 0x80, PIXELS);
+
+    printf("\n--- Startup Benchmark (%d frames, 1024x768 8bpp) ---\n",
+           BENCH_FRAMES);
+
+    /* --- Render only (no blit, writes to sysram) --- */
+    render_plasma(tmp, WIDTH, 0);   /* warm up caches */
+    t0 = clock();
+    for (i = 0; i < BENCH_FRAMES; i++)
+        render_plasma(tmp, WIDTH, (unsigned int)i * 3);
+    t1 = clock();
+    render_ms  = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC / BENCH_FRAMES;
+    render_fps = render_ms > 0.0 ? 1000.0 / render_ms : 0.0;
+
+    /* --- Blit only (sysram -> VRAM, no render) --- */
+    blit_to_lfb(lfb, lfb_pitch, tmp);  /* warm up VRAM write path */
+    t0 = clock();
+    for (i = 0; i < BENCH_FRAMES; i++)
+        blit_to_lfb(lfb, lfb_pitch, tmp);
+    t1 = clock();
+    blit_ms  = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC / BENCH_FRAMES;
+    blit_fps = blit_ms > 0.0 ? 1000.0 / blit_ms : 0.0;
+
+    /* --- Render + Blit combined (matches real demo loop) --- */
+    t0 = clock();
+    for (i = 0; i < BENCH_FRAMES; i++) {
+        render_plasma(tmp, WIDTH, (unsigned int)i * 3);
+        blit_to_lfb(lfb, lfb_pitch, tmp);
+    }
+    t1 = clock();
+    combined_ms  = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC / BENCH_FRAMES;
+    combined_fps = combined_ms > 0.0 ? 1000.0 / combined_ms : 0.0;
+
+    free(tmp);
+
+    /* Identify bottleneck */
+    if (combined_ms > 0.0) {
+        double render_share = render_ms / combined_ms;
+        double blit_share   = blit_ms   / combined_ms;
+        if (render_share >= 0.60)      bottleneck = "RENDER";
+        else if (blit_share >= 0.60)   bottleneck = "BLIT";
+        else                            bottleneck = "balanced";
+    } else {
+        bottleneck = "?";
+    }
+
+    printf("  Render only : %5.2f ms/frame  ->  %5.0f FPS\n",
+           render_ms, render_fps);
+    printf("  Blit only   : %5.2f ms/frame  ->  %5.0f FPS"
+           "  (%lu MB/s)\n",
+           blit_ms, blit_fps,
+           blit_ms > 0.0
+               ? (unsigned long)(PIXELS / 1024.0 / 1024.0
+                                 / (blit_ms / 1000.0))
+               : 0UL);
+    printf("  Combined    : %5.2f ms/frame  ->  %5.0f FPS"
+           "  (bottleneck: %s)\n",
+           combined_ms, combined_fps, bottleneck);
+    printf("  Render %%    : %.0f%%   Blit %%: %.0f%%\n",
+           combined_ms > 0.0 ? render_ms / combined_ms * 100.0 : 0.0,
+           combined_ms > 0.0 ? blit_ms   / combined_ms * 100.0 : 0.0);
+    printf("----------------------------------------------------\n");
 }
 
 /* --------------------------------------------------------------------------
@@ -1161,12 +1250,21 @@ int main(int argc, char *argv[])
     if (!g_direct_vram) {
         frame_buf = (unsigned char *)malloc(PIXELS);
         if (!frame_buf) {
+            free(g_dist);
             dpmi_free_dos();
             printf("Out of memory (frame buffer)\n");
             return 1;
         }
     }
     printf("Render     : %s\n", g_direct_vram ? "direct-to-VRAM (-directvram)" : "system-RAM + blit");
+
+    /* ---- Allocate distance table --------------------------------------- */
+    g_dist = (unsigned char *)malloc(PIXELS);
+    if (!g_dist) {
+        dpmi_free_dos();
+        printf("Out of memory (distance table)\n");
+        return 1;
+    }
 
     init_plasma_tables();
 
@@ -1177,6 +1275,7 @@ int main(int argc, char *argv[])
     }
     if (!lfb) {
         free(frame_buf);
+        free(g_dist);
         dpmi_free_dos();
         printf("Cannot map LFB at 0x%08lX\n", lfb_phys);
         return 1;
@@ -1199,10 +1298,14 @@ int main(int argc, char *argv[])
         printf("MTRR WC    : disabled by -nomtrr\n");
     }
 
+    /* ---- Startup performance benchmark --------------------------------- */
+    run_benchmark(lfb, lfb_pitch);
+
     /* ---- Brief mode set to test page-flip features --------------------- */
     if (!vbe_set_mode(target_mode)) {
         dpmi_unmap_physical(lfb);
         if (frame_buf) free(frame_buf);
+        free(g_dist);
         dpmi_free_dos();
         printf("Set mode 0x%03X failed\n", target_mode);
         return 1;
@@ -1368,6 +1471,7 @@ int main(int argc, char *argv[])
     if (!vbe_set_mode(target_mode)) {
         dpmi_unmap_physical(lfb);
         if (frame_buf) free(frame_buf);
+        free(g_dist);
         dpmi_free_dos();
         return 1;
     }
@@ -1561,6 +1665,7 @@ int main(int argc, char *argv[])
     restore_mtrr();
     dpmi_unmap_physical(lfb);
     if (frame_buf) free(frame_buf);
+    free(g_dist);
     dpmi_free_dos();
 
     printf("PLASMA done.  mode=0x%03X  DAC=%d-bit  buf:%s  PMI:%s  HWF:%s  WC:%s  sched:%s  render:%s\n",
