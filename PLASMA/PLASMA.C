@@ -283,6 +283,9 @@ static void vbe_set_text_mode(void)
  * BL=04h: VBE 3.0 get scheduled flip status
  *         returns BH: 0 = flip completed, 1 = flip still pending
  * BL=80h: wait for vsync then set display start (blocking, tear-free)
+ *         NOTE: unreliable on ATI ATOMBIOS — slow command table execution
+ *         can miss the vsync window, causing tearing.  Prefer BL=00h with
+ *         separate wait_vsync() via port 0x3DA.
  */
 static int vbe_set_display_start(unsigned short cx, unsigned short dy,
                                  int wait)
@@ -1319,13 +1322,29 @@ int main(int argc, char *argv[])
                         vbe_schedule_display_start(0,
                             (unsigned short)(back_page * HEIGHT));
                 } else {
-                    /* VBE 2.0 path: blocking vsync or immediate flip */
+                    /* Always use immediate flip (BL=00h).
+                     *
+                     * BL=80h (BIOS-managed vsync wait) is unreliable on
+                     * modern GPUs: ATI ATOMBIOS executes slow command tables
+                     * to program the CRTC, missing the vsync blanking window
+                     * and causing tearing DURING active display.
+                     *
+                     * Modern GPUs (Radeon etc.) double-buffer the CRTC start
+                     * address: BL=00h latches the address immediately, and
+                     * the hardware applies it at the next vsync.  So BL=00h
+                     * is inherently tear-free on double-buffered hardware.
+                     *
+                     * For vsync throttling we wait_vsync() AFTER the flip to
+                     * ensure the page swap has completed before we overwrite
+                     * the old displayed page on the next iteration. */
                     if (g_pmi_ok)
                         pmi_set_display_start(0,
-                            (unsigned short)(back_page * HEIGHT), vsync_on);
+                            (unsigned short)(back_page * HEIGHT), 0);
                     else
                         vbe_set_display_start(0,
-                            (unsigned short)(back_page * HEIGHT), vsync_on);
+                            (unsigned short)(back_page * HEIGHT), 0);
+                    if (vsync_on)
+                        wait_vsync();
                 }
                 back_page = 1 - back_page;
             } else {
