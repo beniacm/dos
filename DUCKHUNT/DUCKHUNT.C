@@ -1036,19 +1036,14 @@ static void gen_cobble_tex(unsigned char tex[TEX_H][TEX_W])
     int x, y;
     for (y = 0; y < TEX_H; y++) {
         for (x = 0; x < TEX_W; x++) {
-            int row = y / 16;
-            int ox = (row & 1) ? 8 : 0;
-            int bx = (x + ox) % 16;
-            int cy = y % 16;
-            int n = hash2d(x, y) & 3;
-            int shade;
-            if (cy < 1 || bx < 1)
-                shade = 3 + (n & 1);
-            else {
-                int block = hash2d((x + ox) / 16, y / 16) & 7;
-                shade = 5 + block / 2 + n;
-            }
+            /* Multi-octave noise: rough stone floor */
+            int n0 = hash2d(x, y) & 255;
+            int n1 = hash2d(x / 3 + 97, y / 3 + 53) & 255;
+            int n2 = hash2d(x / 7 + 31, y / 7 + 71) & 255;
+            int val = n0 * 2 + n1 * 4 + n2 * 5;
+            int shade = 3 + val * 10 / (255 * 11);
             if (shade > 13) shade = 13;
+            if (shade < 3) shade = 3;
             tex[y][x] = PAL(HUE_FLOOR, shade);
         }
     }
@@ -1059,18 +1054,14 @@ static void gen_dungeon_ceil_tex(unsigned char tex[TEX_H][TEX_W])
     int x, y;
     for (y = 0; y < TEX_H; y++) {
         for (x = 0; x < TEX_W; x++) {
-            int n = hash2d(x, y) & 3;
-            int shade;
-            if ((y % 32) < 1 || (x % 32) < 1)
-                shade = 3 + (n & 1);
-            else {
-                int block = hash2d(x / 32, y / 32) & 3;
-                shade = 6 + block + (n >> 1);
-                if (hash2d(x / 8, y / 8) > 220)
-                    shade -= 2;
-            }
-            if (shade < 2) shade = 2;
+            /* Multi-octave noise: dark mossy stone ceiling */
+            int n0 = hash2d(x + 200, y + 150) & 255;
+            int n1 = hash2d(x / 3 + 43, y / 3 + 17) & 255;
+            int n2 = hash2d(x / 6 + 89, y / 6 + 61) & 255;
+            int val = n0 * 2 + n1 * 3 + n2 * 6;
+            int shade = 2 + val * 9 / (255 * 11);
             if (shade > 11) shade = 11;
+            if (shade < 2) shade = 2;
             tex[y][x] = PAL(HUE_STONE, shade);
         }
     }
