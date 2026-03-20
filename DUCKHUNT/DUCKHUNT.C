@@ -95,7 +95,8 @@
 #define HUE_CREAM   30
 #define HUE_DKBLUE  31
 
-#define PAL(h,s)    ((unsigned char)((h)*4+(s)))
+#define PAL(h,s)    ((unsigned char)((h)*8+(s)))
+#define NUM_LIGHT   32  /* Doom-style light levels: 0=bright, 31=dark */
 
 /* Scan codes */
 #define SC_ESC   0x01
@@ -907,17 +908,19 @@ static int mouse_get_buttons(void)
 }
 
 /* ========================================================================
- *  PALETTE SETUP
+ *  PALETTE SETUP + DOOM-STYLE COLORMAPS
  * ======================================================================== */
+
+static unsigned char g_colormap[NUM_LIGHT][256];  /* [light_level][palette_index] */
 
 static void build_ramp(unsigned char *out, int r0, int g0, int b0,
                        int r1, int g1, int b1)
 {
     int i;
-    for (i = 0; i < 4; i++) {
-        out[i * 3 + 0] = (unsigned char)(r0 + (r1 - r0) * i / 3);
-        out[i * 3 + 1] = (unsigned char)(g0 + (g1 - g0) * i / 3);
-        out[i * 3 + 2] = (unsigned char)(b0 + (b1 - b0) * i / 3);
+    for (i = 0; i < 8; i++) {
+        out[i * 3 + 0] = (unsigned char)(r0 + (r1 - r0) * i / 7);
+        out[i * 3 + 1] = (unsigned char)(g0 + (g1 - g0) * i / 7);
+        out[i * 3 + 2] = (unsigned char)(b0 + (b1 - b0) * i / 7);
     }
 }
 
@@ -931,71 +934,97 @@ static void setup_palette(void)
     memset(pal, 0, sizeof(pal));
 
     /* HUE 0: grayscale */
-    build_ramp(&pal[HUE_GRAY * 4 * 3], 0, 0, 0, m, m, m);
+    build_ramp(&pal[HUE_GRAY * 8 * 3], 0, 0, 0, m, m, m);
     /* HUE 1: brick (dark red-brown to red) */
-    build_ramp(&pal[HUE_BRICK * 4 * 3], m/16, 0, 0, m*3/4, m/4, m/8);
+    build_ramp(&pal[HUE_BRICK * 8 * 3], m/16, 0, 0, m*3/4, m/4, m/8);
     /* HUE 2: stone (dark gray to light gray) */
-    build_ramp(&pal[HUE_STONE * 4 * 3], m/16, m/16, m/16, m*3/4, m*3/4, m*11/16);
+    build_ramp(&pal[HUE_STONE * 8 * 3], m/16, m/16, m/16, m*3/4, m*3/4, m*11/16);
     /* HUE 3: wood (dark brown to light brown) */
-    build_ramp(&pal[HUE_WOOD * 4 * 3], m/16, m/32, 0, m*5/8, m*3/8, m/8);
+    build_ramp(&pal[HUE_WOOD * 8 * 3], m/16, m/32, 0, m*5/8, m*3/8, m/8);
     /* HUE 4: moss (dark green to green) */
-    build_ramp(&pal[HUE_MOSS * 4 * 3], 0, m/16, 0, m/4, m*5/8, m/8);
+    build_ramp(&pal[HUE_MOSS * 8 * 3], 0, m/16, 0, m/4, m*5/8, m/8);
     /* HUE 5: metal (dark blue-gray to light steel) */
-    build_ramp(&pal[HUE_METAL * 4 * 3], m/16, m/16, m/8, m/2, m*9/16, m*3/4);
+    build_ramp(&pal[HUE_METAL * 8 * 3], m/16, m/16, m/8, m/2, m*9/16, m*3/4);
     /* HUE 6: sky (dark blue to medium blue) */
-    build_ramp(&pal[HUE_SKY * 4 * 3], 0, 0, m/8, m/6, m/4, m*5/8);
+    build_ramp(&pal[HUE_SKY * 8 * 3], 0, 0, m/8, m/6, m/4, m*5/8);
     /* HUE 7: floor (very dark brown to medium brown) */
-    build_ramp(&pal[HUE_FLOOR * 4 * 3], m/20, m/32, m/40, m*3/8, m/4, m/8);
+    build_ramp(&pal[HUE_FLOOR * 8 * 3], m/20, m/32, m/40, m*3/8, m/4, m/8);
     /* HUE 8: duck yellow */
-    build_ramp(&pal[HUE_DUCK * 4 * 3], m/8, m/8, 0, m, m*7/8, m/8);
+    build_ramp(&pal[HUE_DUCK * 8 * 3], m/8, m/8, 0, m, m*7/8, m/8);
     /* HUE 9: orange (bill, feet) */
-    build_ramp(&pal[HUE_ORANGE * 4 * 3], m/8, m/16, 0, m, m/2, 0);
+    build_ramp(&pal[HUE_ORANGE * 8 * 3], m/8, m/16, 0, m, m/2, 0);
     /* HUE 10: blood/damage red */
-    build_ramp(&pal[HUE_BLOOD * 4 * 3], m/8, 0, 0, m, 0, 0);
+    build_ramp(&pal[HUE_BLOOD * 8 * 3], m/8, 0, 0, m, 0, 0);
     /* HUE 11: tan */
-    build_ramp(&pal[HUE_TAN * 4 * 3], m/16, m/16, m/32, m*5/8, m/2, m*3/8);
+    build_ramp(&pal[HUE_TAN * 8 * 3], m/16, m/16, m/32, m*5/8, m/2, m*3/8);
     /* HUE 12: teal */
-    build_ramp(&pal[HUE_TEAL * 4 * 3], 0, m/16, m/16, m/4, m*5/8, m*5/8);
+    build_ramp(&pal[HUE_TEAL * 8 * 3], 0, m/16, m/16, m/4, m*5/8, m*5/8);
     /* HUE 13: purple */
-    build_ramp(&pal[HUE_PURPLE * 4 * 3], m/16, 0, m/16, m/2, m/8, m*5/8);
+    build_ramp(&pal[HUE_PURPLE * 8 * 3], m/16, 0, m/16, m/2, m/8, m*5/8);
     /* HUE 14: bright yellow/white */
-    build_ramp(&pal[HUE_YELLOW * 4 * 3], m/8, m/8, 0, m, m, m*3/4);
+    build_ramp(&pal[HUE_YELLOW * 8 * 3], m/8, m/8, 0, m, m, m*3/4);
     /* HUE 15: bright red/white for HUD */
-    build_ramp(&pal[HUE_RED * 4 * 3], m/8, 0, 0, m, m/4, m/4);
+    build_ramp(&pal[HUE_RED * 8 * 3], m/8, 0, 0, m, m/4, m/4);
     /* HUE 16: olive */
-    build_ramp(&pal[HUE_OLIVE * 4 * 3], m/16, m/16, 0, m/2, m/2, m/8);
+    build_ramp(&pal[HUE_OLIVE * 8 * 3], m/16, m/16, 0, m/2, m/2, m/8);
     /* HUE 17: rust */
-    build_ramp(&pal[HUE_RUST * 4 * 3], m/8, m/32, 0, m*3/4, m/4, m/16);
+    build_ramp(&pal[HUE_RUST * 8 * 3], m/8, m/32, 0, m*3/4, m/4, m/16);
     /* HUE 18: slate (cool blue-gray) */
-    build_ramp(&pal[HUE_SLATE * 4 * 3], m/16, m/16, m/10, m/2, m/2, m*9/16);
+    build_ramp(&pal[HUE_SLATE * 8 * 3], m/16, m/16, m/10, m/2, m/2, m*9/16);
     /* HUE 19: sand (warm beige) */
-    build_ramp(&pal[HUE_SAND * 4 * 3], m/10, m/12, m/20, m*3/4, m*5/8, m*3/8);
+    build_ramp(&pal[HUE_SAND * 8 * 3], m/10, m/12, m/20, m*3/4, m*5/8, m*3/8);
     /* HUE 20: cobalt (deep blue) */
-    build_ramp(&pal[HUE_COBALT * 4 * 3], 0, 0, m/8, m/8, m/4, m*3/4);
+    build_ramp(&pal[HUE_COBALT * 8 * 3], 0, 0, m/8, m/8, m/4, m*3/4);
     /* HUE 21: lime (bright green) */
-    build_ramp(&pal[HUE_LIME * 4 * 3], m/16, m/8, 0, m/2, m, m/4);
+    build_ramp(&pal[HUE_LIME * 8 * 3], m/16, m/8, 0, m/2, m, m/4);
     /* HUE 22: copper (warm metallic) */
-    build_ramp(&pal[HUE_COPPER * 4 * 3], m/10, m/16, m/32, m*3/4, m*3/8, m/8);
+    build_ramp(&pal[HUE_COPPER * 8 * 3], m/10, m/16, m/32, m*3/4, m*3/8, m/8);
     /* HUE 23: wine (deep red-purple) */
-    build_ramp(&pal[HUE_WINE * 4 * 3], m/16, 0, m/32, m/2, m/8, m/4);
+    build_ramp(&pal[HUE_WINE * 8 * 3], m/16, 0, m/32, m/2, m/8, m/4);
     /* HUE 24: ash (cool gray) */
-    build_ramp(&pal[HUE_ASH * 4 * 3], m/16, m/16, m/12, m*5/8, m*5/8, m*9/16);
+    build_ramp(&pal[HUE_ASH * 8 * 3], m/16, m/16, m/12, m*5/8, m*5/8, m*9/16);
     /* HUE 25: jade (green-blue) */
-    build_ramp(&pal[HUE_JADE * 4 * 3], 0, m/10, m/12, m/4, m*5/8, m/2);
+    build_ramp(&pal[HUE_JADE * 8 * 3], 0, m/10, m/12, m/4, m*5/8, m/2);
     /* HUE 26: gold (warm yellow) */
-    build_ramp(&pal[HUE_GOLD * 4 * 3], m/8, m/10, 0, m, m*3/4, m/8);
+    build_ramp(&pal[HUE_GOLD * 8 * 3], m/8, m/10, 0, m, m*3/4, m/8);
     /* HUE 27: ivory (off-white warm) */
-    build_ramp(&pal[HUE_IVORY * 4 * 3], m/8, m/8, m/10, m, m*15/16, m*7/8);
+    build_ramp(&pal[HUE_IVORY * 8 * 3], m/8, m/8, m/10, m, m*15/16, m*7/8);
     /* HUE 28: charcoal (very dark) */
-    build_ramp(&pal[HUE_CHARCOAL * 4 * 3], 0, 0, 0, m/4, m/4, m*3/16);
+    build_ramp(&pal[HUE_CHARCOAL * 8 * 3], 0, 0, 0, m/4, m/4, m*3/16);
     /* HUE 29: bronze (dark warm metallic) */
-    build_ramp(&pal[HUE_BRONZE * 4 * 3], m/12, m/16, 0, m*5/8, m*3/8, m/10);
+    build_ramp(&pal[HUE_BRONZE * 8 * 3], m/12, m/16, 0, m*5/8, m*3/8, m/10);
     /* HUE 30: cream (light warm) */
-    build_ramp(&pal[HUE_CREAM * 4 * 3], m/10, m/10, m/12, m*7/8, m*3/4, m*5/8);
+    build_ramp(&pal[HUE_CREAM * 8 * 3], m/10, m/10, m/12, m*7/8, m*3/4, m*5/8);
     /* HUE 31: dark blue */
-    build_ramp(&pal[HUE_DKBLUE * 4 * 3], 0, 0, m/16, m/6, m/6, m/2);
+    build_ramp(&pal[HUE_DKBLUE * 8 * 3], 0, 0, m/16, m/6, m/6, m/2);
 
     set_palette_block(0, 256, pal);
+
+    /* Build Doom-style colormaps: 32 light levels, each a 256-byte remap table.
+       Level 0 = full bright (identity), level 31 = near black. */
+    {
+        int lev, ci;
+        for (lev = 0; lev < NUM_LIGHT; lev++) {
+            for (ci = 0; ci < 256; ci++) {
+                int tr, tg, tb, best, bestd, pi;
+                if (ci == 0) { g_colormap[lev][ci] = 0; continue; }
+                /* Darken original color by light level */
+                tr = pal[ci * 3 + 0] * (NUM_LIGHT - 1 - lev) / (NUM_LIGHT - 1);
+                tg = pal[ci * 3 + 1] * (NUM_LIGHT - 1 - lev) / (NUM_LIGHT - 1);
+                tb = pal[ci * 3 + 2] * (NUM_LIGHT - 1 - lev) / (NUM_LIGHT - 1);
+                /* Find nearest palette color (skip index 0 = transparent) */
+                best = 1; bestd = 999999;
+                for (pi = 1; pi < 256; pi++) {
+                    int dr = pal[pi * 3 + 0] - tr;
+                    int dg = pal[pi * 3 + 1] - tg;
+                    int db = pal[pi * 3 + 2] - tb;
+                    int d = dr * dr + dg * dg + db * db;
+                    if (d < bestd) { bestd = d; best = pi; }
+                }
+                g_colormap[lev][ci] = (unsigned char)best;
+            }
+        }
+    }
 }
 
 /* ========================================================================
@@ -1022,16 +1051,16 @@ static void gen_brick_tex(unsigned char tex[TEX_H][TEX_W])
             int bx = x + (row & 1) * 8;
             int noise = (hash2d(x, y) & 3) - 1;
             if ((y & 7) == 0 || (bx & 15) == 0)
-                tex[y][x] = PAL(HUE_STONE, 1 + (noise & 1));
+                tex[y][x] = PAL(HUE_STONE, 2 + (noise & 1));
             else {
                 /* Occasional mossy or rust-stained bricks */
                 int var = hash2d(x / 8 + 50, y / 8 + 30) & 7;
                 if (var == 0)
-                    tex[y][x] = PAL(HUE_RUST, 1 + (noise & 1));
+                    tex[y][x] = PAL(HUE_RUST, 3 + (noise & 1));
                 else if (var == 1)
-                    tex[y][x] = PAL(HUE_OLIVE, 1 + (noise & 1));
+                    tex[y][x] = PAL(HUE_OLIVE, 3 + (noise & 1));
                 else
-                    tex[y][x] = PAL(HUE_BRICK, 2 + (noise & 1));
+                    tex[y][x] = PAL(HUE_BRICK, 4 + (noise & 1));
             }
         }
     }
@@ -1046,16 +1075,16 @@ static void gen_stone_tex(unsigned char tex[TEX_H][TEX_W])
             int mortar = 0;
             if ((y % 16) < 1 || (x % 12) < 1) mortar = 1;
             if (mortar)
-                tex[y][x] = PAL(HUE_ASH, (n & 1));
+                tex[y][x] = PAL(HUE_ASH, 1 + (n & 1));
             else {
                 /* Lichen and mineral stains on some blocks */
                 int blk = hash2d(x / 12, y / 16) & 7;
                 if (blk == 0)
-                    tex[y][x] = PAL(HUE_JADE, 1 + (n & 1));
+                    tex[y][x] = PAL(HUE_JADE, 3 + (n & 1));
                 else if (blk == 1)
-                    tex[y][x] = PAL(HUE_SLATE, 1 + (n & 1));
+                    tex[y][x] = PAL(HUE_SLATE, 3 + (n & 1));
                 else
-                    tex[y][x] = PAL(HUE_STONE, 1 + (n & 1));
+                    tex[y][x] = PAL(HUE_STONE, 3 + (n & 1));
             }
         }
     }
@@ -1067,9 +1096,9 @@ static void gen_wood_tex(unsigned char tex[TEX_H][TEX_W])
     for (y = 0; y < TEX_H; y++) {
         for (x = 0; x < TEX_W; x++) {
             float grain = (float)sin(x * 0.3 + sin(y * 0.07) * 3.0) * 0.5f + 0.5f;
-            int shade = 1 + (int)(grain * 2.0f);
+            int shade = 2 + (int)(grain * 4.0f);
             int noise = hash2d(x, y) & 1;
-            if (shade + noise > 3) shade = 3 - noise;
+            if (shade + noise > 7) shade = 7 - noise;
             tex[y][x] = PAL(HUE_WOOD, shade + noise);
         }
     }
@@ -1081,7 +1110,7 @@ static void gen_metal_tex(unsigned char tex[TEX_H][TEX_W])
     for (y = 0; y < TEX_H; y++) {
         for (x = 0; x < TEX_W; x++) {
             int n = hash2d(x, y) & 3;
-            int shade = 2 + (n >> 1);
+            int shade = 4 + (n >> 1);
             int hue = HUE_METAL;
             /* Horizontal banding */
             shade += (y & 3) == 0 ? 1 : 0;
@@ -1095,9 +1124,9 @@ static void gen_metal_tex(unsigned char tex[TEX_H][TEX_W])
                 ((x - 40) * (x - 40) + (y - 40) * (y - 40)) < 9 ||
                 ((x - 8) * (x - 8) + (y - 40) * (y - 40)) < 9 ||
                 ((x - 40) * (x - 40) + (y - 8) * (y - 8)) < 9) {
-                shade = 3; hue = HUE_METAL;
+                shade = 7; hue = HUE_METAL;
             }
-            if (shade > 3) shade = 3;
+            if (shade > 7) shade = 7;
             if (shade < 1) shade = 1;
             tex[y][x] = PAL(hue, shade);
         }
@@ -1114,14 +1143,14 @@ static void gen_cobble_tex(unsigned char tex[TEX_H][TEX_W])
             int n1 = hash2d(x / 3 + 97, y / 3 + 53) & 255;
             int n2 = hash2d(x / 7 + 31, y / 7 + 71) & 255;
             int val = n0 * 2 + n1 * 4 + n2 * 5;
-            int shade = 1 + val * 2 / (255 * 11);
+            int shade = 2 + val * 5 / (255 * 11);
             int hue = HUE_FLOOR;
             /* Occasional sand/bronze patches */
             int patch = hash2d(x / 6 + 41, y / 6 + 67) & 7;
             if (patch == 0) hue = HUE_SAND;
             else if (patch == 1) hue = HUE_BRONZE;
-            if (shade > 3) shade = 3;
-            if (shade < 1) shade = 1;
+            if (shade > 7) shade = 7;
+            if (shade < 2) shade = 2;
             tex[y][x] = PAL(hue, shade);
         }
     }
@@ -1137,15 +1166,15 @@ static void gen_dungeon_ceil_tex(unsigned char tex[TEX_H][TEX_W])
             int n1 = hash2d(x / 3 + 43, y / 3 + 17) & 255;
             int n2 = hash2d(x / 6 + 89, y / 6 + 61) & 255;
             int val = n0 * 2 + n1 * 3 + n2 * 6;
-            int shade = 1 + val * 2 / (255 * 11);
+            int shade = 2 + val * 5 / (255 * 11);
             int hue = HUE_CHARCOAL;
             /* Moss and mineral veins */
             int vein = hash2d(x / 5 + 13, y / 5 + 77) & 7;
             if (vein == 0) hue = HUE_JADE;
             else if (vein == 1) hue = HUE_STONE;
             else if (vein == 2) hue = HUE_ASH;
-            if (shade > 3) shade = 3;
-            if (shade < 1) shade = 1;
+            if (shade > 7) shade = 7;
+            if (shade < 2) shade = 2;
             tex[y][x] = PAL(hue, shade);
         }
     }
@@ -1159,18 +1188,18 @@ static void gen_vine_wall_tex(unsigned char tex[TEX_H][TEX_W])
     for (y = 0; y < TEX_H; y++) {
         for (x = 0; x < TEX_W; x++) {
             int n = hash2d(x / 3, y / 3) & 15;
-            int shade = 1 + (n & 1);
+            int shade = 3 + (n & 1);
             int hue = HUE_STONE;
             /* Hanging vine tendrils */
             int vx = (x + hash2d(0, y / 8) * 3) & 63;
             if ((vx & 15) < 2) {
                 hue = HUE_MOSS;
-                shade = 1 + (hash2d(x, y) & 1);
+                shade = 3 + (hash2d(x, y) & 1);
             } else if ((vx & 15) < 4) {
                 hue = HUE_OLIVE;
-                shade = 1 + (hash2d(x, y) & 1);
+                shade = 3 + (hash2d(x, y) & 1);
             }
-            if (shade > 3) shade = 3;
+            if (shade > 7) shade = 7;
             tex[y][x] = PAL(hue, shade);
         }
     }
@@ -1187,22 +1216,22 @@ static void gen_rust_panel_tex(unsigned char tex[TEX_H][TEX_W])
             int edge = (x & 31) < 1 || (y & 31) < 1;
             if (edge) {
                 hue = HUE_CHARCOAL;
-                shade = 1 + (n & 1);
+                shade = 2 + (n & 1);
             } else {
                 /* Alternate rust, copper, orange patches */
                 int panel = hash2d(x / 8 + 19, y / 8 + 37) & 7;
-                if (panel < 3) { hue = HUE_RUST; shade = 1 + (n & 1); }
-                else if (panel < 5) { hue = HUE_COPPER; shade = 1 + (n & 1); }
-                else { hue = HUE_ORANGE; shade = 1 + (n & 1); }
+                if (panel < 3) { hue = HUE_RUST; shade = 3 + (n & 1); }
+                else if (panel < 5) { hue = HUE_COPPER; shade = 3 + (n & 1); }
+                else { hue = HUE_ORANGE; shade = 3 + (n & 1); }
             }
             /* Corner bolts */
             if (((x & 31) < 4 && (y & 31) < 4) ||
                 ((x & 31) > 27 && (y & 31) < 4) ||
                 ((x & 31) < 4 && (y & 31) > 27) ||
                 ((x & 31) > 27 && (y & 31) > 27)) {
-                hue = HUE_METAL; shade = 3;
+                hue = HUE_METAL; shade = 7;
             }
-            if (shade > 3) shade = 3;
+            if (shade > 7) shade = 7;
             tex[y][x] = PAL(hue, shade);
         }
     }
@@ -1216,14 +1245,14 @@ static void gen_wine_stone_tex(unsigned char tex[TEX_H][TEX_W])
             int n0 = hash2d(x, y) & 255;
             int n1 = hash2d(x / 4 + 61, y / 4 + 29) & 255;
             int val = n0 * 3 + n1 * 5;
-            int shade = 1 + val * 2 / (255 * 8);
+            int shade = 2 + val * 5 / (255 * 8);
             int hue;
             /* Deep dungeon stone with wine/purple veins */
             int vein = hash2d(x / 5 + 83, y / 3 + 47) & 7;
             if (vein < 2) hue = HUE_WINE;
             else if (vein == 2) hue = HUE_PURPLE;
             else hue = HUE_SLATE;
-            if (shade > 3) shade = 3;
+            if (shade > 7) shade = 7;
             tex[y][x] = PAL(hue, shade);
         }
     }
@@ -1240,16 +1269,16 @@ static void gen_cobalt_tile_tex(unsigned char tex[TEX_H][TEX_W])
             int grout = ((x & 15) == 0) || ((y & 15) == 0);
             if (grout) {
                 hue = HUE_ASH;
-                shade = (n & 1);
+                shade = 1 + (n & 1);
             } else {
                 /* Alternating blue tones */
                 int tile = ((x >> 4) + (y >> 4)) & 3;
-                if (tile == 0) { hue = HUE_COBALT; shade = 1 + (n & 1); }
-                else if (tile == 1) { hue = HUE_TEAL; shade = 1 + (n & 1); }
-                else if (tile == 2) { hue = HUE_DKBLUE; shade = 1 + (n & 1); }
-                else { hue = HUE_SLATE; shade = 1 + (n & 1); }
+                if (tile == 0) { hue = HUE_COBALT; shade = 3 + (n & 1); }
+                else if (tile == 1) { hue = HUE_TEAL; shade = 3 + (n & 1); }
+                else if (tile == 2) { hue = HUE_DKBLUE; shade = 3 + (n & 1); }
+                else { hue = HUE_SLATE; shade = 3 + (n & 1); }
             }
-            if (shade > 3) shade = 3;
+            if (shade > 7) shade = 7;
             tex[y][x] = PAL(hue, shade);
         }
     }
@@ -1288,25 +1317,25 @@ static void generate_duck_sprites(void)
                 float hy = (y - 9.0f) / 4.5f;
                 /* Body (oval) */
                 if (bx * bx + by * by < 1.0f) {
-                    int sh = 2 + (by < 0.0f ? 1 : 0);
-                    if (sh > 3) sh = 3;
+                    int sh = 5 + (int)(1.0f * (1.0f - by));
+                    if (sh > 7) sh = 7;
                     g_duck_spr[frame][y][x] = PAL(HUE_DUCK, sh);
                 }
                 /* Breast (lighter belly) */
                 if (bx * bx * 1.5f + (by - 0.3f) * (by - 0.3f) * 3.0f < 0.6f)
-                    g_duck_spr[frame][y][x] = PAL(HUE_YELLOW, 3);
+                    g_duck_spr[frame][y][x] = PAL(HUE_YELLOW, 6);
                 /* Head (circle) */
                 if (hx * hx + hy * hy < 1.0f) {
-                    g_duck_spr[frame][y][x] = PAL(HUE_MOSS, 2);
+                    g_duck_spr[frame][y][x] = PAL(HUE_MOSS, 5);
                 }
                 /* Eye */
                 if ((x == 18 || x == 19) && (y == 8 || y == 9))
-                    g_duck_spr[frame][y][x] = PAL(HUE_GRAY, 3);
+                    g_duck_spr[frame][y][x] = PAL(HUE_GRAY, 7);
                 if (x == 19 && y == 9)
                     g_duck_spr[frame][y][x] = PAL(HUE_GRAY, 0);
                 /* Bill */
                 if (x >= 20 && x <= 25 && y >= 10 && y <= 12)
-                    g_duck_spr[frame][y][x] = PAL(HUE_ORANGE, 3);
+                    g_duck_spr[frame][y][x] = PAL(HUE_ORANGE, 6);
             }
         }
         /* Wings */
@@ -1318,18 +1347,18 @@ static void generate_duck_sprites(void)
                 span = (y - 12) * 3 / 4;   /* wings down */
             for (x = 0; x < span; x++) {
                 if (3 - x >= 0)
-                    g_duck_spr[frame][y][3 - x] = PAL(HUE_WOOD, 2);
+                    g_duck_spr[frame][y][3 - x] = PAL(HUE_WOOD, 4);
                 if (28 + x < SPRITE_W)
-                    g_duck_spr[frame][y][28 + x] = PAL(HUE_WOOD, 2);
+                    g_duck_spr[frame][y][28 + x] = PAL(HUE_WOOD, 4);
             }
         }
         /* Feet */
         if (1) {
             int fx;
             for (fx = 13; fx <= 15; fx++)
-                g_duck_spr[frame][26][fx] = PAL(HUE_ORANGE, 2);
+                g_duck_spr[frame][26][fx] = PAL(HUE_ORANGE, 5);
             for (fx = 17; fx <= 19; fx++)
-                g_duck_spr[frame][26][fx] = PAL(HUE_ORANGE, 2);
+                g_duck_spr[frame][26][fx] = PAL(HUE_ORANGE, 5);
         }
     }
 }
@@ -1661,28 +1690,22 @@ static void render_floor_ceiling(unsigned char *buf)
         row = buf + y * WIDTH;
 
         if (isFloor) {
-            int fogVal = (int)(rowDist * 0.2f);
-            if (fogVal > 3) fogVal = 3;
+            int fogLev = (int)(rowDist * 2.0f);
+            if (fogLev > 28) fogLev = 28;
             for (x = 0; x < WIDTH; x++) {
                 int tx = ((int)(fX * TEX_W)) & (TEX_W - 1);
                 int ty = ((int)(fY * TEX_H)) & (TEX_H - 1);
-                unsigned char c = g_floor_tex[ty][tx];
-                int sh = (c & 3) - fogVal;
-                if (sh < 0) sh = 0;
-                row[x] = (unsigned char)((c & 0xFC) + sh);
+                row[x] = g_colormap[fogLev][g_floor_tex[ty][tx]];
                 fX += fStepX;
                 fY += fStepY;
             }
         } else {
-            int fogVal = (int)(rowDist * 0.2f);
-            if (fogVal > 3) fogVal = 3;
+            int fogLev = (int)(rowDist * 2.0f);
+            if (fogLev > 28) fogLev = 28;
             for (x = 0; x < WIDTH; x++) {
                 int tx = ((int)(fX * TEX_W)) & (TEX_W - 1);
                 int ty = ((int)(fY * TEX_H)) & (TEX_H - 1);
-                unsigned char c = g_ceil_tex[ty][tx];
-                int sh = (c & 3) - fogVal;
-                if (sh < 0) sh = 0;
-                row[x] = (unsigned char)((c & 0xFC) + sh);
+                row[x] = g_colormap[fogLev][g_ceil_tex[ty][tx]];
                 fX += fStepX;
                 fY += fStepY;
             }
@@ -1773,12 +1796,12 @@ static void render_walls(unsigned char *buf)
 
         texData = &g_tex[(wallType - 1) % NUM_TEX][0][0];
         {
-            float fogF = perpWallDist * 0.2f;
+            float fogF = perpWallDist * 2.0f;
             fog = (int)fogF;
-            fogFrac = (int)((fogF - (float)fog) * 4.0f);
-            if (fog > 3) { fog = 3; fogFrac = 0; }
+            fogFrac = (int)((fogF - (float)fog) * 8.0f);
+            if (fog > 28) { fog = 28; fogFrac = 0; }
         }
-        sideFog = side ? 1 : 0;
+        sideFog = side ? 3 : 0;
 
         /* Draw wall strip (floor/ceiling already rendered by render_floor_ceiling) */
         {
@@ -1786,17 +1809,14 @@ static void render_walls(unsigned char *buf)
             int ye = drawEnd >= VIEW_H ? VIEW_H - 1 : drawEnd;
             for (y = ys; y <= ye; y++) {
                 int texY = ((y - drawStart) * TEX_H) / lineHeight;
-                int hue, shade;
                 unsigned char c;
+                int lev;
                 if (texY < 0) texY = 0;
                 if (texY >= TEX_H) texY = TEX_H - 1;
                 c = texData[texY * TEX_W + texX];
-                hue = c >> 2;
-                shade = (c & 3) - fog
-                      - ((hash2d(x, y) & 3) < fogFrac ? 1 : 0)
-                      - sideFog;
-                if (shade < 0) shade = 0;
-                buf[y * WIDTH + x] = (unsigned char)(hue * 4 + shade);
+                lev = fog + ((hash2d(x, y) & 7) < fogFrac ? 1 : 0) + sideFog;
+                if (lev > 28) lev = 28;
+                buf[y * WIDTH + x] = g_colormap[lev][c];
             }
         }
     }
@@ -1892,15 +1912,13 @@ static void render_sprites(unsigned char *buf)
                     /* Hit flash: draw white */
                     c = g_duck_spr[0][texY][texX];
                     if (c != 0)
-                        buf[y * WIDTH + stripe] = PAL(HUE_GRAY, 3);
+                        buf[y * WIDTH + stripe] = PAL(HUE_GRAY, 7);
                 } else {
                     c = g_duck_spr[d->anim_frame][texY][texX];
                     if (c != 0) {
-                        /* Apply distance fog */
-                        int hue = c >> 2;
-                        int sh  = (c & 3) - (int)(transformY * 0.15f);
-                        if (sh < 1) sh = 1;
-                        buf[y * WIDTH + stripe] = (unsigned char)(hue * 4 + sh);
+                        int lev = (int)(transformY * 1.5f);
+                        if (lev > 28) lev = 28;
+                        buf[y * WIDTH + stripe] = g_colormap[lev][c];
                     }
                 }
             }
@@ -2019,7 +2037,7 @@ static void draw_crosshair(unsigned char *buf)
     int cx = WIDTH / 2;
     int cy = VIEW_H / 2;
     int i;
-    unsigned char col = PAL(HUE_RED, 3);
+    unsigned char col = PAL(HUE_RED, 7);
 
     /* Horizontal line */
     for (i = -8; i <= 8; i++) {
@@ -2034,7 +2052,7 @@ static void draw_crosshair(unsigned char *buf)
             buf[(cy + i) * WIDTH + cx] = col;
     }
     /* Center dot */
-    buf[cy * WIDTH + cx] = PAL(HUE_GRAY, 3);
+    buf[cy * WIDTH + cx] = PAL(HUE_GRAY, 7);
 }
 
 static void render_hud(unsigned char *buf, float fps)
@@ -2045,23 +2063,23 @@ static void render_hud(unsigned char *buf, float fps)
 
     /* HUD background */
     for (i = 0; i < HUD_H * WIDTH; i++)
-        buf[y0 * WIDTH + i] = PAL(HUE_STONE, 0);
+        buf[y0 * WIDTH + i] = PAL(HUE_STONE, 1);
 
     /* Separator line */
     for (i = 0; i < WIDTH; i++)
-        buf[y0 * WIDTH + i] = PAL(HUE_STONE, 2);
+        buf[y0 * WIDTH + i] = PAL(HUE_STONE, 4);
 
     /* Score */
     sprintf(msg, "SCORE: %d", g_score);
     draw_str_bg(buf, WIDTH, 16, y0 + 8, msg,
-                PAL(HUE_YELLOW, 3), PAL(HUE_STONE, 0));
+                PAL(HUE_YELLOW, 7), PAL(HUE_STONE, 1));
 
     /* Ammo */
     sprintf(msg, "AMMO: ");
     draw_str_bg(buf, WIDTH, 16, y0 + 24, msg,
-                PAL(HUE_GRAY, 3), PAL(HUE_STONE, 0));
+                PAL(HUE_GRAY, 6), PAL(HUE_STONE, 1));
     for (i = 0; i < 6; i++) {
-        unsigned char col = (i < g_ammo) ? PAL(HUE_ORANGE, 3) : PAL(HUE_STONE, 1);
+        unsigned char col = (i < g_ammo) ? PAL(HUE_ORANGE, 6) : PAL(HUE_STONE, 2);
         int bx = 64 + i * 12;
         int by = y0 + 24;
         int j, k;
@@ -2073,12 +2091,12 @@ static void render_hud(unsigned char *buf, float fps)
     /* Round and ducks remaining */
     sprintf(msg, "ROUND: %d    DUCKS: %d", g_round, g_ducks_alive);
     draw_str_bg(buf, WIDTH, 200, y0 + 8, msg,
-                PAL(HUE_GRAY, 3), PAL(HUE_STONE, 0));
+                PAL(HUE_GRAY, 7), PAL(HUE_STONE, 1));
 
     /* FPS */
     sprintf(msg, "FPS: %.0f", fps);
     draw_str_bg(buf, WIDTH, WIDTH - 96, y0 + 8, msg,
-                PAL(HUE_MOSS, 3), PAL(HUE_STONE, 0));
+                PAL(HUE_MOSS, 6), PAL(HUE_STONE, 1));
 
     /* WC / MTRR / PMI / HW status */
     sprintf(msg, "WC:%s PAT:%s HWF:%s PMI:%s",
@@ -2087,7 +2105,7 @@ static void render_hud(unsigned char *buf, float fps)
             g_hw_flip ? "ON" : "---",
             g_pmi_ok ? "ON" : "---");
     draw_str_bg(buf, WIDTH, WIDTH - 300, y0 + 24, msg,
-                PAL(HUE_TEAL, 2), PAL(HUE_STONE, 0));
+                PAL(HUE_TEAL, 5), PAL(HUE_STONE, 1));
 
     /* Minimap */
     {
@@ -2101,9 +2119,9 @@ static void render_hud(unsigned char *buf, float fps)
                 int px = mx0 + mx * scale;
                 int py = my0 + my * scale;
                 if (g_map[my][mx] > 0)
-                    c = PAL(HUE_STONE, 2);
+                    c = PAL(HUE_STONE, 5);
                 else
-                    c = PAL(HUE_GRAY, 0);
+                    c = PAL(HUE_GRAY, 1);
                 buf[py * WIDTH + px] = c;
                 buf[py * WIDTH + px + 1] = c;
                 if (py + 1 < HEIGHT) {
@@ -2117,7 +2135,7 @@ static void render_hud(unsigned char *buf, float fps)
             int ppx = mx0 + (int)(g_posX * scale);
             int ppy = my0 + (int)(g_posY * scale);
             if (ppx >= 0 && ppx < WIDTH && ppy >= 0 && ppy < HEIGHT)
-                buf[ppy * WIDTH + ppx] = PAL(HUE_MOSS, 3);
+                buf[ppy * WIDTH + ppx] = PAL(HUE_MOSS, 7);
         }
         /* Duck dots */
         for (i = 0; i < g_num_ducks; i++) {
@@ -2126,7 +2144,7 @@ static void render_hud(unsigned char *buf, float fps)
                 int dpx = mx0 + (int)(g_ducks[i].x * scale);
                 int dpy = my0 + (int)(g_ducks[i].y * scale);
                 if (dpx >= 0 && dpx < WIDTH && dpy >= 0 && dpy < HEIGHT)
-                    buf[dpy * WIDTH + dpx] = PAL(HUE_DUCK, 3);
+                    buf[dpy * WIDTH + dpx] = PAL(HUE_DUCK, 7);
             }
         }
     }
@@ -2168,13 +2186,13 @@ static void render_bullet_trail(unsigned char *buf)
         if (by < 0 || by >= VIEW_H) continue;
         for (bx = gun_x - sz; bx <= gun_x + sz; bx++) {
             if (bx < 0 || bx >= WIDTH) continue;
-            buf[by * WIDTH + bx] = PAL(HUE_YELLOW, 3);
+            buf[by * WIDTH + bx] = PAL(HUE_YELLOW, 7);
         }
     }
 
     /* Hot core glow */
     if (cur_y >= 0 && cur_y < VIEW_H)
-        buf[cur_y * WIDTH + gun_x] = PAL(HUE_IVORY, 3);
+        buf[cur_y * WIDTH + gun_x] = PAL(HUE_IVORY, 7);
 
     /* Trail: line from behind the head back toward gun */
     trail_end = cur_y + (int)(20.0f + t * 30.0f);
@@ -2182,10 +2200,10 @@ static void render_bullet_trail(unsigned char *buf)
     for (by = cur_y + sz + 1; by <= trail_end; by++) {
         int sh;
         if (by < 0 || by >= VIEW_H) continue;
-        sh = 2 - (by - cur_y) * 2 / (trail_end - cur_y + 1);
+        sh = 5 - (by - cur_y) * 5 / (trail_end - cur_y + 1);
         if (sh < 1) sh = 1;
         buf[by * WIDTH + gun_x] = PAL(HUE_YELLOW, sh);
-        if (sh > 1) {
+        if (sh > 2) {
             if (gun_x - 1 >= 0)
                 buf[by * WIDTH + gun_x - 1] = PAL(HUE_ORANGE, sh - 1);
             if (gun_x + 1 < WIDTH)
@@ -2216,7 +2234,7 @@ static void render_gun_flash(unsigned char *buf)
             dx = x - cx;
             dy = y - cy;
             if (dx * dx + dy * dy < r * r) {
-                int sh = 3 - (dx * dx + dy * dy) * 3 / (r * r);
+                int sh = 7 - (dx * dx + dy * dy) * 7 / (r * r);
                 if (sh > 0)
                     buf[y * WIDTH + x] = PAL(HUE_YELLOW, sh);
             }
