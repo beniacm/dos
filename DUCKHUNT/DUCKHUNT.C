@@ -49,7 +49,7 @@
 #define MAX_DUCKS   20
 #define SPRITE_W    32
 #define SPRITE_H    32
-#define NUM_TEX     4
+#define NUM_TEX     8
 
 #define FOV_PLANE   0.66f
 #define MOVE_SPEED  3.5f
@@ -1023,8 +1023,16 @@ static void gen_brick_tex(unsigned char tex[TEX_H][TEX_W])
             int noise = (hash2d(x, y) & 3) - 1;
             if ((y & 7) == 0 || (bx & 15) == 0)
                 tex[y][x] = PAL(HUE_STONE, 2 + (noise & 1));
-            else
-                tex[y][x] = PAL(HUE_BRICK, 4 + (noise & 1));
+            else {
+                /* Occasional mossy or rust-stained bricks */
+                int var = hash2d(x / 8 + 50, y / 8 + 30) & 7;
+                if (var == 0)
+                    tex[y][x] = PAL(HUE_RUST, 3 + (noise & 1));
+                else if (var == 1)
+                    tex[y][x] = PAL(HUE_OLIVE, 3 + (noise & 1));
+                else
+                    tex[y][x] = PAL(HUE_BRICK, 4 + (noise & 1));
+            }
         }
     }
 }
@@ -1038,9 +1046,17 @@ static void gen_stone_tex(unsigned char tex[TEX_H][TEX_W])
             int mortar = 0;
             if ((y % 16) < 1 || (x % 12) < 1) mortar = 1;
             if (mortar)
-                tex[y][x] = PAL(HUE_STONE, 1 + (n & 1));
-            else
-                tex[y][x] = PAL(HUE_STONE, 3 + (n & 3));
+                tex[y][x] = PAL(HUE_ASH, 1 + (n & 1));
+            else {
+                /* Lichen and mineral stains on some blocks */
+                int blk = hash2d(x / 12, y / 16) & 7;
+                if (blk == 0)
+                    tex[y][x] = PAL(HUE_JADE, 2 + (n & 3));
+                else if (blk == 1)
+                    tex[y][x] = PAL(HUE_SLATE, 3 + (n & 3));
+                else
+                    tex[y][x] = PAL(HUE_STONE, 3 + (n & 3));
+            }
         }
     }
 }
@@ -1066,16 +1082,24 @@ static void gen_metal_tex(unsigned char tex[TEX_H][TEX_W])
         for (x = 0; x < TEX_W; x++) {
             int n = hash2d(x, y) & 3;
             int shade = 4 + n;
+            int hue = HUE_METAL;
             /* Horizontal banding */
             shade += (y & 3) == 0 ? 1 : 0;
+            /* Rust patches */
+            if ((hash2d(x / 5 + 77, y / 5 + 33) & 7) < 2) {
+                hue = HUE_COPPER;
+                shade -= 1;
+            }
             /* Rivets at regular intervals */
             if (((x - 8) * (x - 8) + (y - 8) * (y - 8)) < 9 ||
                 ((x - 40) * (x - 40) + (y - 40) * (y - 40)) < 9 ||
                 ((x - 8) * (x - 8) + (y - 40) * (y - 40)) < 9 ||
-                ((x - 40) * (x - 40) + (y - 8) * (y - 8)) < 9)
-                shade = 7;
+                ((x - 40) * (x - 40) + (y - 8) * (y - 8)) < 9) {
+                shade = 7; hue = HUE_METAL;
+            }
             if (shade > 7) shade = 7;
-            tex[y][x] = PAL(HUE_METAL, shade);
+            if (shade < 1) shade = 1;
+            tex[y][x] = PAL(hue, shade);
         }
     }
 }
@@ -1091,9 +1115,14 @@ static void gen_cobble_tex(unsigned char tex[TEX_H][TEX_W])
             int n2 = hash2d(x / 7 + 31, y / 7 + 71) & 255;
             int val = n0 * 2 + n1 * 4 + n2 * 5;
             int shade = 1 + val * 5 / (255 * 11);
+            int hue = HUE_FLOOR;
+            /* Occasional sand/bronze patches */
+            int patch = hash2d(x / 6 + 41, y / 6 + 67) & 7;
+            if (patch == 0) hue = HUE_SAND;
+            else if (patch == 1) hue = HUE_BRONZE;
             if (shade > 6) shade = 6;
             if (shade < 1) shade = 1;
-            tex[y][x] = PAL(HUE_FLOOR, shade);
+            tex[y][x] = PAL(hue, shade);
         }
     }
 }
@@ -1109,19 +1138,133 @@ static void gen_dungeon_ceil_tex(unsigned char tex[TEX_H][TEX_W])
             int n2 = hash2d(x / 6 + 89, y / 6 + 61) & 255;
             int val = n0 * 2 + n1 * 3 + n2 * 6;
             int shade = 1 + val * 5 / (255 * 11);
+            int hue = HUE_CHARCOAL;
+            /* Moss and mineral veins */
+            int vein = hash2d(x / 5 + 13, y / 5 + 77) & 7;
+            if (vein == 0) hue = HUE_JADE;
+            else if (vein == 1) hue = HUE_STONE;
+            else if (vein == 2) hue = HUE_ASH;
             if (shade > 6) shade = 6;
             if (shade < 1) shade = 1;
-            tex[y][x] = PAL(HUE_STONE, shade);
+            tex[y][x] = PAL(hue, shade);
+        }
+    }
+}
+
+/* --- New wall textures using the extended palette --- */
+
+static void gen_vine_wall_tex(unsigned char tex[TEX_H][TEX_W])
+{
+    int x, y;
+    for (y = 0; y < TEX_H; y++) {
+        for (x = 0; x < TEX_W; x++) {
+            int n = hash2d(x / 3, y / 3) & 15;
+            int shade = 3 + (n & 3);
+            int hue = HUE_STONE;
+            /* Hanging vine tendrils */
+            int vx = (x + hash2d(0, y / 8) * 3) & 63;
+            if ((vx & 15) < 2) {
+                hue = HUE_MOSS;
+                shade = 3 + (hash2d(x, y) & 3);
+            } else if ((vx & 15) < 4) {
+                hue = HUE_OLIVE;
+                shade = 2 + (hash2d(x, y) & 3);
+            }
+            if (shade > 7) shade = 7;
+            tex[y][x] = PAL(hue, shade);
+        }
+    }
+}
+
+static void gen_rust_panel_tex(unsigned char tex[TEX_H][TEX_W])
+{
+    int x, y;
+    for (y = 0; y < TEX_H; y++) {
+        for (x = 0; x < TEX_W; x++) {
+            int n = hash2d(x, y) & 7;
+            int shade, hue;
+            /* Panel grid with bolts */
+            int edge = (x & 31) < 1 || (y & 31) < 1;
+            if (edge) {
+                hue = HUE_CHARCOAL;
+                shade = 3 + (n & 1);
+            } else {
+                /* Alternate rust, copper, orange patches */
+                int panel = hash2d(x / 8 + 19, y / 8 + 37) & 7;
+                if (panel < 3) { hue = HUE_RUST; shade = 3 + (n & 3); }
+                else if (panel < 5) { hue = HUE_COPPER; shade = 3 + (n & 3); }
+                else { hue = HUE_ORANGE; shade = 2 + (n & 3); }
+            }
+            /* Corner bolts */
+            if (((x & 31) < 4 && (y & 31) < 4) ||
+                ((x & 31) > 27 && (y & 31) < 4) ||
+                ((x & 31) < 4 && (y & 31) > 27) ||
+                ((x & 31) > 27 && (y & 31) > 27)) {
+                hue = HUE_METAL; shade = 6;
+            }
+            if (shade > 7) shade = 7;
+            tex[y][x] = PAL(hue, shade);
+        }
+    }
+}
+
+static void gen_wine_stone_tex(unsigned char tex[TEX_H][TEX_W])
+{
+    int x, y;
+    for (y = 0; y < TEX_H; y++) {
+        for (x = 0; x < TEX_W; x++) {
+            int n0 = hash2d(x, y) & 255;
+            int n1 = hash2d(x / 4 + 61, y / 4 + 29) & 255;
+            int val = n0 * 3 + n1 * 5;
+            int shade = 2 + val * 4 / (255 * 8);
+            int hue;
+            /* Deep dungeon stone with wine/purple veins */
+            int vein = hash2d(x / 5 + 83, y / 3 + 47) & 7;
+            if (vein < 2) hue = HUE_WINE;
+            else if (vein == 2) hue = HUE_PURPLE;
+            else hue = HUE_SLATE;
+            if (shade > 6) shade = 6;
+            tex[y][x] = PAL(hue, shade);
+        }
+    }
+}
+
+static void gen_cobalt_tile_tex(unsigned char tex[TEX_H][TEX_W])
+{
+    int x, y;
+    for (y = 0; y < TEX_H; y++) {
+        for (x = 0; x < TEX_W; x++) {
+            int n = hash2d(x, y) & 3;
+            int shade, hue;
+            /* Tiled pattern with grout */
+            int grout = ((x & 15) == 0) || ((y & 15) == 0);
+            if (grout) {
+                hue = HUE_ASH;
+                shade = 2 + (n & 1);
+            } else {
+                /* Alternating blue tones */
+                int tile = ((x >> 4) + (y >> 4)) & 3;
+                if (tile == 0) { hue = HUE_COBALT; shade = 3 + n; }
+                else if (tile == 1) { hue = HUE_TEAL; shade = 3 + n; }
+                else if (tile == 2) { hue = HUE_DKBLUE; shade = 3 + n; }
+                else { hue = HUE_SLATE; shade = 3 + n; }
+            }
+            if (shade > 7) shade = 7;
+            tex[y][x] = PAL(hue, shade);
         }
     }
 }
 
 static void generate_textures(void)
 {
-    gen_brick_tex(g_tex[0]);
-    gen_stone_tex(g_tex[1]);
-    gen_wood_tex(g_tex[2]);
-    gen_metal_tex(g_tex[3]);
+    gen_brick_tex(g_tex[0]);       /* wallType 1 */
+    gen_stone_tex(g_tex[1]);       /* wallType 2 */
+    gen_wood_tex(g_tex[2]);        /* wallType 3 */
+    gen_metal_tex(g_tex[3]);       /* wallType 4 */
+    gen_vine_wall_tex(g_tex[4]);   /* wallType 5 */
+    gen_rust_panel_tex(g_tex[5]);  /* wallType 6 */
+    gen_wine_stone_tex(g_tex[6]);  /* wallType 7 */
+    gen_cobalt_tile_tex(g_tex[7]); /* wallType 8 */
     gen_cobble_tex(g_floor_tex);
     gen_dungeon_ceil_tex(g_ceil_tex);
 }
@@ -1265,23 +1408,23 @@ static unsigned char g_map[MAP_H][MAP_W] = {
     {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1},
     {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
     {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
-    {1,0,0,2,2,2,2,0,0,0,3,3,3,0,0,0,4,4,4,4,0,0,0,1},
-    {1,0,0,2,0,0,0,0,0,0,0,0,3,0,0,0,4,0,0,0,0,0,0,1},
-    {1,0,0,2,0,0,0,0,0,0,0,0,3,0,0,0,4,0,0,0,0,0,0,1},
-    {1,0,0,2,0,0,3,3,3,0,0,0,3,0,0,0,0,0,0,4,4,0,0,1},
-    {1,0,0,0,0,0,3,0,3,0,0,0,0,0,0,0,0,0,0,4,0,0,0,1},
-    {1,0,0,0,0,0,3,0,3,0,0,0,0,0,0,0,0,0,0,4,0,0,0,1},
-    {1,0,0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0,0,1},
-    {1,0,0,0,0,0,0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0,0,1},
-    {1,0,0,2,2,0,0,0,0,0,0,1,0,1,0,0,0,3,3,3,0,0,0,1},
-    {1,0,0,2,0,0,0,0,0,0,0,0,0,1,0,0,0,3,0,0,0,0,0,1},
-    {1,0,0,2,0,0,0,0,0,0,0,0,0,0,0,0,0,3,0,0,0,0,0,1},
+    {1,0,0,2,2,2,2,0,0,0,5,5,5,0,0,0,6,6,6,6,0,0,0,1},
+    {1,0,0,2,0,0,0,0,0,0,0,0,5,0,0,0,6,0,0,0,0,0,0,1},
+    {1,0,0,2,0,0,0,0,0,0,0,0,5,0,0,0,6,0,0,0,0,0,0,1},
+    {1,0,0,2,0,0,7,7,7,0,0,0,5,0,0,0,0,0,0,4,4,0,0,1},
+    {1,0,0,0,0,0,7,0,7,0,0,0,0,0,0,0,0,0,0,4,0,0,0,1},
+    {1,0,0,0,0,0,7,0,7,0,0,0,0,0,0,0,0,0,0,4,0,0,0,1},
+    {1,0,0,0,0,0,0,0,0,0,0,8,8,8,0,0,0,0,0,0,0,0,0,1},
+    {1,0,0,0,0,0,0,0,0,0,0,8,0,8,0,0,0,0,0,0,0,0,0,1},
+    {1,0,0,3,3,0,0,0,0,0,0,8,0,8,0,0,0,5,5,5,0,0,0,1},
+    {1,0,0,3,0,0,0,0,0,0,0,0,0,8,0,0,0,5,0,0,0,0,0,1},
+    {1,0,0,3,0,0,0,0,0,0,0,0,0,0,0,0,0,5,0,0,0,0,0,1},
     {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
-    {1,0,0,0,0,4,4,4,4,0,0,0,0,0,0,2,2,2,2,0,0,0,0,1},
-    {1,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0,0,2,0,0,0,0,1},
-    {1,0,0,0,0,4,0,0,0,0,0,3,3,0,0,0,0,0,2,0,0,0,0,1},
-    {1,0,0,0,0,4,0,0,0,0,0,3,0,0,0,0,0,0,2,0,0,0,0,1},
-    {1,0,0,0,0,0,0,0,0,0,0,3,0,0,0,0,0,0,0,0,0,0,0,1},
+    {1,0,0,0,0,6,6,6,6,0,0,0,0,0,0,3,3,3,3,0,0,0,0,1},
+    {1,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0,0,3,0,0,0,0,1},
+    {1,0,0,0,0,6,0,0,0,0,0,7,7,0,0,0,0,0,3,0,0,0,0,1},
+    {1,0,0,0,0,6,0,0,0,0,0,7,0,0,0,0,0,0,3,0,0,0,0,1},
+    {1,0,0,0,0,0,0,0,0,0,0,7,0,0,0,0,0,0,0,0,0,0,0,1},
     {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
     {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
     {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
