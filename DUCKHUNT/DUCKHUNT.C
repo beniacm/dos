@@ -1914,12 +1914,50 @@ static void render_sprites(unsigned char *buf)
 
 static int g_hit_flash = 0;  /* screen flash timer for hit feedback */
 
+/* Bullet trail state */
+static int g_bullet_active = 0;
+static float g_bullet_progress = 0.0f;
+static float g_bullet_hit_dist = 0.0f;
+
+/* Cast a DDA ray along the center view direction, return wall distance */
+static float cast_center_ray(void)
+{
+    float rayDirX = g_dirX;
+    float rayDirY = g_dirY;
+    int mapX = (int)g_posX;
+    int mapY = (int)g_posY;
+    float deltaDistX = (rayDirX == 0.0f) ? 1e30f : (float)fabs(1.0f / rayDirX);
+    float deltaDistY = (rayDirY == 0.0f) ? 1e30f : (float)fabs(1.0f / rayDirY);
+    float sideDistX, sideDistY;
+    int stepX, stepY, side;
+
+    if (rayDirX < 0) { stepX = -1; sideDistX = (g_posX - mapX) * deltaDistX; }
+    else             { stepX =  1; sideDistX = (mapX + 1.0f - g_posX) * deltaDistX; }
+    if (rayDirY < 0) { stepY = -1; sideDistY = (g_posY - mapY) * deltaDistY; }
+    else             { stepY =  1; sideDistY = (mapY + 1.0f - g_posY) * deltaDistY; }
+
+    side = 0;
+    while (1) {
+        if (sideDistX < sideDistY) { sideDistX += deltaDistX; mapX += stepX; side = 0; }
+        else                       { sideDistY += deltaDistY; mapY += stepY; side = 1; }
+        if (mapX < 0 || mapX >= MAP_W || mapY < 0 || mapY >= MAP_H) break;
+        if (g_map[mapY][mapX] > 0) break;
+    }
+    if (side == 0) return sideDistX - deltaDistX;
+    return sideDistY - deltaDistY;
+}
+
 static int try_shoot(void)
 {
     int best = -1;
     float best_dist = 1e30f;
+    float wall_dist;
     float invDet;
     int i;
+
+    /* Cast center ray for wall hit distance */
+    wall_dist = cast_center_ray();
+    if (wall_dist < 0.01f) wall_dist = 0.01f;
 
     invDet = 1.0f / (g_planeX * g_dirY - g_dirX * g_planeY);
 
@@ -1936,7 +1974,7 @@ static int try_shoot(void)
         ty = invDet * (-g_planeY * sprX + g_planeX * sprY);
 
         if (ty <= 0.1f) continue;
-        if (ty >= g_zbuf[WIDTH / 2]) continue;
+        if (ty >= wall_dist) continue;
 
         scrX = (int)((WIDTH / 2) * (1.0f + tx / ty));
         sprSz = (int)(DUCK_SIZE * VIEW_H / ty);
@@ -1955,6 +1993,11 @@ static int try_shoot(void)
             }
         }
     }
+
+    /* Activate bullet trail */
+    g_bullet_active = 1;
+    g_bullet_progress = 0.0f;
+    g_bullet_hit_dist = (best >= 0) ? best_dist : wall_dist;
 
     if (best >= 0) {
         g_ducks[best].alive = 0;
@@ -2085,6 +2128,68 @@ static void render_hud(unsigned char *buf, float fps)
                 if (dpx >= 0 && dpx < WIDTH && dpy >= 0 && dpy < HEIGHT)
                     buf[dpy * WIDTH + dpx] = PAL(HUE_DUCK, 7);
             }
+        }
+    }
+}
+
+/* ========================================================================
+ *  BULLET TRAIL RENDERING
+ * ======================================================================== */
+
+static void update_bullet(float dt)
+{
+    if (!g_bullet_active) return;
+    g_bullet_progress += dt * 5.0f;
+    if (g_bullet_progress >= 1.0f)
+        g_bullet_active = 0;
+}
+
+static void render_bullet_trail(unsigned char *buf)
+{
+    int gun_x, gun_y, tgt_y, cur_y, sz, by, bx;
+    int trail_end;
+    float t;
+
+    if (!g_bullet_active) return;
+
+    gun_x = WIDTH / 2;
+    gun_y = VIEW_H - 25;
+    tgt_y = VIEW_H / 2 + g_pitch;
+    if (tgt_y < 0) tgt_y = 0;
+    if (tgt_y >= VIEW_H) tgt_y = VIEW_H - 1;
+
+    t = g_bullet_progress;
+    cur_y = gun_y + (int)((float)(tgt_y - gun_y) * t);
+
+    /* Bullet head: bright dot, shrinks with distance */
+    sz = 3 - (int)(t * 2.5f);
+    if (sz < 1) sz = 1;
+    for (by = cur_y - sz; by <= cur_y + sz; by++) {
+        if (by < 0 || by >= VIEW_H) continue;
+        for (bx = gun_x - sz; bx <= gun_x + sz; bx++) {
+            if (bx < 0 || bx >= WIDTH) continue;
+            buf[by * WIDTH + bx] = PAL(HUE_YELLOW, 7);
+        }
+    }
+
+    /* Hot core glow */
+    if (cur_y >= 0 && cur_y < VIEW_H)
+        buf[cur_y * WIDTH + gun_x] = PAL(HUE_IVORY, 7);
+
+    /* Trail: line from behind the head back toward gun */
+    trail_end = cur_y + (int)(20.0f + t * 30.0f);
+    if (trail_end > gun_y) trail_end = gun_y;
+    for (by = cur_y + sz + 1; by <= trail_end; by++) {
+        int sh;
+        if (by < 0 || by >= VIEW_H) continue;
+        sh = 5 - (by - cur_y) * 5 / (trail_end - cur_y + 1);
+        if (sh < 1) sh = 1;
+        buf[by * WIDTH + gun_x] = PAL(HUE_YELLOW, sh);
+        if (sh > 2) {
+            if (gun_x - 1 >= 0)
+                buf[by * WIDTH + gun_x - 1] = PAL(HUE_ORANGE, sh - 1);
+            if (gun_x + 1 < WIDTH)
+                buf[by * WIDTH + gun_x + 1] = PAL(HUE_ORANGE, sh - 1);
         }
     }
 }
@@ -2448,6 +2553,7 @@ int main(int argc, char *argv[])
         if (g_shot_cooldown > 0.0f) g_shot_cooldown -= dt;
         if (g_muzzle_flash > 0) g_muzzle_flash--;
         if (g_hit_flash > 0) g_hit_flash--;
+        update_bullet(dt);
 
         /* Next round check */
         if (g_ducks_alive <= 0) {
@@ -2460,6 +2566,7 @@ int main(int argc, char *argv[])
         render_floor_ceiling(frame_buf);
         render_walls(frame_buf);
         render_sprites(frame_buf);
+        render_bullet_trail(frame_buf);
         render_gun_flash(frame_buf);
         draw_crosshair(frame_buf);
         render_hud(frame_buf, fps);
