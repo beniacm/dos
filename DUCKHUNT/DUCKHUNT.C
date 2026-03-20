@@ -96,7 +96,6 @@
 #define HUE_DKBLUE  31
 
 #define PAL(h,s)    ((unsigned char)((h)*8+(s)))
-#define NUM_LIGHT   32  /* Doom-style light levels: 0=bright, 31=dark */
 
 /* Scan codes */
 #define SC_ESC   0x01
@@ -908,10 +907,8 @@ static int mouse_get_buttons(void)
 }
 
 /* ========================================================================
- *  PALETTE SETUP + DOOM-STYLE COLORMAPS
+ *  PALETTE SETUP
  * ======================================================================== */
-
-static unsigned char g_colormap[NUM_LIGHT][256];  /* [light_level][palette_index] */
 
 static void build_ramp(unsigned char *out, int r0, int g0, int b0,
                        int r1, int g1, int b1)
@@ -999,24 +996,6 @@ static void setup_palette(void)
     build_ramp(&pal[HUE_DKBLUE * 8 * 3], 0, 0, m/16, m/6, m/6, m/2);
 
     set_palette_block(0, 256, pal);
-
-    /* Build Doom-style colormaps: 32 light levels, each a 256-byte remap table.
-       Level 0 = full bright (identity), level 31 = near black.
-       Hue-preserving: darken within the same 8-shade ramp to avoid
-       cross-hue artifacts that look like dithering patterns. */
-    {
-        int lev, ci;
-        for (lev = 0; lev < NUM_LIGHT; lev++) {
-            for (ci = 0; ci < 256; ci++) {
-                int hue, shade, new_shade;
-                if (ci == 0) { g_colormap[lev][ci] = 0; continue; }
-                hue = ci >> 3;
-                shade = ci & 7;
-                new_shade = shade * (NUM_LIGHT - 1 - lev) / (NUM_LIGHT - 1);
-                g_colormap[lev][ci] = (unsigned char)(hue * 8 + new_shade);
-            }
-        }
-    }
 }
 
 /* ========================================================================
@@ -1702,22 +1681,28 @@ static void render_floor_ceiling(unsigned char *buf)
         row = buf + y * WIDTH;
 
         if (isFloor) {
-            int fogLev = (int)(rowDist * 2.0f);
-            if (fogLev > 28) fogLev = 28;
+            int fogVal = (int)(rowDist * 0.4f);
+            if (fogVal > 6) fogVal = 6;
             for (x = 0; x < WIDTH; x++) {
                 int tx = ((int)(fX * TEX_W)) & (TEX_W - 1);
                 int ty = ((int)(fY * TEX_H)) & (TEX_H - 1);
-                row[x] = g_colormap[fogLev][g_floor_tex[ty][tx]];
+                unsigned char c = g_floor_tex[ty][tx];
+                int sh = (c & 7) - fogVal;
+                if (sh < 0) sh = 0;
+                row[x] = (unsigned char)((c & 0xF8) + sh);
                 fX += fStepX;
                 fY += fStepY;
             }
         } else {
-            int fogLev = (int)(rowDist * 2.0f);
-            if (fogLev > 28) fogLev = 28;
+            int fogVal = (int)(rowDist * 0.4f);
+            if (fogVal > 6) fogVal = 6;
             for (x = 0; x < WIDTH; x++) {
                 int tx = ((int)(fX * TEX_W)) & (TEX_W - 1);
                 int ty = ((int)(fY * TEX_H)) & (TEX_H - 1);
-                row[x] = g_colormap[fogLev][g_ceil_tex[ty][tx]];
+                unsigned char c = g_ceil_tex[ty][tx];
+                int sh = (c & 7) - fogVal;
+                if (sh < 0) sh = 0;
+                row[x] = (unsigned char)((c & 0xF8) + sh);
                 fX += fStepX;
                 fY += fStepY;
             }
@@ -1745,7 +1730,7 @@ static void render_walls(unsigned char *buf)
         float wallX;
         int texX, y;
         unsigned char *texData;
-        int fogLev, sideFog;
+        int fog, fogFrac, sideFog;
 
         if (rayDirX < 0) {
             stepX = -1;
@@ -1807,21 +1792,31 @@ static void render_walls(unsigned char *buf)
         if (texX >= TEX_W) texX = TEX_W - 1;
 
         texData = &g_tex[(wallType - 1) % NUM_TEX][0][0];
-        fogLev = (int)(perpWallDist * 2.0f);
-        if (fogLev > 28) fogLev = 28;
-        sideFog = side ? 3 : 0;
+        {
+            float fogF = perpWallDist * 0.4f;
+            fog = (int)fogF;
+            fogFrac = (int)((fogF - (float)fog) * 8.0f);
+            if (fog > 6) { fog = 6; fogFrac = 0; }
+        }
+        sideFog = side ? 1 : 0;
 
         /* Draw wall strip */
         {
             int ys = drawStart < 0 ? 0 : drawStart;
             int ye = drawEnd >= VIEW_H ? VIEW_H - 1 : drawEnd;
-            int lev = fogLev + sideFog;
-            if (lev > 28) lev = 28;
             for (y = ys; y <= ye; y++) {
                 int texY = ((y - drawStart) * TEX_H) / lineHeight;
+                int hue, shade;
+                unsigned char c;
                 if (texY < 0) texY = 0;
                 if (texY >= TEX_H) texY = TEX_H - 1;
-                buf[y * WIDTH + x] = g_colormap[lev][texData[texY * TEX_W + texX]];
+                c = texData[texY * TEX_W + texX];
+                hue = c >> 3;
+                shade = (c & 7) - fog
+                      - ((hash2d(x, y) & 7) < fogFrac ? 1 : 0)
+                      - sideFog;
+                if (shade < 0) shade = 0;
+                buf[y * WIDTH + x] = (unsigned char)(hue * 8 + shade);
             }
         }
     }
@@ -1921,9 +1916,10 @@ static void render_sprites(unsigned char *buf)
                 } else {
                     c = g_duck_spr[d->anim_frame][texY][texX];
                     if (c != 0) {
-                        int lev = (int)(transformY * 1.5f);
-                        if (lev > 28) lev = 28;
-                        buf[y * WIDTH + stripe] = g_colormap[lev][c];
+                        int hue = c >> 3;
+                        int sh  = (c & 7) - (int)(transformY * 0.3f);
+                        if (sh < 1) sh = 1;
+                        buf[y * WIDTH + stripe] = (unsigned char)(hue * 8 + sh);
                     }
                 }
             }
