@@ -1733,7 +1733,7 @@ static void render_walls(unsigned char *buf)
         float wallX;
         int texX, y;
         unsigned char *texData;
-        int fog, fogFrac, sideFog;
+        int fogLev, sideFog;
 
         if (rayDirX < 0) {
             stepX = -1;
@@ -1795,28 +1795,21 @@ static void render_walls(unsigned char *buf)
         if (texX >= TEX_W) texX = TEX_W - 1;
 
         texData = &g_tex[(wallType - 1) % NUM_TEX][0][0];
-        {
-            float fogF = perpWallDist * 2.0f;
-            fog = (int)fogF;
-            fogFrac = (int)((fogF - (float)fog) * 8.0f);
-            if (fog > 28) { fog = 28; fogFrac = 0; }
-        }
+        fogLev = (int)(perpWallDist * 2.0f);
+        if (fogLev > 28) fogLev = 28;
         sideFog = side ? 3 : 0;
 
-        /* Draw wall strip (floor/ceiling already rendered by render_floor_ceiling) */
+        /* Draw wall strip */
         {
             int ys = drawStart < 0 ? 0 : drawStart;
             int ye = drawEnd >= VIEW_H ? VIEW_H - 1 : drawEnd;
+            int lev = fogLev + sideFog;
+            if (lev > 28) lev = 28;
             for (y = ys; y <= ye; y++) {
                 int texY = ((y - drawStart) * TEX_H) / lineHeight;
-                unsigned char c;
-                int lev;
                 if (texY < 0) texY = 0;
                 if (texY >= TEX_H) texY = TEX_H - 1;
-                c = texData[texY * TEX_W + texX];
-                lev = fog + ((hash2d(x, y) & 7) < fogFrac ? 1 : 0) + sideFog;
-                if (lev > 28) lev = 28;
-                buf[y * WIDTH + x] = g_colormap[lev][c];
+                buf[y * WIDTH + x] = g_colormap[lev][texData[texY * TEX_W + texX]];
             }
         }
     }
