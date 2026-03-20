@@ -1001,27 +1001,19 @@ static void setup_palette(void)
     set_palette_block(0, 256, pal);
 
     /* Build Doom-style colormaps: 32 light levels, each a 256-byte remap table.
-       Level 0 = full bright (identity), level 31 = near black. */
+       Level 0 = full bright (identity), level 31 = near black.
+       Hue-preserving: darken within the same 8-shade ramp to avoid
+       cross-hue artifacts that look like dithering patterns. */
     {
         int lev, ci;
         for (lev = 0; lev < NUM_LIGHT; lev++) {
             for (ci = 0; ci < 256; ci++) {
-                int tr, tg, tb, best, bestd, pi;
+                int hue, shade, new_shade;
                 if (ci == 0) { g_colormap[lev][ci] = 0; continue; }
-                /* Darken original color by light level */
-                tr = pal[ci * 3 + 0] * (NUM_LIGHT - 1 - lev) / (NUM_LIGHT - 1);
-                tg = pal[ci * 3 + 1] * (NUM_LIGHT - 1 - lev) / (NUM_LIGHT - 1);
-                tb = pal[ci * 3 + 2] * (NUM_LIGHT - 1 - lev) / (NUM_LIGHT - 1);
-                /* Find nearest palette color (skip index 0 = transparent) */
-                best = 1; bestd = 999999;
-                for (pi = 1; pi < 256; pi++) {
-                    int dr = pal[pi * 3 + 0] - tr;
-                    int dg = pal[pi * 3 + 1] - tg;
-                    int db = pal[pi * 3 + 2] - tb;
-                    int d = dr * dr + dg * dg + db * db;
-                    if (d < bestd) { bestd = d; best = pi; }
-                }
-                g_colormap[lev][ci] = (unsigned char)best;
+                hue = ci >> 3;
+                shade = ci & 7;
+                new_shade = shade * (NUM_LIGHT - 1 - lev) / (NUM_LIGHT - 1);
+                g_colormap[lev][ci] = (unsigned char)(hue * 8 + new_shade);
             }
         }
     }
