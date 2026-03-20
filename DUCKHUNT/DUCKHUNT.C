@@ -49,7 +49,7 @@
 #define MAX_DUCKS   20
 #define SPRITE_W    32
 #define SPRITE_H    32
-#define NUM_TEX     8
+#define NUM_TEX     10
 
 #define FOV_PLANE   0.66f
 #define MOVE_SPEED  3.5f
@@ -1284,6 +1284,24 @@ static void gen_cobalt_tile_tex(unsigned char tex[TEX_H][TEX_W])
     }
 }
 
+/* Solid red wall — flat color, no noise */
+static void gen_solid_red_tex(unsigned char tex[TEX_H][TEX_W])
+{
+    int x, y;
+    for (y = 0; y < TEX_H; y++)
+        for (x = 0; x < TEX_W; x++)
+            tex[y][x] = PAL(HUE_RED, 6);
+}
+
+/* Solid blue wall — flat color, no noise */
+static void gen_solid_blue_tex(unsigned char tex[TEX_H][TEX_W])
+{
+    int x, y;
+    for (y = 0; y < TEX_H; y++)
+        for (x = 0; x < TEX_W; x++)
+            tex[y][x] = PAL(HUE_COBALT, 6);
+}
+
 static void generate_textures(void)
 {
     gen_brick_tex(g_tex[0]);       /* wallType 1 */
@@ -1294,6 +1312,8 @@ static void generate_textures(void)
     gen_rust_panel_tex(g_tex[5]);  /* wallType 6 */
     gen_wine_stone_tex(g_tex[6]);  /* wallType 7 */
     gen_cobalt_tile_tex(g_tex[7]); /* wallType 8 */
+    gen_solid_red_tex(g_tex[8]);   /* wallType 9 */
+    gen_solid_blue_tex(g_tex[9]);  /* wallType 10 */
     gen_cobble_tex(g_floor_tex);
     gen_dungeon_ceil_tex(g_ceil_tex);
 }
@@ -1451,8 +1471,8 @@ static unsigned char g_map[MAP_H][MAP_W] = {
     {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
     {1,0,0,0,0,6,6,6,6,0,0,0,0,0,0,3,3,3,3,0,0,0,0,1},
     {1,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0,0,3,0,0,0,0,1},
-    {1,0,0,0,0,6,0,0,0,0,0,7,7,0,0,0,0,0,3,0,0,0,0,1},
-    {1,0,0,0,0,6,0,0,0,0,0,7,0,0,0,0,0,0,3,0,0,0,0,1},
+    {1,0,0,9,0,6,0,0,0,0,0,7,7,0,0,0,0,0,3,0,10,0,0,1},
+    {1,0,0,9,0,6,0,0,0,0,0,7,0,0,0,0,0,0,3,0,10,0,0,1},
     {1,0,0,0,0,0,0,0,0,0,0,7,0,0,0,0,0,0,0,0,0,0,0,1},
     {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
     {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
