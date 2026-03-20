@@ -130,6 +130,7 @@ typedef struct {
 #define R_DP_BRUSH_FRGD_CLR        0x147C
 #define R_DP_BRUSH_BKGD_CLR        0x1478
 #define R_DP_SRC_FRGD_CLR          0x15D8
+#define R_DP_SRC_BKGD_CLR          0x15DC
 #define R_DP_CNTL                  0x16C0
 #define   DST_X_LEFT_TO_RIGHT      1UL
 #define   DST_Y_TOP_TO_BOTTOM      2UL
@@ -168,6 +169,70 @@ typedef struct {
 #define R_CLR_CMP_MASK            0x15CC
 #define   CLR_CMP_FCN_NE          5UL           /* draw when src != key */
 #define   CLR_CMP_SRC_SOURCE      (1UL << 24)   /* compare source pixels */
+
+/* ---------------------------------------------------------------
+ *  Additional registers from Linux kernel radeon driver (rv515d.h,
+ *  radeon_reg.h, r300_reg.h) needed for proper RV515 initialization.
+ *  Reference: torvalds/linux  drivers/gpu/drm/radeon/
+ * --------------------------------------------------------------- */
+
+/* PLL register access (via MMIO, not PCI config) */
+#define R_CLOCK_CNTL_INDEX         0x0008
+#define R_CLOCK_CNTL_DATA          0x000C
+#define   PLL_WR_EN                (1UL << 7)
+
+/* VGA render control — disable VGA to avoid 2D engine conflicts */
+#define R_VGA_RENDER_CONTROL       0x0300
+#define   VGA_VSTATUS_CNTL_MASK    0x00070000UL
+
+/* HOST_PATH_CNTL bits for HDP reset */
+#define   HDP_SOFT_RESET           (1UL << 26)
+#define   HDP_APER_CNTL            (1UL << 23)
+
+/* 2D/3D synchronization (rv515d.h) */
+#define R_ISYNC_CNTL               0x1724
+#define   ISYNC_ANY2D_IDLE3D       (1UL << 0)
+#define   ISYNC_ANY3D_IDLE2D       (1UL << 1)
+#define   ISYNC_WAIT_IDLEGUI       (1UL << 4)
+#define   ISYNC_CPSCRATCH_IDLEGUI  (1UL << 5)
+
+/* Graphics block registers */
+#define R_GB_ENABLE                0x4008
+#define R_GB_MSPOS0                0x4010
+#define R_GB_MSPOS1                0x4014
+#define R_GB_SELECT                0x401C
+#define R_GB_AA_CONFIG             0x4020
+
+/* R500 shader unit register destination (pipe mask) */
+#define R_SU_REG_DEST              0x42C8
+
+/* Vertex array processing */
+#define R_VAP_INDEX_OFFSET         0x208C
+
+/* Geometry arbiter — deadlock / fastsync prevention */
+#define R_GA_ENHANCE               0x4274
+#define   GA_DEADLOCK_CNTL         (1UL << 0)
+#define   GA_FASTSYNC_CNTL         (1UL << 1)
+
+/* RB3D dst cache (used during ring start for 3D cache flush) */
+#define R_RB3D_DSTCACHE_CTLSTAT_RS 0x4E4C    /* ring-start variant */
+#define   RB3D_DC_FLUSH_RS         (2UL << 0)
+#define   RB3D_DC_FREE_RS          (2UL << 2)
+
+/* ZB z-cache control/status */
+#define R_ZB_ZCACHE_CTLSTAT        0x4F18
+#define   ZC_FLUSH                 (1UL << 0)
+#define   ZC_FREE                  (1UL << 1)
+
+/* RV515 MC indirect register: MC_STATUS */
+#define RV515_MC_STATUS            0x0000
+#define   MC_STATUS_IDLE           (1UL << 4)
+
+/* RV515 MC indirect register: MC_CNTL */
+#define RV515_MC_CNTL              0x0005
+
+/* R500 PLL register for pipe memory power (indirect PLL register) */
+#define R500_DYN_SCLK_PWMEM_PIPE  0x000D
 
 /* =============================================================== */
 /*  RV515 / RV516 device-ID table (Radeon X1300 family)            */
@@ -523,6 +588,40 @@ static unsigned long mc_rreg(unsigned long reg)
     return r;
 }
 
+/* Read/write PLL registers via CLOCK_CNTL_INDEX/DATA
+   (from Linux kernel radeon driver: radeon_reg.h, r100.c) */
+static unsigned long pll_rreg(unsigned long reg)
+{
+    unsigned long r;
+    wreg(R_CLOCK_CNTL_INDEX, reg & 0x3FUL);
+    r = rreg(R_CLOCK_CNTL_DATA);
+    return r;
+}
+static void pll_wreg(unsigned long reg, unsigned long val)
+{
+    wreg(R_CLOCK_CNTL_INDEX, (reg & 0x3FUL) | PLL_WR_EN);
+    wreg(R_CLOCK_CNTL_DATA, val);
+}
+
+/* Disable VGA rendering — prevents VGA block from interfering with
+   the 2D engine.  (from Linux: rv515_vga_render_disable) */
+static void gpu_vga_render_disable(void)
+{
+    wreg(R_VGA_RENDER_CONTROL,
+         rreg(R_VGA_RENDER_CONTROL) & ~VGA_VSTATUS_CNTL_MASK);
+}
+
+/* Wait for memory controller idle (from Linux: rv515_mc_wait_for_idle) */
+static int gpu_mc_wait_idle(void)
+{
+    unsigned long timeout = 2000000UL;
+    while (timeout--) {
+        if (mc_rreg(RV515_MC_STATUS) & MC_STATUS_IDLE)
+            return 1;
+    }
+    return 0;
+}
+
 /* Wait for at least `n` free FIFO entries */
 static void gpu_wait_fifo(int n)
 {
@@ -558,59 +657,172 @@ static void gpu_wait_idle(void)
 
 /* =============================================================== */
 /*  Radeon engine reset (from xf86-video-ati RADEONEngineReset)     */
+/*  Improved with full R300+/R500 sequence from Linux sources.      */
 /* =============================================================== */
 
 static void gpu_engine_reset(void)
 {
     unsigned long rbbm_soft_reset;
     unsigned long host_path_cntl;
+    unsigned long clock_cntl_index;
+
+    /* Save CLOCK_CNTL_INDEX to avoid disturbing PLL access state
+       (from xf86-video-ati RADEONEngineReset) */
+    clock_cntl_index = rreg(R_CLOCK_CNTL_INDEX);
 
     /*
-     * R300+/R500 soft reset sequence:
-     * Reset CP, HI, E2 — leave SE/RE/PP/RB alone to avoid lockup.
-     * Reference: xf86-video-ati radeon_accel.c RADEONEngineReset()
+     * R300+/R500 soft reset sequence (from xf86-video-ati):
+     *   For R300+/AVIVO: reset only CP, HI, E2 — leave SE/RE/PP/RB
+     *   alone to avoid lockup.  Then write 0 to clear all reset bits.
      */
     rbbm_soft_reset = rreg(R_RBBM_SOFT_RESET);
     wreg(R_RBBM_SOFT_RESET, rbbm_soft_reset |
          SOFT_RESET_CP | SOFT_RESET_HI | SOFT_RESET_E2);
     (void)rreg(R_RBBM_SOFT_RESET);   /* flush posted write */
-    wreg(R_RBBM_SOFT_RESET, 0);
+    wreg(R_RBBM_SOFT_RESET, 0);      /* clear ALL reset bits (xf86 style) */
     (void)rreg(R_RBBM_SOFT_RESET);   /* flush */
 
+    /* Enable RB3D dst-cache autoflush (bit 17) — must be set after
+       soft-reset for R300+ (from xf86-video-ati IS_R300/IS_AVIVO path) */
+    wreg(R_RB3D_DSTCACHE_MODE, rreg(R_RB3D_DSTCACHE_MODE) | (1UL << 17));
+
     /*
-     * Reset HDP via HOST_PATH_CNTL toggle (RBBM_SOFT_RESET of HDP
-     * can cause problems on some ASICs).
+     * Reset HDP via HOST_PATH_CNTL toggle.
+     * RBBM_SOFT_RESET of HDP can cause problems on some ASICs — the
+     * Linux and xf86 drivers toggle HDP_SOFT_RESET through HOST_PATH_CNTL
+     * instead.  (from Linux kernel r100.c, xf86-video-ati)
      */
     host_path_cntl = rreg(R_HOST_PATH_CNTL);
-    wreg(R_HOST_PATH_CNTL, host_path_cntl);
+    wreg(R_HOST_PATH_CNTL, host_path_cntl | HDP_SOFT_RESET | HDP_APER_CNTL);
+    (void)rreg(R_HOST_PATH_CNTL);
+    wreg(R_HOST_PATH_CNTL, host_path_cntl | HDP_APER_CNTL);
     (void)rreg(R_HOST_PATH_CNTL);
 
-    /* Enable destination cache autoflush (R300+) */
-    wreg(R_RB3D_DSTCACHE_MODE, rreg(R_RB3D_DSTCACHE_MODE) | (1UL << 17));
+    /* Enable destination cache autoflush (R300+/R500 2D cache) */
     wreg(R_RB2D_DSTCACHE_MODE, rreg(R_RB2D_DSTCACHE_MODE) |
          (1UL << 2) | (1UL << 15));  /* DC_AUTOFLUSH | DC_DISABLE_IGNORE_PE */
+
+    /* Restore CLOCK_CNTL_INDEX */
+    wreg(R_CLOCK_CNTL_INDEX, clock_cntl_index);
 }
 
 /* =============================================================== */
 /*  Radeon R500 2D engine initialization                            */
-/*  Reference: xf86-video-ati RADEONEngineInit() / EngineRestore() */
+/*  Full sequence derived from Linux kernel rv515.c, r100.c and     */
+/*  xf86-video-ati radeon_accel.c RADEONEngineInit/EngineRestore.   */
 /* =============================================================== */
+
+static int g_num_gb_pipes = 1;
 
 static void gpu_init_2d(void)
 {
     unsigned long pitch64;
     unsigned long pitch_offset;
+    unsigned long gb_pipe_sel;
+    unsigned long gb_tile_config;
+    unsigned long pipe_sel_current;
+    unsigned long dst_pipe_val;
+    unsigned long pll_tmp;
 
-    /* Reset the engine first */
-    gpu_engine_reset();
+    /* ---- Phase 1: GPU init (from Linux rv515_gpu_init) ---- */
 
-    /* R300+/R500: GB tile config with single pipe (RV515 has 1 pipe) */
-    wreg(R_GB_TILE_CONFIG, GB_TILE_ENABLE | GB_TILE_SIZE_16 |
-         GB_PIPE_COUNT_RV350);
+    /* Wait for GUI idle before any reset */
+    gpu_wait_idle();
+
+    /* Disable VGA rendering to prevent interference with 2D engine
+       (from Linux rv515_vga_render_disable) */
+    gpu_vga_render_disable();
+
+    /* Detect number of GB pipes
+       (from xf86-video-ati RADEONEngineInit IS_R500_3D path +
+        Linux rv515_gpu_init → r420_pipes_init) */
+    gb_pipe_sel = rreg(R_GB_PIPE_SELECT);
+    g_num_gb_pipes = (int)((gb_pipe_sel >> 12) & 0x3) + 1;
+
+    /* R500 pipe memory power configuration
+       (from xf86-video-ati RADEONEngineInit IS_R500_3D path) */
+    pll_tmp = (1UL | (((gb_pipe_sel >> 8) & 0xFUL) << 4));
+    pll_wreg(R500_DYN_SCLK_PWMEM_PIPE, pll_tmp);
+
+    /* Write PLL reg 0x000D with pipe config
+       (from Linux rv515_gpu_init after r420_pipes_init) */
+    dst_pipe_val = rreg(R_DST_PIPE_CONFIG);
+    pipe_sel_current = (dst_pipe_val >> 2) & 3;
+    pll_wreg(R500_DYN_SCLK_PWMEM_PIPE,
+             (1UL << pipe_sel_current) |
+             (((gb_pipe_sel >> 8) & 0xFUL) << 4));
+
+    /* Wait for GUI and MC idle after pipe init
+       (from Linux rv515_gpu_init) */
+    gpu_wait_idle();
+    gpu_mc_wait_idle();
+
+    /* ---- Phase 2: Configure R300+/R500 tile and cache
+       (from xf86-video-ati RADEONEngineInit IS_R300/IS_R500 path,
+        done BEFORE engine reset per xf86 order) ---- */
+
+    /* GB_TILE_CONFIG based on detected pipe count
+       (from xf86-video-ati RADEONEngineInit) */
+    gb_tile_config = GB_TILE_ENABLE | GB_TILE_SIZE_16;
+    switch (g_num_gb_pipes) {
+    case 2:  gb_tile_config |= (1UL << 1); break;  /* R300_PIPE_COUNT_R300 */
+    case 3:  gb_tile_config |= (2UL << 1); break;  /* R300_PIPE_COUNT_R420_3P */
+    case 4:  gb_tile_config |= (3UL << 1); break;  /* R300_PIPE_COUNT_R420 */
+    default: gb_tile_config |= GB_PIPE_COUNT_RV350; break;  /* 1 pipe */
+    }
+    wreg(R_GB_TILE_CONFIG, gb_tile_config);
+
     wreg(R_WAIT_UNTIL, WAIT_2D_IDLECLEAN | WAIT_3D_IDLECLEAN);
 
     /* R420+/R500: auto-configure destination pipe */
     wreg(R_DST_PIPE_CONFIG, rreg(R_DST_PIPE_CONFIG) | PIPE_AUTO_CONFIG);
+
+    /* Enable RB2D cache autoflush BEFORE engine reset
+       (from xf86-video-ati RADEONEngineInit — order matters) */
+    wreg(R_RB2D_DSTCACHE_MODE, rreg(R_RB2D_DSTCACHE_MODE) |
+         (1UL << 2) | (1UL << 15));
+
+    /* ---- Phase 3: Engine reset ---- */
+    gpu_engine_reset();
+
+    /* ---- Phase 4: Ring-start-equivalent initialization
+       (from Linux rv515_ring_start — these are normally submitted via
+        the CP ring, but we write them directly via MMIO for DOS) ---- */
+
+    gpu_wait_fifo(12);
+
+    /* 2D/3D synchronization control (rv515_ring_start) */
+    wreg(R_ISYNC_CNTL,
+         ISYNC_ANY2D_IDLE3D | ISYNC_ANY3D_IDLE2D |
+         ISYNC_WAIT_IDLEGUI | ISYNC_CPSCRATCH_IDLEGUI);
+
+    wreg(R_WAIT_UNTIL, WAIT_2D_IDLECLEAN | WAIT_3D_IDLECLEAN);
+    wreg(R_DST_PIPE_CONFIG, rreg(R_DST_PIPE_CONFIG) | PIPE_AUTO_CONFIG);
+
+    wreg(R_GB_SELECT, 0);
+    wreg(R_GB_ENABLE, 0);
+
+    /* R500 shader-unit register destination = pipe mask */
+    wreg(R_SU_REG_DEST, (1UL << g_num_gb_pipes) - 1);
+    wreg(R_VAP_INDEX_OFFSET, 0);
+
+    /* Flush RB3D and ZB caches (rv515_ring_start) */
+    wreg(R_RB3D_DSTCACHE_CTLSTAT_RS, RB3D_DC_FLUSH_RS | RB3D_DC_FREE_RS);
+    wreg(R_ZB_ZCACHE_CTLSTAT, ZC_FLUSH | ZC_FREE);
+    wreg(R_WAIT_UNTIL, WAIT_2D_IDLECLEAN | WAIT_3D_IDLECLEAN);
+
+    /* Anti-aliasing off */
+    wreg(R_GB_AA_CONFIG, 0);
+
+    /* Flush again */
+    wreg(R_RB3D_DSTCACHE_CTLSTAT_RS, RB3D_DC_FLUSH_RS | RB3D_DC_FREE_RS);
+    wreg(R_ZB_ZCACHE_CTLSTAT, ZC_FLUSH | ZC_FREE);
+
+    gpu_wait_fifo(4);
+
+    /* Geometry arbiter: deadlock and fastsync prevention
+       (from rv515_ring_start) */
+    wreg(R_GA_ENHANCE, GA_DEADLOCK_CNTL | GA_FASTSYNC_CNTL);
 
     /* Set RBBM GUI control — no byte swap (x86 is little-endian) */
     wreg(R_RBBM_GUICNTL, 0);
@@ -618,8 +830,11 @@ static void gpu_init_2d(void)
     /* Wait for full idle */
     gpu_wait_idle();
 
-    /* Flush destination cache using R300+/R500 register */
+    /* Flush 2D destination cache */
     gpu_engine_flush();
+
+    /* ---- Phase 5: 2D engine setup
+       (from xf86-video-ati RADEONEngineRestore) ---- */
 
     /* Encode pitch/offset for the combined register.
        Pitch field is in 64-byte units at bits [29:22],
@@ -628,7 +843,7 @@ static void gpu_init_2d(void)
     pitch64 = ((unsigned long)g_pitch + 63) / 64;
     pitch_offset = (pitch64 << 22) | ((g_fb_location >> 10) & 0x003FFFFFUL);
 
-    gpu_wait_fifo(12);
+    gpu_wait_fifo(14);
     wreg(R_DEFAULT_PITCH_OFFSET, pitch_offset);
     wreg(R_DST_PITCH_OFFSET, pitch_offset);
     wreg(R_SRC_PITCH_OFFSET, pitch_offset);
@@ -641,8 +856,19 @@ static void gpu_init_2d(void)
     wreg(R_DP_WRITE_MASK, 0xFFFFFFFF);
     wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
 
+    /* Initialize brush and source colors to known state
+       (from xf86-video-ati RADEONEngineRestore — avoids
+        undefined register state on real hardware) */
+    wreg(R_DP_BRUSH_FRGD_CLR, 0xFFFFFFFF);
+    wreg(R_DP_BRUSH_BKGD_CLR, 0x00000000);
+    wreg(R_DP_SRC_FRGD_CLR, 0xFFFFFFFF);
+    wreg(R_DP_SRC_BKGD_CLR, 0x00000000);
+
     /* Set surface byte-order control (no swap for x86) */
     wreg(R_SURFACE_CNTL, 0);
+
+    /* Disable color compare (clean state for first operation) */
+    wreg(R_CLR_CMP_CNTL, 0);
 
     gpu_wait_idle();
 }
@@ -1480,6 +1706,30 @@ int main(void)
             printf("  NOTE: Non-zero FB base — 2D engine offsets adjusted\n");
     }
 
+    /* --- Additional GPU state diagnostics (from Linux rv515 debugfs) --- */
+    {
+        unsigned long gb_ps, gb_tc, dpc, vga_rc, isync, mc_st;
+        int npipes;
+
+        gb_ps  = rreg(R_GB_PIPE_SELECT);
+        gb_tc  = rreg(R_GB_TILE_CONFIG);
+        dpc    = rreg(R_DST_PIPE_CONFIG);
+        vga_rc = rreg(R_VGA_RENDER_CONTROL);
+        isync  = rreg(R_ISYNC_CNTL);
+        mc_st  = mc_rreg(RV515_MC_STATUS);
+        npipes = (int)((gb_ps >> 12) & 0x3) + 1;
+
+        printf("\n  GPU State (pre-init):\n");
+        printf("    GB_PIPE_SELECT : 0x%08lX  (%d pipe%s)\n",
+               gb_ps, npipes, npipes > 1 ? "s" : "");
+        printf("    GB_TILE_CONFIG : 0x%08lX\n", gb_tc);
+        printf("    DST_PIPE_CONFIG: 0x%08lX\n", dpc);
+        printf("    VGA_RENDER_CTL : 0x%08lX\n", vga_rc);
+        printf("    ISYNC_CNTL     : 0x%08lX\n", isync);
+        printf("    MC_STATUS      : 0x%08lX  (%s)\n",
+               mc_st, (mc_st & MC_STATUS_IDLE) ? "idle" : "BUSY");
+    }
+
     /* --- Find VESA mode --- */
     printf("\nLooking for 800x600 8bpp VESA mode...\n");
     if (!find_mode()) {
@@ -1559,6 +1809,14 @@ int main(void)
                    (rbbm & RBBM_ACTIVE) ? "BUSY" : "idle");
             printf("  LFB pixel test: before=0x%02X after=0x%02X "
                    "(expected 0xAA)\n", before, after);
+            printf("  GB_PIPE_SELECT: 0x%08lX  (%d pipes)\n",
+                   rreg(R_GB_PIPE_SELECT), g_num_gb_pipes);
+            printf("  GB_TILE_CONFIG: 0x%08lX\n", rreg(R_GB_TILE_CONFIG));
+            printf("  ISYNC_CNTL    : 0x%08lX\n", rreg(R_ISYNC_CNTL));
+            printf("  VGA_RENDER_CTL: 0x%08lX\n",
+                   rreg(R_VGA_RENDER_CONTROL));
+            printf("  MC_STATUS     : 0x%08lX\n",
+                   mc_rreg(RV515_MC_STATUS));
             printf("\n  GPU 2D engine may not be functional.\n");
             printf("  Press any key to continue anyway, ESC to quit.\n");
             ch = getch();
@@ -1618,8 +1876,8 @@ int main(void)
     vbe_text();
 
     printf("Radeon demo complete.\n");
-    printf("Card: %s  |  VRAM: %lu MB  |  Mode: %dx%d\n",
-           g_card_name, g_vram_mb, g_xres, g_yres);
+    printf("Card: %s  |  VRAM: %lu MB  |  Mode: %dx%d  |  Pipes: %d\n",
+           g_card_name, g_vram_mb, g_xres, g_yres, g_num_gb_pipes);
 
     dpmi_unmap(g_lfb);
     dpmi_unmap((void *)g_mmio);
