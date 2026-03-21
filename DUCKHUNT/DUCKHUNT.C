@@ -20,18 +20,35 @@
  *
  * Requires: PMODE/W (ring 0), VBE 2.0+, mouse driver (CTMOUSE etc.)
  *
- * Build:
+ * Build (Watcom):
  *   wcc386 -bt=dos -5r -fp5 -ox -s -zq DUCKHUNT.C
  *   wlink system pmodew name DUCKHUNT file DUCKHUNT option quiet
+ *
+ * Build (DJGPP):
+ *   i586-pc-msdosdjgpp-gcc -march=prescott -O3 -ffast-math -o DUCKGCC.EXE DUCKHUNT.C -lm
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifdef __DJGPP__
+#include <dos.h>
+#include <dpmi.h>
+#include <go32.h>
+#include <sys/nearptr.h>
+#include <sys/movedata.h>
+#include <sys/segments.h>
+#include <pc.h>
+#include <conio.h>
+#define far
+#define __far
+#define __interrupt
+#else
 #include <conio.h>
 #include <i86.h>
 #include <dos.h>
+#endif
 
 /* ========================================================================
  *  CONSTANTS
@@ -180,6 +197,27 @@ typedef struct {
 
 static unsigned short g_dos_seg = 0, g_dos_sel = 0;
 
+#ifdef __DJGPP__
+/* Convert a real-mode segment address to a usable flat pointer (nearptr) */
+#define DOS_SEG_PTR(seg) ((unsigned char *)((unsigned long)(seg) * 16 + __djgpp_conventional_base))
+/* Convert a flat real-mode address to a usable pointer */
+#define RM_TO_PTR(addr) ((void *)((unsigned long)(addr) + __djgpp_conventional_base))
+#else
+#define DOS_SEG_PTR(seg) ((unsigned char *)((unsigned long)(seg) << 4))
+#define RM_TO_PTR(addr) ((void *)(unsigned long)(addr))
+#endif
+
+#ifdef __DJGPP__
+static int dpmi_alloc_dos(unsigned short paras)
+{
+    int sel_or_max;
+    int seg = __dpmi_allocate_dos_memory(paras, &sel_or_max);
+    if (seg == -1) return 0;
+    g_dos_seg = (unsigned short)seg;
+    g_dos_sel = (unsigned short)sel_or_max;
+    return 1;
+}
+#else
 static int dpmi_alloc_dos(unsigned short paras)
 {
     union REGS r;
@@ -191,7 +229,16 @@ static int dpmi_alloc_dos(unsigned short paras)
     g_dos_sel = r.w.dx;
     return 1;
 }
+#endif
 
+#ifdef __DJGPP__
+static void dpmi_free_dos(void)
+{
+    if (!g_dos_sel) return;
+    __dpmi_free_dos_memory(g_dos_sel);
+    g_dos_sel = 0;
+}
+#else
 static void dpmi_free_dos(void)
 {
     union REGS r;
@@ -201,7 +248,15 @@ static void dpmi_free_dos(void)
     int386(0x31, &r, &r);
     g_dos_sel = 0;
 }
+#endif
 
+#ifdef __DJGPP__
+static int dpmi_real_int(int intno, RMI *rmi)
+{
+    /* RMI layout is binary-compatible with __dpmi_regs (DPMI 0.9 spec) */
+    return (__dpmi_simulate_real_mode_interrupt(intno, (__dpmi_regs *)rmi) == 0);
+}
+#else
 static int dpmi_real_int(int intno, RMI *rmi)
 {
     union REGS r;
@@ -215,7 +270,19 @@ static int dpmi_real_int(int intno, RMI *rmi)
     int386x(0x31, &r, &r, &s);
     return !r.x.cflag;
 }
+#endif
 
+#ifdef __DJGPP__
+static void *dpmi_map_physical(unsigned long phys, unsigned long size)
+{
+    __dpmi_meminfo mi;
+    mi.address = phys;
+    mi.size = size;
+    if (__dpmi_physical_address_mapping(&mi) == -1) return NULL;
+    /* Convert linear address to nearptr-usable pointer */
+    return (void *)(mi.address + __djgpp_conventional_base);
+}
+#else
 static void far *dpmi_map_physical(unsigned long phys, unsigned long size)
 {
     union REGS r;
@@ -228,7 +295,17 @@ static void far *dpmi_map_physical(unsigned long phys, unsigned long size)
     if (r.x.cflag) return NULL;
     return (void far *)(((unsigned long)r.w.bx << 16) | r.w.cx);
 }
+#endif
 
+#ifdef __DJGPP__
+static void dpmi_unmap_physical(void *addr)
+{
+    __dpmi_meminfo mi;
+    mi.address = (unsigned long)addr - __djgpp_conventional_base;
+    mi.size = 0;
+    __dpmi_free_physical_address_mapping(&mi);
+}
+#else
 static void dpmi_unmap_physical(void far *addr)
 {
     union REGS r;
@@ -238,6 +315,7 @@ static void dpmi_unmap_physical(void far *addr)
     r.w.cx = (unsigned short)(la & 0xFFFF);
     int386(0x31, &r, &r);
 }
+#endif
 
 /* ========================================================================
  *  VBE FUNCTIONS
@@ -275,7 +353,7 @@ static unsigned long g_fb_phys = 0;
 static int vbe_get_info(void)
 {
     RMI rmi;
-    unsigned char *buf = (unsigned char *)((unsigned long)g_dos_seg << 4);
+    unsigned char *buf = DOS_SEG_PTR(g_dos_seg);
     memset(buf, 0, 512);
     memcpy(buf, "VBE2", 4);
     memset(&rmi, 0, sizeof(rmi));
@@ -291,7 +369,7 @@ static int vbe_get_info(void)
 static int vbe_get_mode_info(unsigned short mode)
 {
     RMI rmi;
-    unsigned char *buf = (unsigned char *)((unsigned long)g_dos_seg << 4);
+    unsigned char *buf = DOS_SEG_PTR(g_dos_seg);
     memset(buf, 0, 256);
     memset(&rmi, 0, sizeof(rmi));
     rmi.eax = 0x4F01;
@@ -352,7 +430,7 @@ static void vbe_set_dac_width(int bits)
 
 static void set_palette_entry(int idx, int r, int g, int b)
 {
-    unsigned char *buf = (unsigned char *)((unsigned long)g_dos_seg << 4);
+    unsigned char *buf = DOS_SEG_PTR(g_dos_seg);
     RMI rmi;
     buf[0] = (unsigned char)r;
     buf[1] = (unsigned char)g;
@@ -370,7 +448,7 @@ static void set_palette_entry(int idx, int r, int g, int b)
 
 static void set_palette_block(int start, int count, unsigned char *rgb)
 {
-    unsigned char *buf = (unsigned char *)((unsigned long)g_dos_seg << 4);    RMI rmi;
+    unsigned char *buf = DOS_SEG_PTR(g_dos_seg);    RMI rmi;
     int i;
     for (i = 0; i < count; i++) {
         buf[i * 4 + 0] = rgb[i * 3 + 0];
@@ -445,12 +523,43 @@ static int query_pmi(void)
     g_pmi_size   = (unsigned short)(rmi.ecx & 0xFFFF);
     if (g_pmi_size == 0) return 0;
     pmi_flat = (unsigned long)g_pmi_rm_seg * 16 + g_pmi_rm_off;
+#ifdef __DJGPP__
+    pmi_flat += __djgpp_conventional_base;
+#endif
     g_pmi_setw_off   = *(unsigned short *)(pmi_flat + 0);
     g_pmi_setds_off  = *(unsigned short *)(pmi_flat + 2);
     g_pmi_setpal_off = *(unsigned short *)(pmi_flat + 4);
     return 1;
 }
 
+#ifdef __DJGPP__
+/* noinline: 5 specific-register operands exhaust x86-32 register file at -O3 */
+static unsigned long __attribute__((noinline))
+_pmi_call4(unsigned long entry, unsigned long _eax,
+           unsigned long _ebx, unsigned long _ecx, unsigned long _edx)
+{
+    unsigned long result = _eax;
+    __asm__ __volatile__ (
+        "call *%%esi"
+        : "+a"(result), "+S"(entry), "+b"(_ebx), "+c"(_ecx), "+d"(_edx)
+        :: "edi", "memory"
+    );
+    return result;
+}
+
+static unsigned long __attribute__((noinline))
+_pmi_call4_ebx(unsigned long entry, unsigned long _eax,
+               unsigned long _ebx, unsigned long _ecx, unsigned long _edx)
+{
+    unsigned long result = _ebx;
+    __asm__ __volatile__ (
+        "call *%%esi"
+        : "+b"(result), "+S"(entry), "+a"(_eax), "+c"(_ecx), "+d"(_edx)
+        :: "edi", "memory"
+    );
+    return result;
+}
+#else
 unsigned long _pmi_call4(unsigned long entry, unsigned long eax,
                          unsigned long ebx,  unsigned long ecx,
                          unsigned long edx);
@@ -468,11 +577,15 @@ unsigned long _pmi_call4_ebx(unsigned long entry, unsigned long eax,
     parm [esi] [eax] [ebx] [ecx] [edx] \
     value [ebx]              \
     modify [eax ecx edx esi edi]
+#endif
 
 static int pmi_set_display_start(unsigned short cx, unsigned short dy, int wait)
 {
     unsigned long entry = (unsigned long)g_pmi_rm_seg * 16
                         + g_pmi_rm_off + g_pmi_setds_off;
+#ifdef __DJGPP__
+    entry += __djgpp_conventional_base;
+#endif
     unsigned long result;
     result = _pmi_call4(entry, 0x4F07,
                         wait ? 0x0080UL : 0x0000UL,
@@ -485,6 +598,9 @@ static int pmi_schedule_display_start(unsigned short cx, unsigned short dy)
 {
     unsigned long entry = (unsigned long)g_pmi_rm_seg * 16
                         + g_pmi_rm_off + g_pmi_setds_off;
+#ifdef __DJGPP__
+    entry += __djgpp_conventional_base;
+#endif
     unsigned long result;
     result = _pmi_call4(entry, 0x4F07, 0x0002UL,
                         (unsigned long)cx,
@@ -496,6 +612,9 @@ static int pmi_is_flip_complete(void)
 {
     unsigned long entry = (unsigned long)g_pmi_rm_seg * 16
                         + g_pmi_rm_off + g_pmi_setds_off;
+#ifdef __DJGPP__
+    entry += __djgpp_conventional_base;
+#endif
     unsigned long ebx_out;
     ebx_out = _pmi_call4_ebx(entry, 0x4F07, 0x0004UL, 0, 0);
     return ((ebx_out & 0xFF00) == 0);
@@ -511,11 +630,24 @@ static int pmi_is_flip_complete(void)
 #define R5_D1GRPH_SURFACE_UPDATE_PENDING    (1UL << 2)
 #define R5_D1GRPH_SURFACE_UPDATE_LOCK       (1UL << 16)
 
+#ifdef __DJGPP__
+static inline void _gpu_outpd(unsigned short port, unsigned long val)
+{
+    __asm__ __volatile__ ("outl %0, %w1" :: "a"(val), "Nd"(port));
+}
+static inline unsigned long _gpu_inpd(unsigned short port)
+{
+    unsigned long val;
+    __asm__ __volatile__ ("inl %w1, %0" : "=a"(val) : "Nd"(port));
+    return val;
+}
+#else
 void _gpu_outpd(unsigned short port, unsigned long val);
 #pragma aux _gpu_outpd = "out dx, eax" parm [dx] [eax] modify exact []
 
 unsigned long _gpu_inpd(unsigned short port);
 #pragma aux _gpu_inpd = "in eax, dx" parm [dx] value [eax] modify exact []
+#endif
 
 static unsigned long gpu_reg_read(unsigned long reg)
 {
@@ -611,6 +743,101 @@ static void blit_to_lfb(unsigned char *dst, int lfb_pitch,
  *  INLINE ASM FOR MSR / CR / RDTSC
  * ======================================================================== */
 
+#ifdef __DJGPP__
+
+static inline unsigned short _get_cs(void)
+{
+    unsigned short cs;
+    __asm__ __volatile__ ("movw %%cs, %0" : "=r"(cs));
+    return cs;
+}
+
+static inline int _has_cpuid(void)
+{
+    unsigned long result, scratch;
+    __asm__ __volatile__ (
+        "pushfl\n\t"
+        "popl %%eax\n\t"
+        "movl %%eax, %%ecx\n\t"
+        "xorl $0x200000, %%eax\n\t"
+        "pushl %%eax\n\t"
+        "popfl\n\t"
+        "pushfl\n\t"
+        "popl %%eax\n\t"
+        "xorl %%ecx, %%eax\n\t"
+        "shrl $21, %%eax\n\t"
+        "andl $1, %%eax"
+        : "=a"(result), "=c"(scratch) :: "memory"
+    );
+    return (int)result;
+}
+
+static inline unsigned long _cpuid1_edx(void)
+{
+    unsigned long eax = 1, ebx_out, ecx_out, edx;
+    __asm__ __volatile__ (
+        "cpuid"
+        : "+a"(eax), "=b"(ebx_out), "=c"(ecx_out), "=d"(edx)
+    );
+    return edx;
+}
+
+static inline unsigned long _rdmsr_lo(unsigned long msr)
+{
+    unsigned long lo, hi;
+    __asm__ __volatile__ ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return lo;
+}
+
+static inline unsigned long _rdmsr_hi(unsigned long msr)
+{
+    unsigned long lo, hi;
+    __asm__ __volatile__ ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return hi;
+}
+
+static inline void _wrmsr_3(unsigned long msr, unsigned long lo, unsigned long hi)
+{
+    __asm__ __volatile__ ("wrmsr" :: "c"(msr), "a"(lo), "d"(hi));
+}
+
+static inline void _wbinvd(void)
+{
+    __asm__ __volatile__ ("wbinvd" ::: "memory");
+}
+
+static inline void _flush_tlb(void)
+{
+    unsigned long tmp;
+    __asm__ __volatile__ (
+        "movl %%cr3, %0\n\t"
+        "movl %0, %%cr3"
+        : "=r"(tmp) :: "memory"
+    );
+}
+
+static inline void _rdtsc_pair(unsigned long *lo, unsigned long *hi)
+{
+    unsigned long _lo, _hi;
+    __asm__ __volatile__ ("rdtsc" : "=a"(_lo), "=d"(_hi));
+    *lo = _lo;
+    *hi = _hi;
+}
+
+/* Enable SSE/SSE2/SSE3 for Pentium D: set OSFXSR + OSXMMEXCPT in CR4 */
+static void djgpp_enable_sse(void)
+{
+    unsigned long cr4;
+    if ((_get_cs() & 3) != 0) return;
+    if (!_has_cpuid()) return;
+    if (!(_cpuid1_edx() & (1UL << 25))) return;
+    __asm__ __volatile__ ("movl %%cr4, %0" : "=r"(cr4));
+    cr4 |= (1UL << 9) | (1UL << 10);
+    __asm__ __volatile__ ("movl %0, %%cr4" :: "r"(cr4) : "memory");
+}
+
+#else
+
 unsigned short _get_cs(void);
 #pragma aux _get_cs = "mov ax, cs" value [ax]
 
@@ -672,6 +899,7 @@ void _rdtsc_pair(unsigned long *, unsigned long *);
     "mov [edi], edx"        \
     parm [esi] [edi]        \
     modify [eax edx]
+#endif
 
 /* ========================================================================
  *  RDTSC TIMING
@@ -681,8 +909,13 @@ static double g_rdtsc_mhz = 0.0;
 
 static void calibrate_rdtsc(void)
 {
+#ifdef __DJGPP__
+    volatile unsigned long *bios_tick =
+        (volatile unsigned long *)(0x0046CUL + __djgpp_conventional_base);
+#else
     volatile unsigned long *bios_tick =
         (volatile unsigned long *)0x0046CUL;
+#endif
     unsigned long t0, t1, lo0, hi0, lo1, hi1;
     unsigned long long c0, c1;
     double ticks;
@@ -843,7 +1076,11 @@ static void restore_pat(void)
  *  KEYBOARD INPUT (IRQ 1 handler)
  * ======================================================================== */
 
+#ifdef __DJGPP__
+static _go32_dpmi_seginfo g_old_kb_handler, g_new_kb_handler;
+#else
 static void (__interrupt __far *g_old_kb_isr)();
+#endif
 static volatile unsigned char g_keys[128];
 
 static void __interrupt __far kb_isr(void)
@@ -859,18 +1096,38 @@ static void __interrupt __far kb_isr(void)
     outp(0x20, 0x20);
 }
 
+#ifdef __DJGPP__
+static void install_keyboard(void)
+{
+    memset((void *)g_keys, 0, sizeof(g_keys));
+    _go32_dpmi_get_protected_mode_interrupt_vector(9, &g_old_kb_handler);
+    g_new_kb_handler.pm_offset = (unsigned long)kb_isr;
+    g_new_kb_handler.pm_selector = _my_cs();
+    _go32_dpmi_allocate_iret_wrapper(&g_new_kb_handler);
+    _go32_dpmi_set_protected_mode_interrupt_vector(9, &g_new_kb_handler);
+}
+#else
 static void install_keyboard(void)
 {
     memset((void *)g_keys, 0, sizeof(g_keys));
     g_old_kb_isr = _dos_getvect(9);
     _dos_setvect(9, kb_isr);
 }
+#endif
 
+#ifdef __DJGPP__
+static void restore_keyboard(void)
+{
+    _go32_dpmi_set_protected_mode_interrupt_vector(9, &g_old_kb_handler);
+    _go32_dpmi_free_iret_wrapper(&g_new_kb_handler);
+}
+#else
 static void restore_keyboard(void)
 {
     if (g_old_kb_isr)
         _dos_setvect(9, g_old_kb_isr);
 }
+#endif
 
 /* ========================================================================
  *  MOUSE INPUT (INT 33h via DPMI)
@@ -1369,7 +1626,7 @@ static void init_font(void)
     rmi.ebx = 0x0300;
     dpmi_real_int(0x10, &rmi);
     addr = ((unsigned long)(rmi.es & 0xFFFF) << 4) + (rmi.ebp & 0xFFFF);
-    g_font = (unsigned char *)addr;
+    g_font = (unsigned char *)RM_TO_PTR(addr);
 }
 
 static void draw_char(unsigned char *buf, int pitch,
@@ -2306,6 +2563,17 @@ int main(int argc, char *argv[])
     }
 
     draw_title();
+
+#ifdef __DJGPP__
+    /* Enable near pointer access for direct physical memory mapping */
+    if (!__djgpp_nearptr_enable()) {
+        printf("Failed to enable near pointer access\n");
+        return 1;
+    }
+    printf("[0] DJGPP nearptr enabled, SSE init...\n");
+    djgpp_enable_sse();
+#endif
+
     printf("[1] DOS mem...\n");
 
     /* Conventional DOS memory for VBE calls:
@@ -2644,6 +2912,10 @@ int main(int argc, char *argv[])
     dpmi_unmap_physical(lfb);
     free(frame_buf);
     dpmi_free_dos();
+
+#ifdef __DJGPP__
+    __djgpp_nearptr_disable();
+#endif
 
     printf("QUACK HUNT done. Score: %d  Round: %d  Shots: %d\n",
            g_score, g_round, g_shots_fired);
