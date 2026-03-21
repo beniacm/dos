@@ -1655,6 +1655,14 @@ int main(int argc, char *argv[])
         printf("Failed to enable near pointer access\n");
         return 1;
     }
+    /* nearptr_enable expands DS/ES/SS to 4 GB but leaves CS at program
+     * size.  PMI calls jump into BIOS ROM code outside our binary, so
+     * expand CS to cover the full 4 GB address space as well.
+     * The DPMI INT 31h return (IRET) automatically reloads CS. */
+    if (__dpmi_set_segment_limit(_get_cs(), 0xffffffffUL) == -1) {
+        /* Non-fatal: PMI will be disabled later if CS is too small */
+        printf("Warning: could not expand CS limit (PMI may not work)\n");
+    }
     printf("[0] DJGPP nearptr enabled, SSE init...\n");
     djgpp_enable_sse();
 #endif
