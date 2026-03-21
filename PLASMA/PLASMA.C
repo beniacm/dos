@@ -1401,17 +1401,49 @@ static void build_plasma_palette(unsigned char *pal)
  * LFB blit helpers
  * -------------------------------------------------------------------------- */
 
+#ifdef __DJGPP__
+/*
+ * WC-optimal memcpy using REP MOVSD (x86 fast-string path).
+ *
+ * With -O3, GCC inlines memcpy as SSE2 MOVDQA temporal stores which are
+ * ~25% slower on WC memory than the CPU's fast-string microcode.  REP MOVSD
+ * triggers the hardware fast-string engine (Pentium Pro+) which fills WC
+ * buffers optimally.  This keeps blit at ~1000+ MB/s with -O3.
+ *
+ * count must be a multiple of 4 (always true for WIDTH=1024 scanlines).
+ */
+static inline void wc_memcpy(void *dst, const void *src, unsigned long count)
+{
+    unsigned long dwords = count >> 2;
+    __asm__ __volatile__ (
+        "rep movsl"
+        : "+D"(dst), "+S"(src), "+c"(dwords)
+        :
+        : "memory"
+    );
+}
+#endif
+
 /* Copy frame_buf (pitch=WIDTH) to LFB (pitch=lfb_pitch). */
 static void blit_to_lfb(unsigned char *lfb, int lfb_pitch,
                          const unsigned char *src)
 {
     int y;
     if (lfb_pitch == WIDTH) {
+#ifdef __DJGPP__
+        wc_memcpy(lfb, src, PIXELS);
+#else
         memcpy(lfb, src, PIXELS);
+#endif
     } else {
         for (y = 0; y < HEIGHT; y++)
+#ifdef __DJGPP__
+            wc_memcpy(lfb + (unsigned long)y * lfb_pitch,
+                       src + (unsigned long)y * WIDTH, WIDTH);
+#else
             memcpy(lfb + (unsigned long)y * lfb_pitch,
                    src + (unsigned long)y * WIDTH, WIDTH);
+#endif
     }
 }
 
