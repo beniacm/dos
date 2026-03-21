@@ -1424,9 +1424,17 @@ static inline void wc_memcpy(void *dst, const void *src, unsigned long count)
 }
 #endif
 
-/* Copy frame_buf (pitch=WIDTH) to LFB (pitch=lfb_pitch). */
+/* Copy frame_buf (pitch=WIDTH) to LFB (pitch=lfb_pitch).
+ * noinline + O2: prevents GCC -O3 from inlining and over-unrolling
+ * the rep movsl loop, which adds startup overhead per rep invocation
+ * that hurts WC throughput on Prescott/Pentium D. */
+#ifdef __DJGPP__
+static void __attribute__((noinline, optimize("O2,no-unroll-loops")))
+blit_to_lfb(unsigned char *lfb, int lfb_pitch, const unsigned char *src)
+#else
 static void blit_to_lfb(unsigned char *lfb, int lfb_pitch,
                          const unsigned char *src)
+#endif
 {
     int y;
     if (lfb_pitch == WIDTH) {
@@ -1523,7 +1531,12 @@ static void calibrate_rdtsc(void)
 
 #define BENCH_FRAMES 100
 
+#ifdef __DJGPP__
+static void __attribute__((noinline, optimize("O2,no-unroll-loops")))
+run_benchmark(unsigned char *lfb, int lfb_pitch)
+#else
 static void run_benchmark(unsigned char *lfb, int lfb_pitch)
+#endif
 {
     unsigned long lo0, hi0, lo1, hi1;
     unsigned char *tmp;
