@@ -797,6 +797,17 @@ static void djgpp_enable_sse(void)
     __asm__ __volatile__ ("movl %0, %%cr4" :: "r"(cr4) : "memory");
 }
 
+/* Read the current CS segment limit via the LSL instruction. */
+static unsigned long get_cs_limit(void)
+{
+    unsigned long limit;
+    unsigned short cs = _get_cs();
+    __asm__ __volatile__ ("lsll %1, %0"
+                          : "=r"(limit)
+                          : "r"((unsigned long)cs));
+    return limit;
+}
+
 /*
  * Extract the 32-bit base address from an 8-byte descriptor entry.
  * GDT/LDT descriptor layout: base is split across bytes 2-4 and 7.
@@ -810,84 +821,94 @@ static unsigned long desc_base(const unsigned char *d)
 }
 
 /*
- * Expand CS limit to 4 GB by directly patching the descriptor table
- * (GDT or LDT) at ring 0.
+ * Expand CS limit to 4 GB so PMI calls can reach BIOS ROM code.
  *
- * __djgpp_nearptr_enable() expands DS/ES/SS to 4 GB but leaves CS at the
- * program size.  DPMI servers (CWSDPR0, PMODE/DJ) reject function 0008h
- * for the code segment, so we modify the descriptor directly and reload
- * CS via a far return (LRET).
- *
- * DPMI servers allocate client selectors in the LDT (bit 2 of selector =
- * Table Indicator: 0 = GDT, 1 = LDT).  We detect which table the CS
- * selector lives in, locate the table base via SGDT/SLDT, and patch.
+ * Strategy:
+ *   1. Try DPMI function 0008h (Set Segment Limit) — the clean way.
+ *      Works on PMODE/DJ (GDT selectors, ring 0).  The INT 31h return
+ *      via IRETD automatically reloads CS from the modified descriptor.
+ *   2. If DPMI fails (e.g. CWSDPR0 rejects 0008h for CS), fall back to
+ *      direct descriptor table patching at ring 0 + LRET to reload CS.
+ *      Handles both GDT selectors (PMODE/DJ) and LDT selectors (CWSDPR0).
  *
  * Required: ring 0, nearptr already enabled (DS limit = 4 GB).
  */
 static int expand_cs_to_4gb(void)
 {
-    unsigned char gdt_buf[8];
-    unsigned long gdt_base;
     unsigned short cs = _get_cs();
-    unsigned int idx = cs >> 3;       /* descriptor index */
-    int use_ldt = (cs & 4) != 0;     /* TI bit: 0=GDT, 1=LDT */
-    unsigned char *table_ptr;         /* nearptr to descriptor table */
-    unsigned char *entry;
+    unsigned long old_limit;
 
     if ((cs & 3) != 0) return 0;     /* ring 0 only */
 
-    /* We always need the GDT (for direct GDT access or to find the LDT) */
-    __asm__ __volatile__ ("sgdt %0" : "=m"(gdt_buf));
-    gdt_base = *(unsigned long *)&gdt_buf[2];
+    old_limit = get_cs_limit();
+    printf("  CS=0x%04X (%s, idx=%u), limit=0x%08lX\n",
+           cs, (cs & 4) ? "LDT" : "GDT", cs >> 3, old_limit);
 
-    if (use_ldt) {
-        /* CS is in the LDT.  Find LDT base from its GDT descriptor. */
-        unsigned short ldt_sel;
-        unsigned int ldt_idx;
-        unsigned char *ldt_gdt_entry;
-        unsigned long ldt_base;
-
-        __asm__ __volatile__ ("sldt %0" : "=r"(ldt_sel));
-        ldt_idx = ldt_sel >> 3;
-
-        /* LDT descriptor lives in the GDT */
-        ldt_gdt_entry = (unsigned char *)
-            ((long)gdt_base + __djgpp_conventional_base) + ldt_idx * 8;
-        ldt_base = desc_base(ldt_gdt_entry);
-
-        table_ptr = (unsigned char *)
-            ((long)ldt_base + __djgpp_conventional_base);
-
-        printf("  CS=0x%04X (LDT idx=%u), LDT sel=0x%04X base=0x%08lX\n",
-               cs, idx, ldt_sel, ldt_base);
-    } else {
-        /* CS is in the GDT */
-        table_ptr = (unsigned char *)
-            ((long)gdt_base + __djgpp_conventional_base);
-
-        printf("  CS=0x%04X (GDT idx=%u), GDT base=0x%08lX\n",
-               cs, idx, gdt_base);
+    /* --- Method 1: DPMI function 0008h (Set Segment Limit) --- */
+    __dpmi_set_segment_limit(_get_cs(), 0xFFFFFFFFUL);
+    if (get_cs_limit() == 0xFFFFFFFFUL) {
+        printf("  Expanded via DPMI 0008h\n");
+        return 1;
     }
 
-    entry = table_ptr + idx * 8;
+    /* --- Method 2: Direct descriptor table patching at ring 0 --- */
+    {
+        unsigned char gdt_buf[8];
+        unsigned long gdt_base;
+        unsigned int idx = cs >> 3;
+        int use_ldt = (cs & 4) != 0;
+        unsigned char *table_ptr;
+        unsigned char *entry;
 
-    /* Set limit to 0xFFFFF with G=1 (page granularity) → 4 GB */
-    entry[0] = 0xFF;                        /* limit[0:7]   */
-    entry[1] = 0xFF;                        /* limit[8:15]  */
-    entry[6] = (entry[6] & 0xF0) | 0x0F;   /* limit[16:19] */
-    entry[6] |= 0x80;                       /* G = 1        */
+        __asm__ __volatile__ ("sgdt %0" : "=m"(gdt_buf));
+        gdt_base = *(unsigned long *)&gdt_buf[2];
 
-    /* Reload CS descriptor cache via far return */
-    __asm__ __volatile__ (
-        "pushl %0\n\t"
-        "pushl $1f\n\t"
-        "lret\n\t"
-        "1:\n\t"
-        :: "ri"((unsigned long)cs)
-        : "memory"
-    );
+        if (use_ldt) {
+            /* CS is in the LDT — find LDT base from its GDT descriptor */
+            unsigned short ldt_sel;
+            unsigned char *ldt_gdt_entry;
+            unsigned long ldt_base;
 
-    return 1;
+            __asm__ __volatile__ ("sldt %0" : "=r"(ldt_sel));
+
+            ldt_gdt_entry = (unsigned char *)
+                ((long)gdt_base + __djgpp_conventional_base)
+                + (ldt_sel >> 3) * 8;
+            ldt_base = desc_base(ldt_gdt_entry);
+
+            table_ptr = (unsigned char *)
+                ((long)ldt_base + __djgpp_conventional_base);
+        } else {
+            /* CS is in the GDT */
+            table_ptr = (unsigned char *)
+                ((long)gdt_base + __djgpp_conventional_base);
+        }
+
+        entry = table_ptr + idx * 8;
+
+        /* Set limit to 0xFFFFF with G=1 (page granularity) → 4 GB */
+        entry[0] = 0xFF;                        /* limit[0:7]   */
+        entry[1] = 0xFF;                        /* limit[8:15]  */
+        entry[6] = (entry[6] & 0xF0) | 0x0F;   /* limit[16:19] */
+        entry[6] |= 0x80;                       /* G = 1        */
+
+        /* Reload CS descriptor cache via far return */
+        __asm__ __volatile__ (
+            "pushl %0\n\t"
+            "pushl $1f\n\t"
+            "lret\n\t"
+            "1:\n\t"
+            :: "ri"((unsigned long)cs)
+            : "memory"
+        );
+    }
+
+    if (get_cs_limit() == 0xFFFFFFFFUL) {
+        printf("  Expanded via direct %s patch\n",
+               (cs & 4) ? "LDT" : "GDT");
+        return 1;
+    }
+    return 0;
 }
 
 #else /* Watcom */
@@ -1773,10 +1794,11 @@ int main(int argc, char *argv[])
     /* nearptr_enable expands DS/ES/SS to 4 GB but leaves CS at program
      * size.  PMI calls jump into BIOS ROM code outside our binary, so
      * expand CS to cover the full 4 GB address space as well.
-     * CWSDPR0 rejects DPMI 0008h for CS, so we patch the GDT directly. */
+     * Try DPMI 0008h first (works on PMODE/DJ), fall back to direct
+     * GDT/LDT patching (needed for CWSDPR0). */
     if ((_get_cs() & 3) == 0) {
         if (expand_cs_to_4gb()) {
-            printf("[0] CS limit expanded to 4 GB (ring 0 GDT patch)\n");
+            printf("[0] CS limit expanded to 4 GB\n");
         } else {
             printf("Warning: could not expand CS limit (PMI may not work)\n");
         }
