@@ -797,6 +797,55 @@ static void djgpp_enable_sse(void)
     __asm__ __volatile__ ("movl %0, %%cr4" :: "r"(cr4) : "memory");
 }
 
+/*
+ * Expand CS limit to 4 GB by directly patching the GDT at ring 0.
+ *
+ * __djgpp_nearptr_enable() expands DS/ES/SS to 4 GB but leaves CS at the
+ * program size.  CWSDPR0 rejects DPMI function 0008h (Set Segment Limit)
+ * for the code segment, so we modify the GDT entry directly and reload
+ * CS via a far return (LRET).
+ *
+ * Required: ring 0, nearptr already enabled (DS limit = 4 GB).
+ */
+static int expand_cs_to_4gb(void)
+{
+    unsigned char gdt_buf[8];
+    unsigned long gdt_base;
+    unsigned short gdt_limit_val;
+    unsigned short cs = _get_cs();
+    unsigned int idx = cs >> 3;
+    unsigned char *entry;
+
+    if ((cs & 3) != 0) return 0;  /* ring 0 only */
+
+    __asm__ __volatile__ ("sgdt %0" : "=m"(gdt_buf));
+    gdt_limit_val = *(unsigned short *)&gdt_buf[0];
+    gdt_base      = *(unsigned long  *)&gdt_buf[2];
+
+    if ((idx + 1) * 8 > (unsigned long)(gdt_limit_val + 1)) return 0;
+
+    /* Access GDT through DS nearptr (DS base = __djgpp_base_address) */
+    entry = (unsigned char *)(gdt_base + __djgpp_conventional_base)
+          + idx * 8;
+
+    /* Set limit to 0xFFFFF with G=1 (page granularity) → 4 GB */
+    entry[0] = 0xFF;                        /* limit[0:7]   */
+    entry[1] = 0xFF;                        /* limit[8:15]  */
+    entry[6] = (entry[6] & 0xF0) | 0x0F;   /* limit[16:19] */
+    entry[6] |= 0x80;                       /* G = 1        */
+
+    /* Reload CS via far return to activate the new descriptor */
+    __asm__ __volatile__ (
+        "pushl %0\n\t"
+        "pushl $1f\n\t"
+        "lret\n\t"
+        "1:\n\t"
+        :: "ri"((unsigned long)cs)
+        : "memory"
+    );
+    return 1;
+}
+
 #else /* Watcom */
 
 unsigned short _get_cs(void);
@@ -1680,10 +1729,13 @@ int main(int argc, char *argv[])
     /* nearptr_enable expands DS/ES/SS to 4 GB but leaves CS at program
      * size.  PMI calls jump into BIOS ROM code outside our binary, so
      * expand CS to cover the full 4 GB address space as well.
-     * The DPMI INT 31h return (IRET) automatically reloads CS. */
-    if (__dpmi_set_segment_limit(_get_cs(), 0xffffffffUL) == -1) {
-        /* Non-fatal: PMI will be disabled later if CS is too small */
-        printf("Warning: could not expand CS limit (PMI may not work)\n");
+     * CWSDPR0 rejects DPMI 0008h for CS, so we patch the GDT directly. */
+    if ((_get_cs() & 3) == 0) {
+        if (expand_cs_to_4gb()) {
+            printf("[0] CS limit expanded to 4 GB (ring 0 GDT patch)\n");
+        } else {
+            printf("Warning: could not expand CS limit (PMI may not work)\n");
+        }
     }
     printf("[0] DJGPP nearptr enabled, SSE init...\n");
     djgpp_enable_sse();
