@@ -1007,33 +1007,73 @@ static void test_mmio_readback(void)
         return;
     }
 
-    /* Test: write a known pattern to DP_WRITE_MASK and read it back.
-       This register is safe to write (just a mask, no side effects). */
+    /* Test 1: Write a known pattern to DEFAULT_PITCH_OFFSET and read back.
+       This is a direct-accessible 2D register (not FIFO-submitted). */
     {
         unsigned long orig, v1, v2;
+        orig = rreg_at(g_mmio, R_DEFAULT_PITCH_OFFSET);
+        out("  Test 1: DEFAULT_PITCH_OFFSET (direct r/w register)\n");
+        out("    Original = 0x%08lX\n", orig);
+
+        wreg_at(g_mmio, R_DEFAULT_PITCH_OFFSET, 0x00A50000UL);
+        v1 = rreg_at(g_mmio, R_DEFAULT_PITCH_OFFSET);
+        out("    Write 0x00A50000, read = 0x%08lX  %s\n",
+            v1, (v1 == 0x00A50000UL) ? "OK" : "MISMATCH!");
+
+        wreg_at(g_mmio, R_DEFAULT_PITCH_OFFSET, 0x005A0000UL);
+        v2 = rreg_at(g_mmio, R_DEFAULT_PITCH_OFFSET);
+        out("    Write 0x005A0000, read = 0x%08lX  %s\n",
+            v2, (v2 == 0x005A0000UL) ? "OK" : "MISMATCH!");
+
+        /* Restore */
+        wreg_at(g_mmio, R_DEFAULT_PITCH_OFFSET, orig);
+
+        if (v1 == 0x00A50000UL && v2 == 0x005A0000UL)
+            out("    Result: MMIO read-back is WORKING.\n");
+        else if (v1 == v2)
+            out("    Result: MMIO read-back FAILED (reads constant 0x%08lX).\n"
+                "    This BAR is likely VRAM, not MMIO!\n", v1);
+        else
+            out("    Result: MMIO read-back INCONSISTENT.\n");
+    }
+
+    /* Test 2: SURFACE_CNTL — another known-readable register */
+    {
+        unsigned long orig, v1;
+        orig = rreg_at(g_mmio, R_SURFACE_CNTL);
+        out("\n  Test 2: SURFACE_CNTL (direct r/w register)\n");
+        out("    Original = 0x%08lX\n", orig);
+
+        wreg_at(g_mmio, R_SURFACE_CNTL, 0x00000200UL);
+        v1 = rreg_at(g_mmio, R_SURFACE_CNTL);
+        out("    Write 0x00000200, read = 0x%08lX  %s\n",
+            v1, (v1 == 0x00000200UL) ? "OK" : "MISMATCH!");
+
+        /* Restore */
+        wreg_at(g_mmio, R_SURFACE_CNTL, orig);
+    }
+
+    /* Test 3: DP_WRITE_MASK — FIFO-submitted register on R300+/R500.
+       On these GPUs, writes go through the RBBM command FIFO and
+       reads return 0 (no shadow register). This is NORMAL. */
+    {
+        unsigned long orig, v1;
         orig = rreg_at(g_mmio, R_DP_WRITE_MASK);
-        out("  DP_WRITE_MASK original  = 0x%08lX\n", orig);
+        out("\n  Test 3: DP_WRITE_MASK (FIFO-submitted, write-only on R500)\n");
+        out("    Original = 0x%08lX\n", orig);
 
         wreg_at(g_mmio, R_DP_WRITE_MASK, 0xA5A5A5A5UL);
         v1 = rreg_at(g_mmio, R_DP_WRITE_MASK);
-        out("  Write 0xA5A5A5A5, read  = 0x%08lX  %s\n",
-            v1, (v1 == 0xA5A5A5A5UL) ? "OK" : "MISMATCH!");
-
-        wreg_at(g_mmio, R_DP_WRITE_MASK, 0x5A5A5A5AUL);
-        v2 = rreg_at(g_mmio, R_DP_WRITE_MASK);
-        out("  Write 0x5A5A5A5A, read  = 0x%08lX  %s\n",
-            v2, (v2 == 0x5A5A5A5AUL) ? "OK" : "MISMATCH!");
+        out("    Write 0xA5A5A5A5, read = 0x%08lX", v1);
+        if (v1 == 0xA5A5A5A5UL)
+            out("  OK (readable on this chip)\n");
+        else if (v1 == 0 || v1 == orig)
+            out("  (expected — FIFO-submitted, no readback)\n");
+        else
+            out("  UNEXPECTED\n");
 
         /* Restore */
         wreg_at(g_mmio, R_DP_WRITE_MASK, orig);
-
-        if (v1 == 0xA5A5A5A5UL && v2 == 0x5A5A5A5AUL)
-            out("  Result: MMIO read-back is WORKING.\n");
-        else if (v1 == v2)
-            out("  Result: MMIO read-back FAILED (reads constant 0x%08lX).\n"
-                "  This BAR is likely VRAM, not MMIO!\n", v1);
-        else
-            out("  Result: MMIO read-back INCONSISTENT.\n");
     }
 
     /* Test: check CONFIG_MEMSIZE against PCI config space value */
@@ -1630,7 +1670,7 @@ static void test_io_indirect_write(void)
         if (v1 == 0xA5A5A5A5UL && v2 == 0x5A5A5A5AUL)
             out("  Result: I/O indirect write-back WORKS.\n");
         else
-            out("  Result: I/O indirect write-back FAILED.\n");
+            out("  Result: DP_WRITE_MASK not readable (FIFO-submitted on R500).\n");
 
         /* Cross-check: write via I/O, read via MMIO BAR */
         if (g_mmio) {
@@ -1649,7 +1689,10 @@ static void test_io_indirect_write(void)
             out("    Read via I/O      = 0x%08lX  %s\n",
                 io_val, (io_val == 0xDEADBEEFUL) ? "OK" : "MISMATCH");
 
-            if (io_val == 0xDEADBEEFUL && mmio_val != 0xDEADBEEFUL) {
+            if (io_val != 0xDEADBEEFUL && mmio_val != 0xDEADBEEFUL) {
+                out("    >> Neither path reads back — register is FIFO-submitted\n");
+                out("    >> (write-only). This is normal for R300+/R500.\n");
+            } else if (io_val == 0xDEADBEEFUL && mmio_val != 0xDEADBEEFUL) {
                 out("    >> I/O works but MMIO BAR doesn't — possible caching issue\n");
                 out("    >> or DPMI mapping not set as uncacheable.\n");
             }
@@ -1658,6 +1701,30 @@ static void test_io_indirect_write(void)
             outpd(base, R_DP_WRITE_MASK);
             outpd(base + 4, orig);
         }
+    }
+
+    /* Test DEFAULT_PITCH_OFFSET — a known readable register, via I/O */
+    {
+        unsigned long orig, v1;
+
+        out("\n  DEFAULT_PITCH_OFFSET (I/O, readable register):\n");
+        outpd(base, R_DEFAULT_PITCH_OFFSET);
+        orig = inpd(base + 4);
+        out("    Current = 0x%08lX\n", orig);
+
+        outpd(base, R_DEFAULT_PITCH_OFFSET);
+        outpd(base + 4, 0x00A50000UL);
+        outpd(base, R_DEFAULT_PITCH_OFFSET);
+        v1 = inpd(base + 4);
+        out("    Write 0x00A50000, read = 0x%08lX  %s\n",
+            v1, (v1 == 0x00A50000UL) ? "OK" : "MISMATCH");
+
+        /* Restore */
+        outpd(base, R_DEFAULT_PITCH_OFFSET);
+        outpd(base + 4, orig);
+
+        if (v1 == 0x00A50000UL)
+            out("    Result: I/O indirect write-back confirmed WORKING.\n");
     }
 
     /* Test DST_PITCH_OFFSET via I/O */
@@ -1916,23 +1983,24 @@ static void test_write_ranges(void)
         const char *name;
         unsigned long test_val;
         int restore_zero;  /* 1 = restore to 0, 0 = restore original */
+        int is_fifo;       /* 1 = FIFO-submitted (write-only on R500) */
     } WRTest;
 
     static const WRTest tests[] = {
-        { 0x0070, "MC_IND_INDEX",      0x007F0001UL, 1 },
-        { 0x0008, "CLOCK_CNTL_INDEX",  0x0000001FUL, 1 },
-        { 0x00F0, "RBBM_SOFT_RESET",   0x00000000UL, 1 },  /* read-only test */
-        { 0x0E44, "RBBM_CNTL",         0x0000444FUL, 0 },
-        { 0x0B00, "SURFACE_CNTL",      0x00000100UL, 0 },
-        { 0x1404, "DST_OFFSET",        0x12345678UL, 1 },
-        { 0x1408, "DST_PITCH",         0x00002000UL, 0 },
-        { 0x142C, "DST_PITCH_OFFSET",  0x00D00000UL, 1 },
-        { 0x146C, "DP_GUI_MASTER_CNTL",0x10000000UL, 1 },
-        { 0x16C0, "DP_CNTL",           0x00000003UL, 0 },
-        { 0x16CC, "DP_WRITE_MASK",     0xFFFFFFFFUL, 1 },
-        { 0x16E0, "DEFAULT_PITCH_OFS", 0x00D00000UL, 1 },
-        { 0x1720, "WAIT_UNTIL",        0x00000000UL, 0 },
-        { 0x172C, "RBBM_GUICNTL",      0x00000000UL, 0 },
+        { 0x0070, "MC_IND_INDEX",      0x007F0001UL, 1, 0 },
+        { 0x0008, "CLOCK_CNTL_INDEX",  0x0000001FUL, 1, 0 },
+        { 0x00F0, "RBBM_SOFT_RESET",   0x00000000UL, 1, 0 },
+        { 0x0E44, "RBBM_CNTL",         0x0000444FUL, 0, 0 },
+        { 0x0B00, "SURFACE_CNTL",      0x00000100UL, 0, 0 },
+        { 0x1404, "DST_OFFSET",        0x12345678UL, 1, 0 },
+        { 0x1408, "DST_PITCH",         0x00002000UL, 0, 0 },
+        { 0x142C, "DST_PITCH_OFFSET",  0x00D00000UL, 1, 1 },
+        { 0x146C, "DP_GUI_MASTER_CNTL",0x10000000UL, 1, 1 },
+        { 0x16C0, "DP_CNTL",           0x00000003UL, 0, 0 },
+        { 0x16CC, "DP_WRITE_MASK",     0xFFFFFFFFUL, 1, 1 },
+        { 0x16E0, "DEFAULT_PITCH_OFS", 0x00D00000UL, 1, 0 },
+        { 0x1720, "WAIT_UNTIL",        0x00000000UL, 0, 0 },
+        { 0x172C, "RBBM_GUICNTL",      0x00000000UL, 0, 0 },
     };
     int i, n = sizeof(tests) / sizeof(tests[0]);
 
@@ -1965,6 +2033,8 @@ static void test_write_ranges(void)
 
         if (rb == tests[i].test_val)
             status = "OK";
+        else if (tests[i].is_fifo && (rb == 0 || rb == orig))
+            status = "OK (FIFO w/o)";
         else if (rb == orig)
             status = "NO CHANGE";
         else
@@ -1980,9 +2050,9 @@ static void test_write_ranges(void)
             wreg_at(g_mmio, tests[i].off, orig);
     }
 
-    /* Summary: count how many worked below vs above 0x4000 */
+    /* Summary: count results, accounting for FIFO-submitted regs */
     {
-        int low_ok = 0, low_total = 0, high_ok = 0, high_total = 0;
+        int ok = 0, fifo_ok = 0, fail = 0, partial = 0;
         for (i = 0; i < n; i++) {
             unsigned long rb;
             wreg_at(g_mmio, tests[i].off, tests[i].test_val);
@@ -1990,21 +2060,23 @@ static void test_write_ranges(void)
             if (tests[i].restore_zero)
                 wreg_at(g_mmio, tests[i].off, 0);
 
-            if (tests[i].off < 0x4000) {
-                low_total++;
-                if (rb == tests[i].test_val) low_ok++;
-            } else {
-                high_total++;
-                if (rb == tests[i].test_val) high_ok++;
-            }
+            if (rb == tests[i].test_val)
+                ok++;
+            else if (tests[i].is_fifo && (rb == 0))
+                fifo_ok++;
+            else if (rb == 0)
+                fail++;
+            else
+                partial++;
         }
-        out("\n  Summary: offsets < 0x4000: %d/%d writable, "
-            ">= 0x4000: %d/%d writable\n",
-            low_ok, low_total, high_ok, high_total);
+        out("\n  Summary: %d OK, %d FIFO-submitted (write-only, normal), "
+            "%d partial, %d failed\n", ok, fifo_ok, partial, fail);
 
-        if (low_ok > 0 && high_ok == 0)
-            out("  >> Registers above 0x4000 not writable via direct access.\n"
-                "  >> May need MM_INDEX/MM_DATA or I/O indirect.\n");
+        if (fifo_ok > 0)
+            out("\n  NOTE: FIFO-submitted registers (DST_PITCH_OFFSET,\n"
+                "  DP_GUI_MASTER_CNTL, DP_WRITE_MASK) read back as 0 on\n"
+                "  R300+/R500. Writes go through RBBM FIFO to the engine.\n"
+                "  This is NORMAL — the 2D engine receives the commands.\n");
     }
 }
 
@@ -2147,11 +2219,25 @@ static void print_recommendations(void)
 
     if (rbbm_fifo >= 16 && mmio_seems_correct) {
         out("  MMIO mapping appears CORRECT.\n");
-        out("  If 2D engine still doesn't work, check:\n");
-        out("    - HDP_FB_LOCATION / fb_base value\n");
-        out("    - DST_PITCH_OFFSET encoding\n");
-        out("    - VGA render control state\n");
-        out("    - Engine initialization sequence\n");
+        out("  RBBM_STATUS FIFO=%lu (healthy).\n\n", rbbm_fifo);
+    }
+
+    /* Check FIFO-submitted register behavior */
+    {
+        unsigned long dpo_orig, dpo_rb;
+        dpo_orig = rreg_at(g_mmio, R_DP_WRITE_MASK);
+        wreg_at(g_mmio, R_DP_WRITE_MASK, 0xFFFFFFFFUL);
+        dpo_rb = rreg_at(g_mmio, R_DP_WRITE_MASK);
+        wreg_at(g_mmio, R_DP_WRITE_MASK, dpo_orig);
+
+        if (dpo_rb == 0 || dpo_rb == dpo_orig) {
+            out("  FIFO-submitted registers (DST_PITCH_OFFSET,\n");
+            out("  DP_GUI_MASTER_CNTL, DP_WRITE_MASK) don't support\n");
+            out("  readback on this chip — this is NORMAL for R300+/R500.\n");
+            out("  Writes reach the engine via RBBM FIFO; verification\n");
+            out("  must use a GPU fill + VRAM readback test, not register\n");
+            out("  readback.\n");
+        }
     }
 
     out("\n  Summary of BAR usage for RADEON.C:\n");
