@@ -798,12 +798,29 @@ static void djgpp_enable_sse(void)
 }
 
 /*
- * Expand CS limit to 4 GB by directly patching the GDT at ring 0.
+ * Extract the 32-bit base address from an 8-byte descriptor entry.
+ * GDT/LDT descriptor layout: base is split across bytes 2-4 and 7.
+ */
+static unsigned long desc_base(const unsigned char *d)
+{
+    return (unsigned long)d[2]
+         | ((unsigned long)d[3] << 8)
+         | ((unsigned long)d[4] << 16)
+         | ((unsigned long)d[7] << 24);
+}
+
+/*
+ * Expand CS limit to 4 GB by directly patching the descriptor table
+ * (GDT or LDT) at ring 0.
  *
  * __djgpp_nearptr_enable() expands DS/ES/SS to 4 GB but leaves CS at the
- * program size.  CWSDPR0 rejects DPMI function 0008h (Set Segment Limit)
- * for the code segment, so we modify the GDT entry directly and reload
+ * program size.  DPMI servers (CWSDPR0, PMODE/DJ) reject function 0008h
+ * for the code segment, so we modify the descriptor directly and reload
  * CS via a far return (LRET).
+ *
+ * DPMI servers allocate client selectors in the LDT (bit 2 of selector =
+ * Table Indicator: 0 = GDT, 1 = LDT).  We detect which table the CS
+ * selector lives in, locate the table base via SGDT/SLDT, and patch.
  *
  * Required: ring 0, nearptr already enabled (DS limit = 4 GB).
  */
@@ -811,22 +828,48 @@ static int expand_cs_to_4gb(void)
 {
     unsigned char gdt_buf[8];
     unsigned long gdt_base;
-    unsigned short gdt_limit_val;
     unsigned short cs = _get_cs();
-    unsigned int idx = cs >> 3;
+    unsigned int idx = cs >> 3;       /* descriptor index */
+    int use_ldt = (cs & 4) != 0;     /* TI bit: 0=GDT, 1=LDT */
+    unsigned char *table_ptr;         /* nearptr to descriptor table */
     unsigned char *entry;
 
-    if ((cs & 3) != 0) return 0;  /* ring 0 only */
+    if ((cs & 3) != 0) return 0;     /* ring 0 only */
 
+    /* We always need the GDT (for direct GDT access or to find the LDT) */
     __asm__ __volatile__ ("sgdt %0" : "=m"(gdt_buf));
-    gdt_limit_val = *(unsigned short *)&gdt_buf[0];
-    gdt_base      = *(unsigned long  *)&gdt_buf[2];
+    gdt_base = *(unsigned long *)&gdt_buf[2];
 
-    if ((idx + 1) * 8 > (unsigned long)(gdt_limit_val + 1)) return 0;
+    if (use_ldt) {
+        /* CS is in the LDT.  Find LDT base from its GDT descriptor. */
+        unsigned short ldt_sel;
+        unsigned int ldt_idx;
+        unsigned char *ldt_gdt_entry;
+        unsigned long ldt_base;
 
-    /* Access GDT through DS nearptr (DS base = __djgpp_base_address) */
-    entry = (unsigned char *)(gdt_base + __djgpp_conventional_base)
-          + idx * 8;
+        __asm__ __volatile__ ("sldt %0" : "=r"(ldt_sel));
+        ldt_idx = ldt_sel >> 3;
+
+        /* LDT descriptor lives in the GDT */
+        ldt_gdt_entry = (unsigned char *)
+            ((long)gdt_base + __djgpp_conventional_base) + ldt_idx * 8;
+        ldt_base = desc_base(ldt_gdt_entry);
+
+        table_ptr = (unsigned char *)
+            ((long)ldt_base + __djgpp_conventional_base);
+
+        printf("  CS=0x%04X (LDT idx=%u), LDT sel=0x%04X base=0x%08lX\n",
+               cs, idx, ldt_sel, ldt_base);
+    } else {
+        /* CS is in the GDT */
+        table_ptr = (unsigned char *)
+            ((long)gdt_base + __djgpp_conventional_base);
+
+        printf("  CS=0x%04X (GDT idx=%u), GDT base=0x%08lX\n",
+               cs, idx, gdt_base);
+    }
+
+    entry = table_ptr + idx * 8;
 
     /* Set limit to 0xFFFFF with G=1 (page granularity) → 4 GB */
     entry[0] = 0xFF;                        /* limit[0:7]   */
@@ -834,7 +877,7 @@ static int expand_cs_to_4gb(void)
     entry[6] = (entry[6] & 0xF0) | 0x0F;   /* limit[16:19] */
     entry[6] |= 0x80;                       /* G = 1        */
 
-    /* Reload CS via far return to activate the new descriptor */
+    /* Reload CS descriptor cache via far return */
     __asm__ __volatile__ (
         "pushl %0\n\t"
         "pushl $1f\n\t"
@@ -843,6 +886,7 @@ static int expand_cs_to_4gb(void)
         :: "ri"((unsigned long)cs)
         : "memory"
     );
+
     return 1;
 }
 
