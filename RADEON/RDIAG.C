@@ -163,6 +163,30 @@ typedef struct {
 #define RV515_MC_MISC_LAT_TIMER    0x0009
 #define RV515_MC_MISC_UMA_CNTL     0x000C
 
+/* MM_INDEX/MM_DATA indirect MMIO access */
+#define R_MM_INDEX                 0x0000
+#define R_MM_DATA                  0x0004
+
+/* RBBM engine control */
+#define R_RBBM_CNTL               0x0E44
+
+/* Soft reset bits (for engine reset tests) */
+#define SOFT_RESET_CP              (1UL << 0)
+#define SOFT_RESET_HI              (1UL << 1)
+#define SOFT_RESET_SE              (1UL << 2)
+#define SOFT_RESET_RE              (1UL << 3)
+#define SOFT_RESET_PP              (1UL << 4)
+#define SOFT_RESET_E2              (1UL << 5)
+#define SOFT_RESET_RB             (1UL << 6)
+
+/* Host path control HDP bits (for engine reset tests) */
+#define HDP_SOFT_RESET             (1UL << 26)
+#define HDP_APER_CNTL              (1UL << 23)
+
+/* D1/D2 VGA control registers (AVIVO display) */
+#define R_D1VGA_CONTROL            0x0330
+#define R_D2VGA_CONTROL            0x0338
+
 /* ATI vendor ID */
 #define ATI_VID  0x1002
 
@@ -1545,7 +1569,539 @@ static void dump_environment(void)
 }
 
 /* =============================================================== */
-/*  SECTION 14: Recommendations                                     */
+/*  SECTION 14: I/O Port Indirect Register Write Test               */
+/*  Tests writing GPU registers via I/O BAR MM_INDEX/MM_DATA,       */
+/*  bypassing the MMIO BAR memory mapping entirely.                 */
+/* =============================================================== */
+
+static void test_io_indirect_write(void)
+{
+    int io_bar = -1;
+    int i;
+    unsigned short base;
+
+    out("\n========================================\n");
+    out("  SECTION 14: I/O Indirect Write Test\n");
+    out("========================================\n\n");
+
+    /* Find I/O BAR */
+    for (i = 0; i < 6; i++) {
+        if (g_bars[i].is_io && g_bars[i].size > 0) {
+            io_bar = i;
+            break;
+        }
+    }
+    if (io_bar < 0) {
+        out("  No I/O BAR found — cannot test I/O indirect access.\n");
+        return;
+    }
+
+    base = (unsigned short)(g_bars[io_bar].phys & 0xFFFF);
+    out("  I/O BAR%d at port 0x%04X\n", io_bar, base);
+    out("  Using MM_INDEX(port+0) / MM_DATA(port+4) for indirect access.\n\n");
+
+    /* Read current DP_WRITE_MASK via I/O indirect */
+    {
+        unsigned long orig, v1, v2;
+
+        outpd(base, R_DP_WRITE_MASK);
+        orig = inpd(base + 4);
+        out("  DP_WRITE_MASK (I/O read)    = 0x%08lX\n", orig);
+
+        /* Write via I/O indirect, read back via I/O indirect */
+        outpd(base, R_DP_WRITE_MASK);
+        outpd(base + 4, 0xA5A5A5A5UL);
+        outpd(base, R_DP_WRITE_MASK);
+        v1 = inpd(base + 4);
+        out("  Write 0xA5A5A5A5 via I/O, read = 0x%08lX  %s\n",
+            v1, (v1 == 0xA5A5A5A5UL) ? "OK" : "MISMATCH");
+
+        outpd(base, R_DP_WRITE_MASK);
+        outpd(base + 4, 0x5A5A5A5AUL);
+        outpd(base, R_DP_WRITE_MASK);
+        v2 = inpd(base + 4);
+        out("  Write 0x5A5A5A5A via I/O, read = 0x%08lX  %s\n",
+            v2, (v2 == 0x5A5A5A5AUL) ? "OK" : "MISMATCH");
+
+        /* Restore */
+        outpd(base, R_DP_WRITE_MASK);
+        outpd(base + 4, orig);
+
+        if (v1 == 0xA5A5A5A5UL && v2 == 0x5A5A5A5AUL)
+            out("  Result: I/O indirect write-back WORKS.\n");
+        else
+            out("  Result: I/O indirect write-back FAILED.\n");
+
+        /* Cross-check: write via I/O, read via MMIO BAR */
+        if (g_mmio) {
+            unsigned long io_val, mmio_val;
+            out("\n  Cross-check: write via I/O, read via MMIO BAR:\n");
+
+            outpd(base, R_DP_WRITE_MASK);
+            outpd(base + 4, 0xDEADBEEFUL);
+            mmio_val = rreg_at(g_mmio, R_DP_WRITE_MASK);
+            outpd(base, R_DP_WRITE_MASK);
+            io_val = inpd(base + 4);
+
+            out("    Write 0xDEADBEEF via I/O\n");
+            out("    Read via MMIO BAR = 0x%08lX  %s\n",
+                mmio_val, (mmio_val == 0xDEADBEEFUL) ? "OK" : "MISMATCH");
+            out("    Read via I/O      = 0x%08lX  %s\n",
+                io_val, (io_val == 0xDEADBEEFUL) ? "OK" : "MISMATCH");
+
+            if (io_val == 0xDEADBEEFUL && mmio_val != 0xDEADBEEFUL) {
+                out("    >> I/O works but MMIO BAR doesn't — possible caching issue\n");
+                out("    >> or DPMI mapping not set as uncacheable.\n");
+            }
+
+            /* Restore */
+            outpd(base, R_DP_WRITE_MASK);
+            outpd(base + 4, orig);
+        }
+    }
+
+    /* Test DST_PITCH_OFFSET via I/O */
+    {
+        unsigned long orig, v1;
+
+        out("\n  DST_PITCH_OFFSET (I/O indirect):\n");
+        outpd(base, R_DST_PITCH_OFFSET);
+        orig = inpd(base + 4);
+        out("    Current = 0x%08lX\n", orig);
+
+        outpd(base, R_DST_PITCH_OFFSET);
+        outpd(base + 4, 0x00D00000UL);
+        outpd(base, R_DST_PITCH_OFFSET);
+        v1 = inpd(base + 4);
+        out("    Write 0x00D00000, read = 0x%08lX  %s\n",
+            v1, (v1 == 0x00D00000UL) ? "OK" : "MISMATCH");
+
+        /* Restore */
+        outpd(base, R_DST_PITCH_OFFSET);
+        outpd(base + 4, orig);
+    }
+
+    /* Test RBBM_SOFT_RESET (low-offset, known writable) via I/O */
+    {
+        unsigned long orig, v1;
+
+        out("\n  RBBM_SOFT_RESET (low offset 0x%04X, I/O):\n", R_RBBM_SOFT_RESET);
+        outpd(base, R_RBBM_SOFT_RESET);
+        orig = inpd(base + 4);
+        out("    Current = 0x%08lX\n", orig);
+
+        outpd(base, R_RBBM_SOFT_RESET);
+        outpd(base + 4, 0x00000001UL);
+        outpd(base, R_RBBM_SOFT_RESET);
+        v1 = inpd(base + 4);
+        out("    Write 0x00000001, read = 0x%08lX  %s\n",
+            v1, (v1 & 0x01) ? "OK (bit latched)" : "BIT NOT SET");
+
+        /* Clear reset immediately */
+        outpd(base, R_RBBM_SOFT_RESET);
+        outpd(base + 4, 0);
+        outpd(base, R_RBBM_SOFT_RESET);
+        v1 = inpd(base + 4);
+        out("    Write 0x00000000, read = 0x%08lX\n", v1);
+    }
+}
+
+/* =============================================================== */
+/*  SECTION 15: MM_INDEX/MM_DATA Indirect Write Test                */
+/*  Tests MMIO offset 0x0000/0x0004 indirect mechanism which can    */
+/*  reach all registers regardless of BAR direct-decode range.      */
+/* =============================================================== */
+
+static void test_mmindex_indirect_write(void)
+{
+    out("\n========================================\n");
+    out("  SECTION 15: MM_INDEX/MM_DATA Write Test\n");
+    out("========================================\n\n");
+
+    if (!g_mmio) {
+        out("  MMIO not available.\n");
+        return;
+    }
+
+    out("  Using MMIO offsets 0x0000 (MM_INDEX) / 0x0004 (MM_DATA)\n");
+    out("  to access registers indirectly through the MMIO BAR.\n\n");
+
+    /* Test: write DP_WRITE_MASK via MM_INDEX/MM_DATA */
+    {
+        unsigned long orig_direct, orig_indirect, v1, v2;
+
+        /* Read directly and indirectly for comparison */
+        orig_direct = rreg_at(g_mmio, R_DP_WRITE_MASK);
+
+        wreg_at(g_mmio, R_MM_INDEX, R_DP_WRITE_MASK);
+        orig_indirect = rreg_at(g_mmio, R_MM_DATA);
+
+        out("  DP_WRITE_MASK direct read   = 0x%08lX\n", orig_direct);
+        out("  DP_WRITE_MASK indirect read = 0x%08lX  %s\n",
+            orig_indirect,
+            (orig_direct == orig_indirect) ? "(match)" : "(DIFFER!)");
+
+        /* Write via indirect, read both ways */
+        wreg_at(g_mmio, R_MM_INDEX, R_DP_WRITE_MASK);
+        wreg_at(g_mmio, R_MM_DATA, 0xA5A5A5A5UL);
+
+        wreg_at(g_mmio, R_MM_INDEX, R_DP_WRITE_MASK);
+        v1 = rreg_at(g_mmio, R_MM_DATA);
+        v2 = rreg_at(g_mmio, R_DP_WRITE_MASK);
+
+        out("\n  Write 0xA5A5A5A5 via MM_INDEX/MM_DATA:\n");
+        out("    Read back (indirect) = 0x%08lX  %s\n",
+            v1, (v1 == 0xA5A5A5A5UL) ? "OK" : "MISMATCH");
+        out("    Read back (direct)   = 0x%08lX  %s\n",
+            v2, (v2 == 0xA5A5A5A5UL) ? "OK" : "MISMATCH");
+
+        if (v1 == 0xA5A5A5A5UL && v2 != 0xA5A5A5A5UL)
+            out("    >> Indirect works, direct doesn't — register is beyond\n"
+                "    >> direct-decode range, use MM_INDEX/MM_DATA.\n");
+        else if (v1 != 0xA5A5A5A5UL && v2 != 0xA5A5A5A5UL)
+            out("    >> Neither path works — register may be clock-gated.\n");
+
+        /* Restore */
+        wreg_at(g_mmio, R_MM_INDEX, R_DP_WRITE_MASK);
+        wreg_at(g_mmio, R_MM_DATA, orig_direct);
+    }
+
+    /* Test with DST_PITCH_OFFSET */
+    {
+        unsigned long v1;
+
+        wreg_at(g_mmio, R_MM_INDEX, R_DST_PITCH_OFFSET);
+        wreg_at(g_mmio, R_MM_DATA, 0x00D00000UL);
+        wreg_at(g_mmio, R_MM_INDEX, R_DST_PITCH_OFFSET);
+        v1 = rreg_at(g_mmio, R_MM_DATA);
+
+        out("\n  DST_PITCH_OFFSET via MM_INDEX:\n");
+        out("    Write 0x00D00000, read = 0x%08lX  %s\n",
+            v1, (v1 == 0x00D00000UL) ? "OK" : "MISMATCH");
+
+        /* Restore to 0 */
+        wreg_at(g_mmio, R_MM_INDEX, R_DST_PITCH_OFFSET);
+        wreg_at(g_mmio, R_MM_DATA, 0);
+    }
+
+    /* Test with low-offset register (MC_IND_INDEX) that we know works */
+    {
+        unsigned long orig, v1;
+
+        orig = rreg_at(g_mmio, R_MC_IND_INDEX);
+        wreg_at(g_mmio, R_MM_INDEX, R_MC_IND_INDEX);
+        wreg_at(g_mmio, R_MM_DATA, 0x007F0001UL);
+        wreg_at(g_mmio, R_MM_INDEX, R_MC_IND_INDEX);
+        v1 = rreg_at(g_mmio, R_MM_DATA);
+
+        out("\n  MC_IND_INDEX (low offset 0x%04X) via MM_INDEX:\n",
+            R_MC_IND_INDEX);
+        out("    Write 0x007F0001, read = 0x%08lX  %s\n",
+            v1, (v1 == 0x007F0001UL) ? "OK" : "MISMATCH");
+
+        /* Restore */
+        wreg_at(g_mmio, R_MC_IND_INDEX, orig);
+    }
+}
+
+/* =============================================================== */
+/*  SECTION 16: Engine Reset + Write Test                           */
+/*  Attempts a soft reset of the 2D engine, then tests if           */
+/*  registers become writable.                                      */
+/* =============================================================== */
+
+static void test_reset_then_write(void)
+{
+    unsigned long rbbm_before, rbbm_after;
+    unsigned long orig_dp_wm;
+    unsigned long host_path;
+
+    out("\n========================================\n");
+    out("  SECTION 16: Engine Reset + Write Test\n");
+    out("========================================\n\n");
+
+    if (!g_mmio) {
+        out("  MMIO not available.\n");
+        return;
+    }
+
+    rbbm_before = rreg_at(g_mmio, R_RBBM_STATUS);
+    out("  Pre-reset RBBM_STATUS  = 0x%08lX (FIFO=%lu, %s)\n",
+        rbbm_before, rbbm_before & RBBM_FIFOCNT_MASK,
+        (rbbm_before & RBBM_ACTIVE) ? "BUSY" : "idle");
+
+    orig_dp_wm = rreg_at(g_mmio, R_DP_WRITE_MASK);
+    out("  Pre-reset DP_WRITE_MASK = 0x%08lX\n\n", orig_dp_wm);
+
+    /* Step 1: Soft reset CP + HI + E2 (R300+/R500 safe reset) */
+    out("  Step 1: Soft reset (CP|HI|E2)...\n");
+    wreg_at(g_mmio, R_RBBM_SOFT_RESET,
+            SOFT_RESET_CP | SOFT_RESET_HI | SOFT_RESET_E2);
+    (void)rreg_at(g_mmio, R_RBBM_SOFT_RESET);
+    wreg_at(g_mmio, R_RBBM_SOFT_RESET, 0);
+    (void)rreg_at(g_mmio, R_RBBM_SOFT_RESET);
+
+    rbbm_after = rreg_at(g_mmio, R_RBBM_STATUS);
+    out("    Post-reset RBBM_STATUS = 0x%08lX (FIFO=%lu)\n",
+        rbbm_after, rbbm_after & RBBM_FIFOCNT_MASK);
+
+    /* Step 2: HDP reset via HOST_PATH_CNTL toggle */
+    out("  Step 2: HDP reset via HOST_PATH_CNTL...\n");
+    host_path = rreg_at(g_mmio, R_HOST_PATH_CNTL);
+    wreg_at(g_mmio, R_HOST_PATH_CNTL, host_path | HDP_SOFT_RESET | HDP_APER_CNTL);
+    (void)rreg_at(g_mmio, R_HOST_PATH_CNTL);
+    wreg_at(g_mmio, R_HOST_PATH_CNTL, host_path | HDP_APER_CNTL);
+    (void)rreg_at(g_mmio, R_HOST_PATH_CNTL);
+    out("    Done.\n");
+
+    /* Step 3: Enable 2D cache autoflush */
+    out("  Step 3: Enable 2D dst-cache autoflush...\n");
+    wreg_at(g_mmio, R_RB3D_DSTCACHE_MODE,
+            rreg_at(g_mmio, R_RB3D_DSTCACHE_MODE) | (1UL << 17));
+    wreg_at(g_mmio, R_RB2D_DSTCACHE_MODE,
+            rreg_at(g_mmio, R_RB2D_DSTCACHE_MODE) | (1UL << 2) | (1UL << 15));
+    out("    Done.\n");
+
+    /* Step 4: Test DP_WRITE_MASK again */
+    out("\n  Step 4: Test DP_WRITE_MASK write after reset:\n");
+    {
+        unsigned long v1, v2;
+
+        wreg_at(g_mmio, R_DP_WRITE_MASK, 0xA5A5A5A5UL);
+        v1 = rreg_at(g_mmio, R_DP_WRITE_MASK);
+        out("    Write 0xA5A5A5A5, read = 0x%08lX  %s\n",
+            v1, (v1 == 0xA5A5A5A5UL) ? "OK" : "MISMATCH");
+
+        wreg_at(g_mmio, R_DP_WRITE_MASK, 0x5A5A5A5AUL);
+        v2 = rreg_at(g_mmio, R_DP_WRITE_MASK);
+        out("    Write 0x5A5A5A5A, read = 0x%08lX  %s\n",
+            v2, (v2 == 0x5A5A5A5AUL) ? "OK" : "MISMATCH");
+
+        if (v1 == 0xA5A5A5A5UL && v2 == 0x5A5A5A5AUL)
+            out("    Result: Engine registers WRITABLE after reset!\n");
+        else if (v1 != orig_dp_wm || v2 != orig_dp_wm)
+            out("    Result: Partial change — engine partially responding.\n");
+        else
+            out("    Result: Still not writable after reset.\n");
+
+        /* Restore */
+        wreg_at(g_mmio, R_DP_WRITE_MASK, orig_dp_wm);
+    }
+
+    /* Step 5: Test DST_PITCH_OFFSET after reset */
+    out("\n  Step 5: Test DST_PITCH_OFFSET write after reset:\n");
+    {
+        unsigned long v1;
+
+        wreg_at(g_mmio, R_DST_PITCH_OFFSET, 0x00D00000UL);
+        v1 = rreg_at(g_mmio, R_DST_PITCH_OFFSET);
+        out("    Write 0x00D00000, read = 0x%08lX  %s\n",
+            v1, (v1 == 0x00D00000UL) ? "OK" : "MISMATCH");
+
+        /* Restore */
+        wreg_at(g_mmio, R_DST_PITCH_OFFSET, 0);
+    }
+}
+
+/* =============================================================== */
+/*  SECTION 17: Register Writability Range Test                     */
+/*  Tests writes at various offsets to determine which ranges       */
+/*  respond to direct MMIO writes vs which need indirect access.    */
+/* =============================================================== */
+
+static void test_write_ranges(void)
+{
+    typedef struct {
+        unsigned long off;
+        const char *name;
+        unsigned long test_val;
+        int restore_zero;  /* 1 = restore to 0, 0 = restore original */
+    } WRTest;
+
+    static const WRTest tests[] = {
+        { 0x0070, "MC_IND_INDEX",      0x007F0001UL, 1 },
+        { 0x0008, "CLOCK_CNTL_INDEX",  0x0000001FUL, 1 },
+        { 0x00F0, "RBBM_SOFT_RESET",   0x00000000UL, 1 },  /* read-only test */
+        { 0x0E44, "RBBM_CNTL",         0x0000444FUL, 0 },
+        { 0x0B00, "SURFACE_CNTL",      0x00000100UL, 0 },
+        { 0x1404, "DST_OFFSET",        0x12345678UL, 1 },
+        { 0x1408, "DST_PITCH",         0x00002000UL, 0 },
+        { 0x142C, "DST_PITCH_OFFSET",  0x00D00000UL, 1 },
+        { 0x146C, "DP_GUI_MASTER_CNTL",0x10000000UL, 1 },
+        { 0x16C0, "DP_CNTL",           0x00000003UL, 0 },
+        { 0x16CC, "DP_WRITE_MASK",     0xFFFFFFFFUL, 1 },
+        { 0x16E0, "DEFAULT_PITCH_OFS", 0x00D00000UL, 1 },
+        { 0x1720, "WAIT_UNTIL",        0x00000000UL, 0 },
+        { 0x172C, "RBBM_GUICNTL",      0x00000000UL, 0 },
+    };
+    int i, n = sizeof(tests) / sizeof(tests[0]);
+
+    out("\n========================================\n");
+    out("  SECTION 17: Register Write Range Test\n");
+    out("========================================\n\n");
+
+    if (!g_mmio) {
+        out("  MMIO not available.\n");
+        return;
+    }
+
+    out("  Testing direct MMIO writes at various offset ranges.\n");
+    out("  Registers below 0x4000 are 'direct-decode', above may\n");
+    out("  need MM_INDEX/MM_DATA on some R300+/R500 chips.\n\n");
+
+    out("  %-8s %-20s %-12s %-12s %s\n",
+        "Offset", "Register", "Write", "ReadBack", "Status");
+    out("  %-8s %-20s %-12s %-12s %s\n",
+        "------", "--------", "-----", "--------", "------");
+
+    for (i = 0; i < n; i++) {
+        unsigned long orig, rb;
+        const char *status;
+
+        orig = rreg_at(g_mmio, tests[i].off);
+
+        wreg_at(g_mmio, tests[i].off, tests[i].test_val);
+        rb = rreg_at(g_mmio, tests[i].off);
+
+        if (rb == tests[i].test_val)
+            status = "OK";
+        else if (rb == orig)
+            status = "NO CHANGE";
+        else
+            status = "PARTIAL";
+
+        out("  0x%04lX  %-20s 0x%08lX   0x%08lX   %s\n",
+            tests[i].off, tests[i].name, tests[i].test_val, rb, status);
+
+        /* Restore */
+        if (tests[i].restore_zero)
+            wreg_at(g_mmio, tests[i].off, 0);
+        else
+            wreg_at(g_mmio, tests[i].off, orig);
+    }
+
+    /* Summary: count how many worked below vs above 0x4000 */
+    {
+        int low_ok = 0, low_total = 0, high_ok = 0, high_total = 0;
+        for (i = 0; i < n; i++) {
+            unsigned long rb;
+            wreg_at(g_mmio, tests[i].off, tests[i].test_val);
+            rb = rreg_at(g_mmio, tests[i].off);
+            if (tests[i].restore_zero)
+                wreg_at(g_mmio, tests[i].off, 0);
+
+            if (tests[i].off < 0x4000) {
+                low_total++;
+                if (rb == tests[i].test_val) low_ok++;
+            } else {
+                high_total++;
+                if (rb == tests[i].test_val) high_ok++;
+            }
+        }
+        out("\n  Summary: offsets < 0x4000: %d/%d writable, "
+            ">= 0x4000: %d/%d writable\n",
+            low_ok, low_total, high_ok, high_total);
+
+        if (low_ok > 0 && high_ok == 0)
+            out("  >> Registers above 0x4000 not writable via direct access.\n"
+                "  >> May need MM_INDEX/MM_DATA or I/O indirect.\n");
+    }
+}
+
+/* =============================================================== */
+/*  SECTION 18: Display Controller / VGA State Analysis             */
+/*  Dumps AVIVO display controller state that affects 2D engine.    */
+/* =============================================================== */
+
+static void analyze_display_state(void)
+{
+    out("\n========================================\n");
+    out("  SECTION 18: Display / VGA State\n");
+    out("========================================\n\n");
+
+    if (!g_mmio) {
+        out("  MMIO not available.\n");
+        return;
+    }
+
+    /* VGA render control */
+    {
+        unsigned long vga_rc = rreg_at(g_mmio, R_VGA_RENDER_CONTROL);
+        out("  VGA_RENDER_CONTROL = 0x%08lX\n", vga_rc);
+        out("    VGA rendering    : %s\n",
+            (vga_rc & 0x0F) ? "ENABLED (some planes on)" : "disabled");
+        out("    VGA vsync status : %s\n",
+            (vga_rc & (1UL << 24)) ? "controlled" : "free-running");
+    }
+
+    /* D1VGA / D2VGA control (AVIVO) */
+    {
+        unsigned long d1 = rreg_at(g_mmio, R_D1VGA_CONTROL);
+        unsigned long d2 = rreg_at(g_mmio, R_D2VGA_CONTROL);
+        out("\n  D1VGA_CONTROL = 0x%08lX\n", d1);
+        out("    D1 VGA enable    : %s\n",
+            (d1 & (1UL << 0)) ? "ENABLED" : "disabled");
+        out("    D1 timing select : %s\n",
+            (d1 & (1UL << 8)) ? "from D1CRTC" : "VGA timing");
+        out("    D1 sync polarity : %s\n",
+            (d1 & (1UL << 16)) ? "from D1CRTC" : "VGA default");
+
+        out("  D2VGA_CONTROL = 0x%08lX\n", d2);
+        out("    D2 VGA enable    : %s\n",
+            (d2 & (1UL << 0)) ? "ENABLED" : "disabled");
+
+        if ((d1 & 1) || (d2 & 1))
+            out("\n  NOTE: VGA mode active — 2D engine registers may be\n"
+                "  accessible but rendering may conflict with VGA output.\n"
+                "  RADEON.C disables VGA rendering before using 2D engine.\n");
+    }
+
+    /* RBBM control (engine block enables) */
+    {
+        unsigned long rbbm_cntl = rreg_at(g_mmio, R_RBBM_CNTL);
+        out("\n  RBBM_CNTL = 0x%08lX\n", rbbm_cntl);
+        out("    This controls engine block scheduling and FIFO.\n");
+        if (rbbm_cntl == 0)
+            out("    WARNING: value is 0 — engine blocks may not be\n"
+                "    properly configured.\n");
+    }
+
+    /* HDP / Surface state */
+    {
+        unsigned long hdp = rreg_at(g_mmio, 0x0134);  /* HDP_FB_LOCATION */
+        unsigned long surf = rreg_at(g_mmio, R_SURFACE_CNTL);
+        unsigned long host = rreg_at(g_mmio, R_HOST_PATH_CNTL);
+        out("\n  HDP_FB_LOCATION  = 0x%08lX  (FB base = 0x%08lX)\n",
+            hdp, (hdp & 0xFFFFUL) << 16);
+        out("  SURFACE_CNTL     = 0x%08lX\n", surf);
+        out("  HOST_PATH_CNTL   = 0x%08lX\n", host);
+        out("    HDP_APER_CNTL  : %s\n",
+            (host & HDP_APER_CNTL) ? "SET" : "clear");
+    }
+
+    /* 2D engine current state summary */
+    {
+        unsigned long dp_cntl  = rreg_at(g_mmio, R_DP_CNTL);
+        unsigned long dp_dtype = rreg_at(g_mmio, R_DP_DATATYPE);
+        unsigned long dp_mix   = rreg_at(g_mmio, R_DP_MIX);
+        unsigned long dp_wm    = rreg_at(g_mmio, R_DP_WRITE_MASK);
+        unsigned long dp_gmc   = rreg_at(g_mmio, R_DP_GUI_MASTER_CNTL);
+        unsigned long dpo      = rreg_at(g_mmio, R_DST_PITCH_OFFSET);
+        unsigned long def_po   = rreg_at(g_mmio, R_DEFAULT_PITCH_OFFSET);
+
+        out("\n  2D Engine Register State:\n");
+        out("    DP_CNTL            = 0x%08lX\n", dp_cntl);
+        out("    DP_DATATYPE        = 0x%08lX\n", dp_dtype);
+        out("    DP_MIX             = 0x%08lX\n", dp_mix);
+        out("    DP_WRITE_MASK      = 0x%08lX\n", dp_wm);
+        out("    DP_GUI_MASTER_CNTL = 0x%08lX\n", dp_gmc);
+        out("    DST_PITCH_OFFSET   = 0x%08lX\n", dpo);
+        out("    DEFAULT_PITCH_OFS  = 0x%08lX\n", def_po);
+    }
+}
+
+/* =============================================================== */
+/*  SECTION 19: Recommendations (updated)                           */
 /* =============================================================== */
 
 static void print_recommendations(void)
@@ -1555,7 +2111,7 @@ static void print_recommendations(void)
     int bar0_is_vram = 0;
 
     out("\n========================================\n");
-    out("  SECTION 14: Analysis & Recommendations\n");
+    out("  SECTION 19: Analysis & Recommendations\n");
     out("========================================\n\n");
 
     if (!g_mmio) {
@@ -1670,6 +2226,11 @@ int main(void)
     dump_vbe_info();
     test_io_ports();
     dump_environment();
+    test_io_indirect_write();
+    test_mmindex_indirect_write();
+    test_reset_then_write();
+    test_write_ranges();
+    analyze_display_state();
     print_recommendations();
 
     /* Cleanup all mapped BARs */

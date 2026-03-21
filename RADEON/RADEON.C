@@ -1587,7 +1587,7 @@ static void demo_parallax(void)
 
 int main(void)
 {
-    unsigned long bar0, bar1, pci_cmd;
+    unsigned long bar0, bar2, bar3, pci_cmd;
     unsigned long lfb_sz;
     unsigned long rbbm_val;
     int ch;
@@ -1619,37 +1619,47 @@ int main(void)
            pci_rd16(g_pci_bus,g_pci_dev,g_pci_func,0x2C),
            pci_rd16(g_pci_bus,g_pci_dev,g_pci_func,0x2E));
 
-    /* --- Map MMIO registers (BAR0 — may be 64-bit on PCIe) --- */
+    /* --- Map MMIO registers (BAR2 on RV515 PCIe) ---
+       RV515 PCIe BAR layout:
+         BAR0 (0x10): VRAM aperture (256MB, 64-bit, prefetchable)
+         BAR2 (0x18): MMIO registers (64KB, 64-bit, non-prefetchable)
+         BAR4 (0x20): I/O ports (256 bytes)
+       BAR0 is 64-bit and occupies PCI offsets 0x10+0x14,
+       so BAR2 starts at PCI offset 0x18. */
     bar0 = pci_rd32(g_pci_bus, g_pci_dev, g_pci_func, 0x10);
-    g_mmio_phys = bar0 & 0xFFFFFFF0UL;
+    bar2 = pci_rd32(g_pci_bus, g_pci_dev, g_pci_func, 0x18);
+    g_mmio_phys = bar2 & 0xFFFFFFF0UL;
 
-    /* Check if BAR0 is 64-bit (type field bits [2:1] == 10b) */
-    if ((bar0 & 0x06) == 0x04) {
-        bar1 = pci_rd32(g_pci_bus, g_pci_dev, g_pci_func, 0x14);
-        printf("  BAR0      : 64-bit, lower=0x%08lX upper=0x%08lX\n",
-               bar0, bar1);
-        if (bar1 != 0) {
+    printf("  BAR0 (VRAM): 0x%08lX %s\n", bar0,
+           (bar0 & 0x08) ? "(pref)" : "(non-pref)");
+
+    /* Check if BAR2 is 64-bit (type field bits [2:1] == 10b) */
+    if ((bar2 & 0x06) == 0x04) {
+        bar3 = pci_rd32(g_pci_bus, g_pci_dev, g_pci_func, 0x1C);
+        printf("  BAR2 (MMIO): 64-bit, lower=0x%08lX upper=0x%08lX\n",
+               bar2, bar3);
+        if (bar3 != 0) {
             printf("ERROR: MMIO mapped above 4GB (0x%08lX%08lX).\n",
-                   bar1, g_mmio_phys);
+                   bar3, g_mmio_phys);
             printf("Cannot access from 32-bit DOS extender.\n");
             dpmi_free();
             return 1;
         }
     } else {
-        printf("  BAR0      : 32-bit = 0x%08lX\n", bar0);
+        printf("  BAR2 (MMIO): 32-bit = 0x%08lX\n", bar2);
     }
 
     printf("  MMIO phys : 0x%08lX %s\n", g_mmio_phys,
-           (bar0 & 0x08) ? "(prefetchable)" : "(non-prefetchable)");
+           (bar2 & 0x08) ? "(prefetchable)" : "(non-prefetchable)");
 
-    /* Map 128KB of MMIO (RV515 register space) */
-    g_mmio = (volatile unsigned long *)dpmi_map(g_mmio_phys, 0x20000);
+    /* Map 64KB of MMIO (RV515 BAR2 register space) */
+    g_mmio = (volatile unsigned long *)dpmi_map(g_mmio_phys, 0x10000);
     if (!g_mmio) {
         printf("ERROR: Cannot map MMIO registers.\n");
         dpmi_free();
         return 1;
     }
-    printf("  MMIO lin  : 0x%08lX (mapped 128KB)\n",
+    printf("  MMIO lin  : 0x%08lX (mapped 64KB)\n",
            (unsigned long)g_mmio);
 
     /* Ensure PCI bus-master + memory access are enabled */
@@ -1672,7 +1682,7 @@ int main(void)
     if (g_vram_mb == 0 || g_vram_mb > 1024) {
         printf("WARNING: VRAM size %lu MB looks wrong.\n", g_vram_mb);
         printf("  CONFIG_MEMSIZE=0x%08lX\n", rreg(R_CONFIG_MEMSIZE));
-        printf("  BAR0 may not be MMIO. Check lspci output.\n");
+        printf("  BAR2 may not be MMIO. Run RDIAG for analysis.\n");
     }
 
     /* Print all BARs for diagnostics */
