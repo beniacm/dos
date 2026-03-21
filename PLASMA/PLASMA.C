@@ -1295,7 +1295,7 @@ static void init_dac(void)
     dpmi_real_int(0x10, &rmi);
 
     memset(&rmi, 0, sizeof(rmi));
-    rmi.eax = 0x4F08;  rmi.ebx = 0x0100;   /* query actual */
+    rmi.eax = 0x4F08;  rmi.ebx = 0x0001;   /* BL=01h: query actual width */
     if (dpmi_real_int(0x10, &rmi) && (rmi.eax & 0xFFFF) == 0x004F)
         got = (int)((rmi.ebx >> 8) & 0xFF);
     else
