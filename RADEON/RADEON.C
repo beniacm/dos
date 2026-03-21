@@ -170,6 +170,14 @@ typedef struct {
 #define   CLR_CMP_FCN_NE          5UL           /* draw when src != key */
 #define   CLR_CMP_SRC_SOURCE      (1UL << 24)   /* compare source pixels */
 
+/* AVIVO display controller registers (R500/RV515)
+   Used for tear-free hardware page flipping via surface update lock. */
+#define R_D1GRPH_PRIMARY_SURFACE_ADDRESS   0x6110
+#define R_D1GRPH_SECONDARY_SURFACE_ADDRESS 0x6118
+#define R_D1GRPH_UPDATE                    0x6144
+#define   D1GRPH_SURFACE_UPDATE_PENDING    (1UL << 2)
+#define   D1GRPH_SURFACE_UPDATE_LOCK       (1UL << 16)
+
 /* ---------------------------------------------------------------
  *  Additional registers from Linux kernel radeon driver (rv515d.h,
  *  radeon_reg.h, r300_reg.h) needed for proper RV515 initialization.
@@ -271,6 +279,7 @@ static unsigned long  g_fb_location = 0;   /* GPU internal FB base address */
 static int g_xres, g_yres, g_pitch;
 static unsigned short g_vmode;
 static unsigned char *g_font = NULL;
+static int g_fifo_free = 0;  /* tracked free FIFO entries (avoids MMIO reads) */
 
 static int  g_pci_bus, g_pci_dev, g_pci_func;
 static unsigned short g_pci_did;
@@ -622,13 +631,23 @@ static int gpu_mc_wait_idle(void)
     return 0;
 }
 
-/* Wait for at least `n` free FIFO entries */
+/* Wait for at least `n` free FIFO entries.
+   Uses a local counter to avoid MMIO reads when enough space is known. */
 static void gpu_wait_fifo(int n)
 {
-    unsigned long timeout = 2000000UL;
+    unsigned long timeout;
+    int avail;
+    if (g_fifo_free >= n) {
+        g_fifo_free -= n;
+        return;
+    }
+    timeout = 2000000UL;
     while (timeout--) {
-        if ((int)(rreg(R_RBBM_STATUS) & RBBM_FIFOCNT_MASK) >= n)
+        avail = (int)(rreg(R_RBBM_STATUS) & RBBM_FIFOCNT_MASK);
+        if (avail >= n) {
+            g_fifo_free = avail - n;
             return;
+        }
     }
 }
 
@@ -653,6 +672,7 @@ static void gpu_wait_idle(void)
             break;
     }
     gpu_engine_flush();
+    g_fifo_free = 64;   /* engine idle → FIFO fully drained */
 }
 
 /* =============================================================== */
@@ -874,16 +894,43 @@ static void gpu_init_2d(void)
 }
 
 /* =============================================================== */
-/*  VGA vertical retrace wait                                       */
+/*  AVIVO hardware page flip (tear-free, non-blocking)              */
+/*                                                                  */
+/*  Uses D1GRPH_UPDATE_LOCK so hardware applies the new surface     */
+/*  address atomically at the next vsync boundary.                  */
+/*  Adapted from PLASMA.C -hwflip mechanism.                        */
 /* =============================================================== */
 
-/* Wait for vertical blanking interval using VGA Input Status Register 1.
-   More reliable than VBE 4F07h BX=0x0080 on ATOMBIOS-based cards. */
+/* Tear-free page flip: lock → write surface address → unlock.
+   The hardware latches the new address and applies at next vsync. */
+static void hw_page_flip(unsigned long surface_addr)
+{
+    unsigned long lock;
+
+    /* Lock surface updates */
+    lock = rreg(R_D1GRPH_UPDATE);
+    wreg(R_D1GRPH_UPDATE, lock | D1GRPH_SURFACE_UPDATE_LOCK);
+
+    /* Write new surface address (both primary + secondary) */
+    wreg(R_D1GRPH_PRIMARY_SURFACE_ADDRESS, surface_addr);
+    wreg(R_D1GRPH_SECONDARY_SURFACE_ADDRESS, surface_addr);
+
+    /* Unlock — hardware applies at next vsync */
+    lock = rreg(R_D1GRPH_UPDATE);
+    wreg(R_D1GRPH_UPDATE, lock & ~D1GRPH_SURFACE_UPDATE_LOCK);
+}
+
+/* Returns 1 when the previous hw_page_flip has been applied. */
+static int hw_is_flip_done(void)
+{
+    return !(rreg(R_D1GRPH_UPDATE) & D1GRPH_SURFACE_UPDATE_PENDING);
+}
+
+/* Wait for vertical blanking using VGA Input Status Register 1.
+   Fallback for cards where AVIVO D1GRPH registers don't work. */
 static void wait_vsync(void)
 {
-    /* If in retrace now, wait for it to end first */
     while (inp(0x3DA) & 0x08);
-    /* Wait for new retrace to start */
     while (!(inp(0x3DA) & 0x08));
 }
 
@@ -902,6 +949,27 @@ static void gpu_fill(int x, int y, int w, int h, unsigned char color)
 
     wreg(R_DP_BRUSH_FRGD_CLR, (unsigned long)color);
     wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+    wreg(R_DST_Y_X, ((unsigned long)y << 16) | (unsigned long)x);
+    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
+}
+
+/* Set up 2D engine state for a batch of solid fills.
+   Call once before a sequence of gpu_fill_fast() calls. */
+static void gpu_fill_setup(void)
+{
+    gpu_wait_fifo(3);
+    wreg(R_DP_GUI_MASTER_CNTL,
+         GMC_BRUSH_SOLID | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_PATCOPY | GMC_CLR_CMP_DIS | GMC_WR_MSK_DIS);
+    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+    wreg(R_CLR_CMP_CNTL, 0);
+}
+
+/* Fast solid fill — only 3 register writes (assumes gpu_fill_setup). */
+static void gpu_fill_fast(int x, int y, int w, int h, unsigned char color)
+{
+    gpu_wait_fifo(3);
+    wreg(R_DP_BRUSH_FRGD_CLR, (unsigned long)color);
     wreg(R_DST_Y_X, ((unsigned long)y << 16) | (unsigned long)x);
     wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
 }
@@ -1094,8 +1162,9 @@ static void demo_pattern(void)
 static void demo_benchmark(void)
 {
     clock_t t0, t1;
-    double cpu_ms, gpu_ms;
+    double cpu_ms, gpu_ms, rect_ms;
     int iters = 100;
+    long rect_iters;
     int i;
     unsigned char col;
     char buf[80];
@@ -1115,7 +1184,7 @@ static void demo_benchmark(void)
     t1 = clock();
     cpu_ms = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC;
 
-    /* --- GPU benchmark --- */
+    /* --- GPU full-screen fill benchmark --- */
     gpu_fill(0, 0, g_xres, g_yres, 0);
     gpu_wait_idle();
 
@@ -1128,6 +1197,35 @@ static void demo_benchmark(void)
     t1 = clock();
     gpu_ms = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC;
 
+    /* --- GPU small-rect throughput benchmark (fast path) --- */
+    {
+        int rw = 32, rh = 32;
+        int cols = g_xres / rw;
+        int rows = (g_yres - 20) / rh;
+        long total_rects = (long)cols * rows;
+        int pass;
+
+        gpu_fill(0, 0, g_xres, g_yres, 0);
+        gpu_wait_idle();
+
+        gpu_fill_setup();
+        rect_iters = 0;
+        t0 = clock();
+        /* Run for ~2 seconds of rect submissions */
+        for (pass = 0; pass < 200; pass++) {
+            int rx, ry;
+            col = (unsigned char)(pass & 0xFF);
+            for (ry = 0; ry < rows; ry++)
+                for (rx = 0; rx < cols; rx++)
+                    gpu_fill_fast(rx * rw, ry * rh, rw, rh,
+                                  (unsigned char)(col + rx + ry));
+            rect_iters += total_rects;
+        }
+        gpu_wait_idle();
+        t1 = clock();
+        rect_ms = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC;
+    }
+
     /* Display results */
     gpu_fill(0, 0, g_xres, g_yres, 0);
     gpu_wait_idle();
@@ -1137,6 +1235,9 @@ static void demo_benchmark(void)
         double cpu_rate = (cpu_ms > 0) ? total / (cpu_ms/1000.0) : 0;
         double gpu_rate = (gpu_ms > 0) ? total / (gpu_ms/1000.0) : 0;
         double speedup  = (gpu_ms > 0) ? cpu_ms / gpu_ms : 0;
+        double rps      = (rect_ms > 0) ? (double)rect_iters / (rect_ms / 1000.0) : 0;
+        double rpix     = (rect_ms > 0) ? (double)rect_iters * 32 * 32 /
+                          (rect_ms / 1000.0) / 1000000.0 : 0;
 
         cpu_str_c(10, "=== CPU vs GPU Fill Benchmark ===", 255, 2);
 
@@ -1153,6 +1254,10 @@ static void demo_benchmark(void)
             sprintf(buf, "GPU speedup: %.1fx", speedup);
             cpu_str_c(150, buf, 254, 3);
         }
+
+        /* Small rect throughput */
+        sprintf(buf, "GPU 32x32 rects: %.0f rects/s  %.0f Mpix/s", rps, rpix);
+        cpu_str_c(180, buf, 250, 1);
 
         /* Draw bar chart */
         {
@@ -1180,13 +1285,15 @@ static void demo_benchmark(void)
     }
 }
 
-/* Animated random GPU rectangles with throughput counter */
+/* Animated random GPU rectangles with throughput counter.
+   Uses fast fill path (3 regs per rect) + FIFO tracking for max throughput. */
 static void demo_flood(void)
 {
     clock_t t0, last_upd;
     long count = 0, fps_count = 0;
-    char buf[60];
-    int ch;
+    long long total_pixels = 0;
+    char buf[80];
+    int ch, loop_count = 0;
 
     gpu_fill(0, 0, g_xres, g_yres, 0);
     gpu_wait_idle();
@@ -1197,7 +1304,10 @@ static void demo_flood(void)
     t0 = clock();
     last_upd = t0;
 
-    while (!kbhit()) {
+    /* Set up 2D engine for batch fills (invariant regs written once) */
+    gpu_fill_setup();
+
+    while (1) {
         int rx = rand() % g_xres;
         int ry = rand() % g_yres + 14;
         int rw = rand() % (g_xres / 4) + 4;
@@ -1208,25 +1318,38 @@ static void demo_flood(void)
         if (ry + rh > g_yres) rh = g_yres - ry;
         if (rw < 1 || rh < 1) continue;
 
-        gpu_fill(rx, ry, rw, rh, rc);
+        gpu_fill_fast(rx, ry, rw, rh, rc);
         count++;
         fps_count++;
+        total_pixels += (long long)rw * rh;
 
-        /* Update counter every ~500 rects */
-        if (fps_count >= 500) {
+        /* Check keyboard less frequently (every 64 rects) */
+        if (++loop_count >= 64) {
+            loop_count = 0;
+            if (kbhit()) break;
+        }
+
+        /* Update counter every ~4000 rects (reduces stall overhead) */
+        if (fps_count >= 4000) {
             clock_t now = clock();
             double elapsed = (double)(now - last_upd) / CLOCKS_PER_SEC;
-            double rps;
+            double rps, mpps;
             if (elapsed <= 0) elapsed = 0.001;
             rps = fps_count / elapsed;
+            mpps = (double)total_pixels / elapsed / 1000000.0;
 
             gpu_wait_idle();
             gpu_fill(0, 0, g_xres, 13, 0);
             gpu_wait_idle();
-            sprintf(buf, "Rects: %ld  Rate: %.0f rects/sec", count, rps);
+            sprintf(buf, "Rects: %ld  %-.0f rects/s  %-.0f Mpix/s",
+                    count, rps, mpps);
             cpu_str(4, 4, buf, 254, 1);
 
+            /* Re-setup fast fill state after gpu_fill in header clear */
+            gpu_fill_setup();
+
             fps_count = 0;
+            total_pixels = 0;
             last_upd = now;
         }
     }
@@ -1260,7 +1383,6 @@ static void demo_blit(void)
     clock_t fps_t0;
     double fps;
     char buf[80];
-    RMI rm;
 
     /* Sprite source stored on page 2 (offscreen, beyond display pages) */
     sprite_y = g_yres * 2;
@@ -1326,14 +1448,10 @@ static void demo_blit(void)
         sprintf(buf, "GPU Blit Bounce  %.1f FPS  [ESC quit]", fps);
         cpu_str(4, back_y + g_yres - 14, buf, 253, 1);
 
-        /* Vsync + page flip */
-        wait_vsync();
-        memset(&rm, 0, sizeof rm);
-        rm.eax = 0x4F07;
-        rm.ebx = 0x0000;   /* immediate set (vsync already waited) */
-        rm.ecx = 0;
-        rm.edx = (unsigned long)back_y;
-        dpmi_rmint(0x10, &rm);
+        /* Wait for previous flip to complete, then issue new flip */
+        while (!hw_is_flip_done()) {}
+        hw_page_flip(g_fb_location +
+            (unsigned long)back_page * g_pitch * g_yres);
 
         back_page ^= 1;
         bx = nx; by = ny;
@@ -1341,12 +1459,8 @@ static void demo_blit(void)
     getch();
 
     /* Restore display to page 0, reset scissor */
-    memset(&rm, 0, sizeof rm);
-    rm.eax = 0x4F07;
-    rm.ebx = 0x0000;
-    rm.ecx = 0;
-    rm.edx = 0;
-    dpmi_rmint(0x10, &rm);
+    hw_page_flip(g_fb_location);
+    while (!hw_is_flip_done()) {}
 
     gpu_wait_fifo(1);
     wreg(R_SC_BOTTOM_RIGHT,
@@ -1359,7 +1473,7 @@ static void demo_blit(void)
 /*  4 layers at different scroll speeds, composited each frame      */
 /*  using GPU BLT.  Upper layers use source color-key (index 0) so */
 /*  lower layers show through transparent regions.                  */
-/*  Double-buffered via VBE 4F07h page flip.                        */
+/*  Double-buffered via AVIVO D1GRPH hardware page flip.            */
 /* =============================================================== */
 
 #define PLAX_NLAYERS   4
@@ -1551,7 +1665,6 @@ static void demo_parallax(void)
     char buf[80];
     int i;
     unsigned long need;
-    RMI rm;
 
     /* Verify VRAM can hold 2 display pages + 4 layer pages */
     need = (unsigned long)g_pitch * g_yres * 6;
@@ -1627,16 +1740,11 @@ static void demo_parallax(void)
                 PLAX_NLAYERS, fps);
         cpu_str(4, back_y + 4, buf, 255, 1);
 
-        /* Wait for vertical retrace, then flip display to back buffer.
-           Using explicit port 0x3DA wait + immediate VBE flip instead of
-           VBE 4F07h BX=0x0080, which is unreliable on ATOMBIOS. */
-        wait_vsync();
-        memset(&rm, 0, sizeof rm);
-        rm.eax = 0x4F07;
-        rm.ebx = 0x0000;   /* immediate set (vsync already waited) */
-        rm.ecx = 0;
-        rm.edx = (unsigned long)back_y;
-        dpmi_rmint(0x10, &rm);
+        /* AVIVO hardware page flip: atomic, tear-free, non-blocking.
+           Wait for previous flip to apply, then issue new flip. */
+        while (!hw_is_flip_done()) {}
+        hw_page_flip(g_fb_location +
+            (unsigned long)back_page * g_pitch * g_yres);
 
         back_page ^= 1;
         scroll++;
@@ -1645,12 +1753,8 @@ static void demo_parallax(void)
     getch();
 
     /* Restore display to page 0 */
-    memset(&rm, 0, sizeof rm);
-    rm.eax = 0x4F07;
-    rm.ebx = 0x0000;
-    rm.ecx = 0;
-    rm.edx = 0;
-    dpmi_rmint(0x10, &rm);
+    hw_page_flip(g_fb_location);
+    while (!hw_is_flip_done()) {}
 
     /* Restore scissor */
     gpu_wait_fifo(1);
