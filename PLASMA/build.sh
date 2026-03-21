@@ -14,3 +14,8 @@ echo "Building MTRRDIAG..."
 wcc386 -bt=dos -5r -ox -s -zq MTRRDIAG.C
 wlink system pmodew name MTRRDIAG file MTRRDIAG option quiet
 echo "Done: MTRRDIAG.exe"
+
+echo "Building WCINIT..."
+wcc386 -bt=dos -5r -ox -s -zq WCINIT.C
+wlink system pmodew name WCINIT file WCINIT option quiet
+echo "Done: WCINIT.exe"

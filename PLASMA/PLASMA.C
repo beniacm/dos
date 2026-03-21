@@ -43,9 +43,26 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#ifdef __DJGPP__
+#include <dos.h>
+#include <dpmi.h>
+#include <go32.h>
+#include <sys/nearptr.h>
+#include <sys/movedata.h>
+#include <sys/segments.h>
+#include <pc.h>
+#include <conio.h>
+#define far
+#define __far
+#define __interrupt
+#define inp(p)      inportb(p)
+#define outp(p,v)   outportb(p,v)
+#define stricmp     strcasecmp
+#else
 #include <conio.h>
 #include <dos.h>
 #include <i86.h>
+#endif
 
 /* --------------------------------------------------------------------------
  * Constants
@@ -150,9 +167,24 @@ static unsigned long  g_fb_phys      = 0;   /* LFB physical base for flip   */
 
 static unsigned char *dos_buf(void)
 {
+#ifdef __DJGPP__
+    return (unsigned char *)((unsigned long)g_dos_seg * 16 + __djgpp_conventional_base);
+#else
     return (unsigned char *)((unsigned long)g_dos_seg << 4);
+#endif
 }
 
+#ifdef __DJGPP__
+static int dpmi_alloc_dos(unsigned short paragraphs)
+{
+    int sel_or_max;
+    int seg = __dpmi_allocate_dos_memory(paragraphs, &sel_or_max);
+    if (seg == -1) return 0;
+    g_dos_seg = (unsigned short)seg;
+    g_dos_sel = (unsigned short)sel_or_max;
+    return 1;
+}
+#else
 static int dpmi_alloc_dos(unsigned short paragraphs)
 {
     union REGS r;
@@ -165,7 +197,17 @@ static int dpmi_alloc_dos(unsigned short paragraphs)
     g_dos_sel = (unsigned short)r.x.edx;
     return 1;
 }
+#endif
 
+#ifdef __DJGPP__
+static void dpmi_free_dos(void)
+{
+    if (!g_dos_sel) return;
+    __dpmi_free_dos_memory(g_dos_sel);
+    g_dos_sel = 0;
+    g_dos_seg = 0;
+}
+#else
 static void dpmi_free_dos(void)
 {
     union REGS r;
@@ -177,7 +219,14 @@ static void dpmi_free_dos(void)
     g_dos_sel = 0;
     g_dos_seg = 0;
 }
+#endif
 
+#ifdef __DJGPP__
+static int dpmi_real_int(unsigned char intno, RMI *rmi)
+{
+    return (__dpmi_simulate_real_mode_interrupt(intno, (__dpmi_regs *)rmi) == 0);
+}
+#else
 static int dpmi_real_int(unsigned char intno, RMI *rmi)
 {
     union REGS  r;
@@ -191,7 +240,18 @@ static int dpmi_real_int(unsigned char intno, RMI *rmi)
     int386x(0x31, &r, &r, &sr);
     return !(r.x.cflag);
 }
+#endif
 
+#ifdef __DJGPP__
+static void *dpmi_map_physical(unsigned long phys, unsigned long size)
+{
+    __dpmi_meminfo mi;
+    mi.address = phys;
+    mi.size = size;
+    if (__dpmi_physical_address_mapping(&mi) == -1) return NULL;
+    return (void *)(mi.address + __djgpp_conventional_base);
+}
+#else
 static void *dpmi_map_physical(unsigned long phys, unsigned long size)
 {
     union REGS r;
@@ -207,7 +267,17 @@ static void *dpmi_map_physical(unsigned long phys, unsigned long size)
     linear = ((unsigned long)(r.x.ebx & 0xFFFF) << 16) | (r.x.ecx & 0xFFFF);
     return (void *)linear;
 }
+#endif
 
+#ifdef __DJGPP__
+static void dpmi_unmap_physical(void *ptr)
+{
+    __dpmi_meminfo mi;
+    mi.address = (unsigned long)ptr - __djgpp_conventional_base;
+    mi.size = 0;
+    __dpmi_free_physical_address_mapping(&mi);
+}
+#else
 static void dpmi_unmap_physical(void *ptr)
 {
     union REGS r;
@@ -218,6 +288,7 @@ static void dpmi_unmap_physical(void *ptr)
     r.x.ecx = addr & 0xFFFF;
     int386(0x31, &r, &r);
 }
+#endif
 
 /* --------------------------------------------------------------------------
  * VBE functions
@@ -359,6 +430,9 @@ static int query_pmi(void)
 
     /* Read entry offsets from the PMI table header (first 6 bytes) */
     pmi_flat = (unsigned long)g_pmi_rm_seg * 16 + g_pmi_rm_off;
+#ifdef __DJGPP__
+    pmi_flat += __djgpp_conventional_base;
+#endif
     g_pmi_setw_off   = *(unsigned short *)(pmi_flat + 0);
     g_pmi_setds_off  = *(unsigned short *)(pmi_flat + 2);
     g_pmi_setpal_off = *(unsigned short *)(pmi_flat + 4);
@@ -380,6 +454,33 @@ static int query_pmi(void)
  *
  * Requires ring 0 (PMODE/W) for the direct port I/O in the PMI code.
  */
+#ifdef __DJGPP__
+static unsigned long __attribute__((noinline))
+_pmi_call4(unsigned long entry, unsigned long _eax,
+           unsigned long _ebx, unsigned long _ecx, unsigned long _edx)
+{
+    unsigned long result = _eax;
+    __asm__ __volatile__ (
+        "call *%%esi"
+        : "+a"(result), "+S"(entry), "+b"(_ebx), "+c"(_ecx), "+d"(_edx)
+        :: "edi", "memory"
+    );
+    return result;
+}
+
+static unsigned long __attribute__((noinline))
+_pmi_call4_ebx(unsigned long entry, unsigned long _eax,
+               unsigned long _ebx, unsigned long _ecx, unsigned long _edx)
+{
+    unsigned long result = _ebx;
+    __asm__ __volatile__ (
+        "call *%%esi"
+        : "+b"(result), "+S"(entry), "+a"(_eax), "+c"(_ecx), "+d"(_edx)
+        :: "edi", "memory"
+    );
+    return result;
+}
+#else
 unsigned long _pmi_call4(unsigned long entry, unsigned long eax,
                          unsigned long ebx,  unsigned long ecx,
                          unsigned long edx);
@@ -398,12 +499,16 @@ unsigned long _pmi_call4_ebx(unsigned long entry, unsigned long eax,
     parm [esi] [eax] [ebx] [ecx] [edx] \
     value [ebx]              \
     modify [eax ecx edx esi edi]
+#endif
 
 static int pmi_set_display_start(unsigned short cx, unsigned short dy,
                                  int wait)
 {
     unsigned long entry = (unsigned long)g_pmi_rm_seg * 16
                         + g_pmi_rm_off + g_pmi_setds_off;
+#ifdef __DJGPP__
+    entry += __djgpp_conventional_base;
+#endif
     unsigned long result;
     result = _pmi_call4(entry, 0x4F07,
                         wait ? 0x0080UL : 0x0000UL,
@@ -417,6 +522,9 @@ static int pmi_schedule_display_start(unsigned short cx, unsigned short dy)
 {
     unsigned long entry = (unsigned long)g_pmi_rm_seg * 16
                         + g_pmi_rm_off + g_pmi_setds_off;
+#ifdef __DJGPP__
+    entry += __djgpp_conventional_base;
+#endif
     unsigned long result;
     result = _pmi_call4(entry, 0x4F07, 0x0002UL,
                         (unsigned long)cx,
@@ -429,6 +537,9 @@ static int pmi_is_flip_complete(void)
 {
     unsigned long entry = (unsigned long)g_pmi_rm_seg * 16
                         + g_pmi_rm_off + g_pmi_setds_off;
+#ifdef __DJGPP__
+    entry += __djgpp_conventional_base;
+#endif
     unsigned long ebx_out;
     ebx_out = _pmi_call4_ebx(entry, 0x4F07, 0x0004UL, 0, 0);
     return ((ebx_out & 0xFF00) == 0);  /* BH=0 means flip complete */
@@ -465,11 +576,24 @@ static int pmi_is_flip_complete(void)
 #define R5_D1GRPH_SURFACE_UPDATE_LOCK       (1UL << 16)
 
 /* Dword I/O port access (named to avoid conio.h conflict) */
+#ifdef __DJGPP__
+static inline void _gpu_outpd(unsigned short port, unsigned long val)
+{
+    __asm__ __volatile__ ("outl %0, %w1" :: "a"(val), "Nd"(port));
+}
+static inline unsigned long _gpu_inpd(unsigned short port)
+{
+    unsigned long val;
+    __asm__ __volatile__ ("inl %w1, %0" : "=a"(val) : "Nd"(port));
+    return val;
+}
+#else
 void _gpu_outpd(unsigned short port, unsigned long val);
 #pragma aux _gpu_outpd = "out dx, eax" parm [dx] [eax] modify exact []
 
 unsigned long _gpu_inpd(unsigned short port);
 #pragma aux _gpu_inpd = "in eax, dx" parm [dx] value [eax] modify exact []
+#endif
 
 static unsigned long gpu_reg_read(unsigned long reg)
 {
@@ -573,6 +697,107 @@ static int hw_is_flip_done(void)
 /* Inline helpers for privileged CPU instructions (ring 0 only).
  * Use raw opcodes to avoid assembler version dependencies. */
 
+#ifdef __DJGPP__
+
+static inline unsigned short _get_cs(void)
+{
+    unsigned short cs;
+    __asm__ __volatile__ ("movw %%cs, %0" : "=r"(cs));
+    return cs;
+}
+
+static inline int _has_cpuid(void)
+{
+    unsigned long result, scratch;
+    __asm__ __volatile__ (
+        "pushfl\n\t"
+        "popl %%eax\n\t"
+        "movl %%eax, %%ecx\n\t"
+        "xorl $0x200000, %%eax\n\t"
+        "pushl %%eax\n\t"
+        "popfl\n\t"
+        "pushfl\n\t"
+        "popl %%eax\n\t"
+        "xorl %%ecx, %%eax\n\t"
+        "shrl $21, %%eax\n\t"
+        "andl $1, %%eax"
+        : "=a"(result), "=c"(scratch) :: "memory"
+    );
+    return (int)result;
+}
+
+static inline unsigned long _cpuid1_edx(void)
+{
+    unsigned long eax = 1, ebx_out, ecx_out, edx;
+    __asm__ __volatile__ (
+        "cpuid"
+        : "+a"(eax), "=b"(ebx_out), "=c"(ecx_out), "=d"(edx)
+    );
+    return edx;
+}
+
+static inline unsigned long _rdmsr_lo(unsigned long msr)
+{
+    unsigned long lo, hi;
+    __asm__ __volatile__ ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return lo;
+}
+
+static inline unsigned long _rdmsr_hi(unsigned long msr)
+{
+    unsigned long lo, hi;
+    __asm__ __volatile__ ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return hi;
+}
+
+static inline void _wrmsr_3(unsigned long msr, unsigned long lo, unsigned long hi)
+{
+    __asm__ __volatile__ ("wrmsr" :: "c"(msr), "a"(lo), "d"(hi));
+}
+
+static inline void _wbinvd(void)
+{
+    __asm__ __volatile__ ("wbinvd" ::: "memory");
+}
+
+static inline unsigned long _read_cr3(void)
+{
+    unsigned long val;
+    __asm__ __volatile__ ("movl %%cr3, %0" : "=r"(val));
+    return val;
+}
+
+static inline void _flush_tlb(void)
+{
+    unsigned long tmp;
+    __asm__ __volatile__ (
+        "movl %%cr3, %0\n\t"
+        "movl %0, %%cr3"
+        : "=r"(tmp) :: "memory"
+    );
+}
+
+static inline unsigned long _read_cr0(void)
+{
+    unsigned long val;
+    __asm__ __volatile__ ("movl %%cr0, %0" : "=r"(val));
+    return val;
+}
+
+/* Enable SSE/SSE2/SSE3 for Pentium D: set OSFXSR + OSXMMEXCPT in CR4 */
+static void djgpp_enable_sse(void)
+{
+    unsigned long cr4;
+    if ((_get_cs() & 3) != 0) return;
+    if (!_has_cpuid()) return;
+    if (!(_cpuid1_edx() & (1UL << 25))) return;
+    __asm__ __volatile__ ("movl %%cr4, %0" : "=r"(cr4));
+    cr4 |= (1UL << 9) | (1UL << 10);
+    __asm__ __volatile__ ("movl %0, %%cr4" :: "r"(cr4) : "memory");
+}
+
+#else /* Watcom */
+
 unsigned short _get_cs(void);
 #pragma aux _get_cs = "mov ax, cs" value [ax]
 
@@ -637,6 +862,8 @@ unsigned long _read_cr0(void);
 #pragma aux _read_cr0 = \
     "db 0Fh, 20h, 0C0h"    \
     value [eax]
+
+#endif /* __DJGPP__ */
 
 #define MSR_MTRR_DEF_TYPE   0x2FF
 #define MSR_PAT             0x277
@@ -990,7 +1217,11 @@ static unsigned char *get_bios_font_8x8(void)
     rmi.eax = 0x1130;
     rmi.ebx = 0x0300;   /* ROM 8x8 font, chars 0-127 */
     dpmi_real_int(0x10, &rmi);
+#ifdef __DJGPP__
+    return (unsigned char *)(((unsigned long)rmi.es << 4) + (rmi.ebp & 0xFFFF) + __djgpp_conventional_base);
+#else
     return (unsigned char *)(((unsigned long)rmi.es << 4) + (rmi.ebp & 0xFFFF));
+#endif
 }
 
 /* --------------------------------------------------------------------------
@@ -1188,6 +1419,15 @@ static void blit_to_lfb(unsigned char *lfb, int lfb_pitch,
  * RDTSC helpers (Pentium+)
  * -------------------------------------------------------------------------- */
 
+#ifdef __DJGPP__
+static void rdtsc_read(unsigned long *lo, unsigned long *hi)
+{
+    unsigned long _lo, _hi;
+    __asm__ __volatile__ ("rdtsc" : "=a"(_lo), "=d"(_hi));
+    *lo = _lo;
+    *hi = _hi;
+}
+#else
 static void rdtsc_read(unsigned long *lo, unsigned long *hi)
 {
     unsigned long a, d;
@@ -1199,6 +1439,7 @@ static void rdtsc_read(unsigned long *lo, unsigned long *hi)
     *lo = a;
     *hi = d;
 }
+#endif
 
 /* Convert two (hi:lo) TSC snapshots to milliseconds using g_rdtsc_mhz */
 static double tsc_to_ms(unsigned long lo1, unsigned long hi1,
@@ -1215,7 +1456,11 @@ static void calibrate_rdtsc(void)
 {
     /* Use BIOS tick counter at 0x46C (18.2065 Hz) directly — avoids any
      * CLOCKS_PER_SEC ambiguity in the C runtime.                          */
+#ifdef __DJGPP__
+    volatile unsigned long *bios_ticks = (volatile unsigned long *)(0x0046CUL + __djgpp_conventional_base);
+#else
     volatile unsigned long *bios_ticks = (volatile unsigned long *)0x46CUL;
+#endif
     unsigned long bt0, bt1;
     unsigned long lo0, hi0, lo1, hi1;
     double elapsed_s, cycles;
@@ -1313,7 +1558,11 @@ int main(int argc, char *argv[])
     int            i;
 
     /* BIOS timer-tick counter at flat address 0x46C  (~18.2 ticks/sec) */
+#ifdef __DJGPP__
+    bios_ticks = (volatile unsigned long *)(0x0046CUL + __djgpp_conventional_base);
+#else
     bios_ticks = (volatile unsigned long *)0x46CUL;
+#endif
 
     /* Parse command-line flags */
     for (i = 1; i < argc; i++) {
@@ -1354,6 +1603,15 @@ int main(int argc, char *argv[])
     /* Conventional DOS memory:
      *   512 B VBEInfo  + 256 B ModeInfo  + 1024 B palette = 1792 B
      *   128 paragraphs = 2048 B - enough with room to spare              */
+#ifdef __DJGPP__
+    /* Enable near pointer access for direct physical memory mapping */
+    if (!__djgpp_nearptr_enable()) {
+        printf("Failed to enable near pointer access\n");
+        return 1;
+    }
+    printf("[0] DJGPP nearptr enabled, SSE init...\n");
+    djgpp_enable_sse();
+#endif
     if (!dpmi_alloc_dos(128)) {
         printf("DPMI: cannot allocate conventional memory\n");
         return 1;
@@ -1419,7 +1677,11 @@ int main(int argc, char *argv[])
         unsigned long   ml_seg = (vbi.video_mode_ptr >> 16) & 0xFFFF;
         unsigned long   ml_off =  vbi.video_mode_ptr        & 0xFFFF;
 
+#ifdef __DJGPP__
+        src = (unsigned short *)(ml_seg * 16 + ml_off + __djgpp_conventional_base);
+#else
         src = (unsigned short *)(ml_seg * 16 + ml_off);
+#endif
         for (count = 0; count < 511 && src[count] != 0xFFFF; count++)
             mode_list[count] = src[count];
         mode_list[count] = 0xFFFF;
@@ -1527,7 +1789,7 @@ int main(int argc, char *argv[])
         } else if (wc == -1)
             printf("MTRR WC    : already active (BIOS/chipset)\n");
         else if ((_get_cs() & 3) != 0)
-            printf("MTRR WC    : skipped (ring 3 - use PMODE/W for ring 0)\n");
+            printf("MTRR WC    : skipped (ring 3 - run WCINIT.EXE first)\n");
         else
             printf("MTRR WC    : not available\n");
     } else {
@@ -1605,7 +1867,7 @@ int main(int argc, char *argv[])
     /* Test direct GPU register access for -hwflip */
     if (g_hw_flip && use_doublebuf) {
         if ((_get_cs() & 3) != 0) {
-            printf("HW flip    : skipped (ring 3 — use PMODE/W)\n");
+            printf("HW flip    : skipped (ring 3 — needs PMODE/W)\n");
             g_hw_flip = 0;
         } else if (!detect_gpu_iobase(lfb_phys)) {
             printf("HW flip    : GPU I/O base not found\n");
@@ -1639,7 +1901,7 @@ int main(int argc, char *argv[])
     /* ---- Feature Summary ----------------------------------------------- */
     {
         const char *ring_str  = ((_get_cs() & 3) == 0) ?
-                                "0 (PMODE/W)" : "3 (DOS4GW)";
+                                "0 (PMODE/W)" : "3 (CWSDPMI)";
         const char *pmi_str, *mtrr_str, *flip_str;
         const char *sched_str, *buf_str, *render_str;
         const char *hwflip_str;
@@ -1663,7 +1925,7 @@ int main(int argc, char *argv[])
         else if (g_no_mtrr)
             mtrr_str = "disabled (-nomtrr)";
         else if ((_get_cs() & 3) != 0)
-            mtrr_str = "skipped (ring 3)";
+            mtrr_str = "skipped (ring 3 - run WCINIT.EXE first)";
         else
             mtrr_str = "not available";
 
@@ -1956,6 +2218,9 @@ int main(int argc, char *argv[])
     if (frame_buf) free(frame_buf);
     free(g_dist);
     dpmi_free_dos();
+#ifdef __DJGPP__
+    __djgpp_nearptr_disable();
+#endif
 
     printf("PLASMA done.  mode=0x%03X  DAC=%d-bit  buf:%s  PMI:%s  HWF:%s  WC:%s  PAT:%s  sched:%s  render:%s\n",
            target_mode, g_dac_bits,
