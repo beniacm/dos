@@ -874,6 +874,20 @@ static void gpu_init_2d(void)
 }
 
 /* =============================================================== */
+/*  VGA vertical retrace wait                                       */
+/* =============================================================== */
+
+/* Wait for vertical blanking interval using VGA Input Status Register 1.
+   More reliable than VBE 4F07h BX=0x0080 on ATOMBIOS-based cards. */
+static void wait_vsync(void)
+{
+    /* If in retrace now, wait for it to end first */
+    while (inp(0x3DA) & 0x08);
+    /* Wait for new retrace to start */
+    while (!(inp(0x3DA) & 0x08));
+}
+
+/* =============================================================== */
 /*  Radeon 2D operations                                            */
 /* =============================================================== */
 
@@ -1232,19 +1246,33 @@ static void demo_flood(void)
     }
 }
 
-/* GPU blit demo: bounce a block around the screen */
+/* GPU blit demo: bounce a block around the screen.
+   Double-buffered with vsync page flipping for tear-free animation.
+   Sprite source is kept in offscreen VRAM (page 2). */
 static void demo_blit(void)
 {
     int bw = 120, bh = 90;
     int bx, by, dx, dy;
     int i;
+    int sprite_y;       /* offscreen row where sprite pattern lives */
+    int back_page, back_y;
+    long fps_count;
+    clock_t fps_t0;
+    double fps;
+    char buf[80];
+    RMI rm;
 
-    gpu_fill(0, 0, g_xres, g_yres, 0);
-    gpu_wait_idle();
+    /* Sprite source stored on page 2 (offscreen, beyond display pages) */
+    sprite_y = g_yres * 2;
 
-    /* Draw a small pattern to blit around */
+    /* Widen scissor so GPU fill/blit can reach offscreen rows */
+    gpu_wait_fifo(1);
+    wreg(R_SC_BOTTOM_RIGHT, (0x1FFFUL << 16) | (unsigned long)g_xres);
+
+    /* Generate the rainbow-stripe sprite in offscreen VRAM */
+    gpu_fill(0, sprite_y, bw, bh, 0);
     for (i = 0; i < 7; i++) {
-        int y0 = i * (bh / 7);
+        int y0 = sprite_y + i * (bh / 7);
         int y1 = y0 + bh / 7 - 1;
         unsigned char base = (unsigned char)(1 + i * 32);
         int x;
@@ -1255,9 +1283,15 @@ static void demo_blit(void)
     }
     gpu_wait_idle();
 
-    cpu_str_c(g_yres - 14, "GPU Blit Bounce - press any key to stop", 253, 1);
+    /* Clear both display pages */
+    gpu_fill(0, 0, g_xres, g_yres * 2, 0);
+    gpu_wait_idle();
 
     bx = 0; by = 0; dx = 3; dy = 2;
+    back_page = 1;
+    fps_count = 0;
+    fps       = 0.0;
+    fps_t0    = clock();
 
     while (!kbhit()) {
         int nx = bx + dx;
@@ -1266,20 +1300,57 @@ static void demo_blit(void)
         if (nx < 0 || nx + bw > g_xres) { dx = -dx; nx = bx + dx; }
         if (ny < 0 || ny + bh > g_yres - 16) { dy = -dy; ny = by + dy; }
 
-        gpu_blit(bx, by, nx, ny, bw, bh);
+        back_y = back_page * g_yres;
 
-        /* Erase trail edges */
-        if (dx > 0) gpu_fill(bx, by, dx, bh, 0);
-        else        gpu_fill(nx + bw, by, -dx, bh, 0);
-        if (dy > 0) gpu_fill(bx, by, bw, dy, 0);
-        else        gpu_fill(bx, ny + bh, bw, -dy, 0);
+        /* Clear the back buffer (GPU fill is very fast) */
+        gpu_fill(0, back_y, g_xres, g_yres, 0);
 
-        bx = nx; by = ny;
+        /* Blit sprite from offscreen source to new position on back buffer */
+        gpu_blit_fwd(0, sprite_y, nx, back_y + ny, bw, bh);
 
-        /* Small delay for visible motion */
         gpu_wait_idle();
+
+        /* FPS counter */
+        fps_count++;
+        {
+            clock_t now = clock();
+            double elapsed = (double)(now - fps_t0) / CLOCKS_PER_SEC;
+            if (elapsed >= 1.0) {
+                fps = (double)fps_count / elapsed;
+                fps_count = 0;
+                fps_t0 = now;
+            }
+        }
+
+        /* HUD text on back buffer */
+        sprintf(buf, "GPU Blit Bounce  %.1f FPS  [ESC quit]", fps);
+        cpu_str(4, back_y + g_yres - 14, buf, 253, 1);
+
+        /* Vsync + page flip */
+        wait_vsync();
+        memset(&rm, 0, sizeof rm);
+        rm.eax = 0x4F07;
+        rm.ebx = 0x0000;   /* immediate set (vsync already waited) */
+        rm.ecx = 0;
+        rm.edx = (unsigned long)back_y;
+        dpmi_rmint(0x10, &rm);
+
+        back_page ^= 1;
+        bx = nx; by = ny;
     }
     getch();
+
+    /* Restore display to page 0, reset scissor */
+    memset(&rm, 0, sizeof rm);
+    rm.eax = 0x4F07;
+    rm.ebx = 0x0000;
+    rm.ecx = 0;
+    rm.edx = 0;
+    dpmi_rmint(0x10, &rm);
+
+    gpu_wait_fifo(1);
+    wreg(R_SC_BOTTOM_RIGHT,
+         ((unsigned long)g_yres << 16) | (unsigned long)g_xres);
 }
 
 /* =============================================================== */
@@ -1556,10 +1627,13 @@ static void demo_parallax(void)
                 PLAX_NLAYERS, fps);
         cpu_str(4, back_y + 4, buf, 255, 1);
 
-        /* VBE 4F07h: flip display to back buffer (vsync) */
+        /* Wait for vertical retrace, then flip display to back buffer.
+           Using explicit port 0x3DA wait + immediate VBE flip instead of
+           VBE 4F07h BX=0x0080, which is unreliable on ATOMBIOS. */
+        wait_vsync();
         memset(&rm, 0, sizeof rm);
         rm.eax = 0x4F07;
-        rm.ebx = 0x0080;   /* set during vertical retrace */
+        rm.ebx = 0x0000;   /* immediate set (vsync already waited) */
         rm.ecx = 0;
         rm.edx = (unsigned long)back_y;
         dpmi_rmint(0x10, &rm);
