@@ -2128,6 +2128,41 @@ static void analyze_display_state(void)
                 "  RADEON.C disables VGA rendering before using 2D engine.\n");
     }
 
+    /* AVIVO D1GRPH surface / CRTC state (for page flip diagnosis) */
+    {
+        unsigned long d1grph_surf = rreg_at(g_mmio, 0x6110);
+        unsigned long d1grph_sec  = rreg_at(g_mmio, 0x6118);
+        unsigned long d1grph_upd  = rreg_at(g_mmio, 0x6144);
+        unsigned long d1grph_flip = rreg_at(g_mmio, 0x6148);
+        unsigned long d1grph_pitch= rreg_at(g_mmio, 0x6120);
+        unsigned long d1crtc_ctl  = rreg_at(g_mmio, 0x6080);
+        unsigned long d1crtc_stat = rreg_at(g_mmio, 0x609C);
+        out("\n  AVIVO D1GRPH / D1CRTC state:\n");
+        out("    D1GRPH_PRIMARY_SURFACE_ADDR = 0x%08lX\n", d1grph_surf);
+        out("    D1GRPH_SECONDARY_SURFACE_ADDR = 0x%08lX\n", d1grph_sec);
+        out("    D1GRPH_PITCH        = 0x%08lX\n", d1grph_pitch);
+        out("    D1GRPH_UPDATE       = 0x%08lX", d1grph_upd);
+        if (d1grph_upd & (1UL << 16)) out(" [LOCKED]");
+        if (d1grph_upd & (1UL << 2))  out(" [UPDATE_PENDING]");
+        out("\n");
+        out("    D1GRPH_FLIP_CONTROL = 0x%08lX\n", d1grph_flip);
+        out("    D1CRTC_CONTROL      = 0x%08lX  %s\n",
+            d1crtc_ctl, (d1crtc_ctl & 1) ? "(CRTC enabled)" : "(CRTC DISABLED)");
+        out("    D1CRTC_STATUS       = 0x%08lX  %s\n",
+            d1crtc_stat, (d1crtc_stat & 1) ? "(in VBLANK)" : "(in active)");
+
+        /* HW flip feasibility: does D1GRPH surface match MC_FB_LOCATION? */
+        {
+            unsigned long mc_fb = rreg_at(g_mmio, 0x2180); /* RV515_MC_FB_LOCATION */
+            unsigned long fb_base = (mc_fb & 0xFFFFUL) << 16;
+            if ((d1grph_surf & 0xFFF00000UL) == (fb_base & 0xFFF00000UL))
+                out("    HW page flip     : FEASIBLE (D1GRPH surf matches VRAM base)\n");
+            else
+                out("    HW page flip     : UNLIKELY (D1GRPH=0x%08lX vs FB=0x%08lX)\n",
+                    d1grph_surf, fb_base);
+        }
+    }
+
     /* RBBM control (engine block enables) */
     {
         unsigned long rbbm_cntl = rreg_at(g_mmio, R_RBBM_CNTL);
