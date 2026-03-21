@@ -864,6 +864,19 @@ unsigned long _read_cr0(void);
     "db 0Fh, 20h, 0C0h"    \
     value [eax]
 
+/*
+ * WC-optimal block copy using REP MOVSD (x86 fast-string path).
+ * Takes a DWORD count (not byte count) so the compiler cannot confuse
+ * this with memcpy and substitute its own intrinsic expansion.
+ * Forces the hardware fast-string engine (Pentium Pro+) which fills
+ * WC write-combine buffers optimally (~900+ MB/s vs ~700).
+ */
+void wc_rep_movsd(void *dst, const void *src, unsigned long dwords);
+#pragma aux wc_rep_movsd = \
+    "rep movsd"             \
+    parm [edi] [esi] [ecx]  \
+    modify [edi esi ecx]
+
 #endif /* __DJGPP__ */
 
 #define MSR_MTRR_DEF_TYPE   0x2FF
@@ -1412,6 +1425,7 @@ static void build_plasma_palette(unsigned char *pal)
  * buffers optimally.  This keeps blit at ~1000+ MB/s with -O3.
  *
  * count must be a multiple of 4 (always true for WIDTH=1024 scanlines).
+ * (Watcom version is declared via #pragma aux in the Watcom section above.)
  */
 static inline void wc_memcpy(void *dst, const void *src, unsigned long count)
 {
@@ -1432,29 +1446,37 @@ static inline void wc_memcpy(void *dst, const void *src, unsigned long count)
 #ifdef __DJGPP__
 static void __attribute__((noinline, optimize("O2,no-unroll-loops")))
 blit_to_lfb(unsigned char *lfb, int lfb_pitch, const unsigned char *src)
-#else
-static void blit_to_lfb(unsigned char *lfb, int lfb_pitch,
-                         const unsigned char *src)
-#endif
 {
     int y;
     if (lfb_pitch == WIDTH) {
-#ifdef __DJGPP__
         wc_memcpy(lfb, src, PIXELS);
-#else
-        memcpy(lfb, src, PIXELS);
-#endif
     } else {
         for (y = 0; y < HEIGHT; y++)
-#ifdef __DJGPP__
             wc_memcpy(lfb + (unsigned long)y * lfb_pitch,
                        src + (unsigned long)y * WIDTH, WIDTH);
-#else
-            memcpy(lfb + (unsigned long)y * lfb_pitch,
-                   src + (unsigned long)y * WIDTH, WIDTH);
-#endif
     }
 }
+#else
+/*
+ * Watcom version: calls wc_rep_movsd (#pragma aux) which emits a single
+ * REP MOVSD to guarantee the hardware fast-string path for WC memory.
+ * The dword count is precomputed so the compiler cannot confuse this
+ * with memcpy and substitute its own intrinsic (which adds a redundant
+ * REP MOVSB byte-tail and EDI save/restore).
+ */
+static void blit_to_lfb(unsigned char *lfb, int lfb_pitch,
+                         const unsigned char *src)
+{
+    if (lfb_pitch == WIDTH) {
+        wc_rep_movsd(lfb, src, PIXELS / 4);
+    } else {
+        int y;
+        for (y = 0; y < HEIGHT; y++)
+            wc_rep_movsd(lfb  + (unsigned long)y * lfb_pitch,
+                          src + (unsigned long)y * WIDTH, WIDTH / 4);
+    }
+}
+#endif
 
 /* --------------------------------------------------------------------------
  * RDTSC helpers (Pentium+)
