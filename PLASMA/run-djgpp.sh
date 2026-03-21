@@ -4,14 +4,10 @@
 # Build with:  ./build-djgpp.sh dosbox   (x87 only, works in DOSBox)
 #              ./build-djgpp.sh           (SSE2/SSE3, real Pentium D only)
 #
-# CWSDPMI.EXE must be in the same directory as PLASMGCC.EXE.
+# CWSDPR0.EXE must be in the same directory as PLASMGCC.EXE.
+# (CWSDPR0 is the ring-0 DPMI server — enables MTRR WC + SSE setup)
 #
-# On real hardware: run WCINIT.EXE first to set MTRR write-combining.
-# CWSDPMI runs at ring 3 and cannot program MTRRs, so without WCINIT
-# the blit speed is ~80 MB/s (UC) instead of ~700 MB/s (WC).
-#
-#   C:\> WCINIT.EXE
-#   C:\> PLASMGCC.EXE
+# On real hardware, just run PLASMGCC.EXE directly — no WCINIT needed.
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 CONF="$(mktemp /tmp/plasma-dosbox-XXXXXX.conf)"

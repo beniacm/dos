@@ -685,8 +685,9 @@ static int hw_is_flip_done(void)
  * then combines sequential byte/word/dword writes into full cache-line
  * burst transactions over PCI/PCIe — typically ~10x faster VRAM blits.
  *
- * When running at ring 3 (DOS4GW), MTRR setup is skipped since
+ * When running at ring 3, MTRR setup is skipped since
  * RDMSR/WRMSR are privileged (ring-0) instructions.
+ * Use CWSDPR0 (ring 0) or PMODE/W for MTRR access.
  * -------------------------------------------------------------------------- */
 
 #define MSR_MTRRCAP         0xFE
@@ -1696,7 +1697,7 @@ int main(int argc, char *argv[])
      * PMI code does direct port I/O — requires ring 0 (PMODE/W). */
     if (g_vbe3 && !g_no_pmi) {
         if ((_get_cs() & 3) != 0) {
-            printf("PMI        : skipped (ring 3 — needs PMODE/W for direct I/O)\n");
+            printf("PMI        : skipped (ring 3 — needs ring 0 for direct I/O)\n");
         } else {
             g_pmi_ok = query_pmi();
             if (g_pmi_ok) {
@@ -1834,7 +1835,7 @@ int main(int argc, char *argv[])
         } else if (wc == -1)
             printf("MTRR WC    : already active (BIOS/chipset)\n");
         else if ((_get_cs() & 3) != 0)
-            printf("MTRR WC    : skipped (ring 3 - run WCINIT.EXE first)\n");
+            printf("MTRR WC    : skipped (ring 3 — use CWSDPR0 for ring 0)\n");
         else
             printf("MTRR WC    : not available\n");
     } else {
@@ -1912,7 +1913,7 @@ int main(int argc, char *argv[])
     /* Test direct GPU register access for -hwflip */
     if (g_hw_flip && use_doublebuf) {
         if ((_get_cs() & 3) != 0) {
-            printf("HW flip    : skipped (ring 3 — needs PMODE/W)\n");
+            printf("HW flip    : skipped (ring 3 — use CWSDPR0 for ring 0)\n");
             g_hw_flip = 0;
         } else if (!detect_gpu_iobase(lfb_phys)) {
             printf("HW flip    : GPU I/O base not found\n");
@@ -1946,7 +1947,7 @@ int main(int argc, char *argv[])
     /* ---- Feature Summary ----------------------------------------------- */
     {
         const char *ring_str  = ((_get_cs() & 3) == 0) ?
-                                "0 (PMODE/W)" : "3 (CWSDPMI)";
+                                "0 (ring 0)" : "3 (ring 3 — use CWSDPR0)";
         const char *pmi_str, *mtrr_str, *flip_str;
         const char *sched_str, *buf_str, *render_str;
         const char *hwflip_str;
@@ -1970,7 +1971,7 @@ int main(int argc, char *argv[])
         else if (g_no_mtrr)
             mtrr_str = "disabled (-nomtrr)";
         else if ((_get_cs() & 3) != 0)
-            mtrr_str = "skipped (ring 3 - run WCINIT.EXE first)";
+            mtrr_str = "skipped (ring 3 — use CWSDPR0 for ring 0)";
         else
             mtrr_str = "not available";
 
