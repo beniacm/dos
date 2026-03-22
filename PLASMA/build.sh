@@ -19,6 +19,12 @@ wcc386 $CFLAGS WAVE.C
 wlink system pmodew name PLASMA file PLASMA,VGA,WAVE option quiet
 echo "Done: PLASMA.exe"
 
+echo "Building WATER..."
+wcc386 $CFLAGS WATERDMO.C
+wcc386 $CFLAGS WATER.C
+wlink system pmodew name WATER file WATERDMO,VGA,WAVE,WATER option quiet
+echo "Done: WATER.exe"
+
 echo "Building WATERDRP..."
 wcc386 $CFLAGS WATERDRP.C
 wlink system pmodew name WATERDRP file WATERDRP,VGA option quiet

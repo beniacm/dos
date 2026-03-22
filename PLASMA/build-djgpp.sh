@@ -49,6 +49,16 @@ $STRIP $OUT
 ls -la $OUT
 echo "Done: $OUT"
 
+# --- WATER ---
+WTROUT=WATRGCC.EXE
+echo ""
+echo "Building WATER (lit water surface demo)..."
+$CC $CFLAGS -o $WTROUT WATERDMO.C VGA.C WAVE.C WATER.C -lm
+$STUBEDIT $WTROUT dpmi=CWSDPR0
+$STRIP $WTROUT
+ls -la $WTROUT
+echo "Done: $WTROUT"
+
 # --- WATERDRP ---
 WOUT=WDRPGCC.EXE
 echo ""
