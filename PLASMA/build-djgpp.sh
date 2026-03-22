@@ -37,7 +37,7 @@ fi
 echo "  CC: $($CC --version | head -1)"
 echo "  CFLAGS: $CFLAGS"
 
-$CC $CFLAGS -o $OUT PLASMA.C -lm
+$CC $CFLAGS -o $OUT PLASMA.C WAVE.C -lm
 
 # Patch the stub to load CWSDPR0 (ring-0 DPMI server) instead of CWSDPMI
 echo "Patching DPMI server to CWSDPR0 (ring 0)..."

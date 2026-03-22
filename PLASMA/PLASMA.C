@@ -64,6 +64,8 @@
 #include <i86.h>
 #endif
 
+#include "WAVE.H"
+
 /* --------------------------------------------------------------------------
  * Constants
  * -------------------------------------------------------------------------- */
@@ -1432,11 +1434,6 @@ static void wait_vsync(void)
  * The four 8-bit values are averaged to a single palette index.
  * -------------------------------------------------------------------------- */
 
-static unsigned char  g_sintab[256];         /* 256 B — always L1-hot       */
-static unsigned char  g_xdist[WIDTH];        /* 1 KB — always L1-hot        */
-static unsigned char  g_ydist[HEIGHT];       /* 768 B — always L1-hot       */
-static unsigned char *g_dist  = NULL;        /* WIDTH*HEIGHT Euclidean dist  */
-
 /* Benchmark results — filled by run_benchmark(), shown in summary */
 static double g_bench_render_ms   = 0.0;
 static double g_bench_blit_ms     = 0.0;
@@ -1445,31 +1442,7 @@ static double g_rdtsc_mhz         = 0.0; /* calibrated CPU MHz via RDTSC */
 
 static void init_plasma_tables(void)
 {
-    int x, y;
-    double cx   = WIDTH  / 2.0;
-    double cy   = HEIGHT / 2.0;
-    double maxd = sqrt(cx*cx + cy*cy);
-    int icx = WIDTH  / 2;
-    int icy = HEIGHT / 2;
-
-    for (x = 0; x < 256; x++)
-        g_sintab[x] = (unsigned char)((sin(x * 6.283185307 / 256.0) + 1.0) * 127.5);
-
-    /* Euclidean distance table (768 KB — primary radial wave) */
-    for (y = 0; y < HEIGHT; y++) {
-        double dy = y - cy;
-        for (x = 0; x < WIDTH; x++) {
-            double dx = x - cx;
-            double d  = sqrt(dx*dx + dy*dy) / maxd * 255.0;
-            g_dist[y * WIDTH + x] = (unsigned char)(d > 255.0 ? 255.0 : d);
-        }
-    }
-
-    /* 1-D Chebyshev tables (2 KB total — kept for reference/future use) */
-    for (x = 0; x < WIDTH;  x++)
-        g_xdist[x] = (unsigned char)((abs(x - icx) * 255 + icx - 1) / icx);
-    for (y = 0; y < HEIGHT; y++)
-        g_ydist[y] = (unsigned char)((abs(y - icy) * 255 + icy - 1) / icy);
+    wave_init();
 }
 
 /*
@@ -1484,22 +1457,13 @@ static void render_plasma(unsigned char *buf, int pitch, unsigned int t)
     unsigned int t2 = (t + t/2)   & 0xFF;   /* 1.5x                        */
     unsigned int t3 = (t*2)       & 0xFF;   /* 2x – diagonal               */
     unsigned int t4 = (t*3)       & 0xFF;   /* 3x – radial (fast ripple)   */
-    const unsigned char *dist_row = g_dist;
+    short hrow[WIDTH];
 
     for (y = 0; y < HEIGHT; y++) {
         unsigned char *dst = buf + (unsigned long)y * pitch;
-        int vy    = (int)g_sintab[((unsigned int)(y >> 1) + t1) & 0xFF];
-        int dbase = (y >> 1) & 0xFF;
-
-        for (x = 0; x < WIDTH; x++) {
-            int v;
-            v  = (int)g_sintab[((unsigned int)(x >> 1) + t2) & 0xFF];
-            v += vy;
-            v += (int)g_sintab[((unsigned int)((x >> 1) + dbase) + t3) & 0xFF];
-            v += (int)g_sintab[((unsigned int)dist_row[x] + t4) & 0xFF];
-            dst[x] = (unsigned char)(v >> 2);
-        }
-        dist_row += WIDTH;
+        wave_fill_row(hrow, y, t1, t2, t3, t4);
+        for (x = 0; x < WIDTH; x++)
+            dst[x] = (unsigned char)(hrow[x] >> 2);
     }
 }
 
@@ -1519,10 +1483,75 @@ static void build_plasma_palette(unsigned char *pal)
         pal[i*4+2] = (unsigned char)((sin(t + 4.188790205)  + 1.0) * 127.5); /* B */
         pal[i*4+3] = 0;
     }
-    /* Reserve index 255 as pure white for HUD text */
-    pal[255*4+0] = 255; pal[255*4+1] = 255; pal[255*4+2] = 255; pal[255*4+3] = 0;
-    /* Index 0 = black for HUD background */
-    pal[0*4+0] = 0; pal[0*4+1] = 0; pal[0*4+2] = 0; pal[0*4+3] = 0;
+}
+
+/* HUD colour indices — found from natural palette (no overrides needed) */
+static unsigned char g_hud_dark;    /* darkest palette entry  */
+static unsigned char g_hud_bright;  /* brightest palette entry */
+
+/* Scan palette for darkest and brightest entries by perceived luminance */
+static void find_hud_colours(const unsigned char *pal)
+{
+    int i, best_lo = 999999, best_hi = -1;
+    for (i = 0; i < 256; i++) {
+        /* Fast approximate luminance: 2R + 5G + B (avoids floats) */
+        int lum = 2*pal[i*4+0] + 5*pal[i*4+1] + pal[i*4+2];
+        if (lum < best_lo) { best_lo = lum; g_hud_dark   = (unsigned char)i; }
+        if (lum > best_hi) { best_hi = lum; g_hud_bright = (unsigned char)i; }
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Palette debug grid — 16×16 swatches covering all 256 entries.
+ * Drawn into an 8-bpp LFB so the VBE palette hardware does the mapping.
+ * Each swatch is SW×SH pixels; hex index label at top-left corner.
+ * -------------------------------------------------------------------------- */
+static void show_palette_grid(unsigned char *lfb, int lfb_pitch,
+                              const unsigned char *font)
+{
+    /* swatch sizes — chosen so the grid fits comfortably in 1024×768 */
+    const int SW = 56;                /* swatch width  (56×16 = 896) */
+    const int SH = 40;               /* swatch height (40×16 = 640) */
+    const int OX = (WIDTH  - SW*16) / 2;   /* centre horizontally */
+    const int OY = (HEIGHT - SH*16) / 2;   /* centre vertically   */
+    int ix, iy;
+    char hex[4];
+
+    /* Clear screen to darkest palette entry */
+    {
+        int y;
+        for (y = 0; y < HEIGHT; y++)
+            memset(lfb + (unsigned long)y * lfb_pitch, g_hud_dark, WIDTH);
+    }
+
+    for (iy = 0; iy < 16; iy++) {
+        for (ix = 0; ix < 16; ix++) {
+            unsigned char idx = (unsigned char)(iy * 16 + ix);
+            int sx = OX + ix * SW;
+            int sy = OY + iy * SH;
+            int y;
+
+            /* Fill swatch rectangle */
+            for (y = 0; y < SH; y++)
+                memset(lfb + (unsigned long)(sy + y) * lfb_pitch + sx, idx, SW);
+
+            /* Hex label — use contrasting text colour */
+            {
+                unsigned char fg = (idx < 64 || (idx >= 128 && idx < 192))
+                                 ? g_hud_bright : g_hud_dark;
+                hex[0] = "0123456789ABCDEF"[idx >> 4];
+                hex[1] = "0123456789ABCDEF"[idx & 0xF];
+                hex[2] = '\0';
+                draw_str_bg(lfb, lfb_pitch, sx + 2, sy + 2,
+                            hex, fg, idx, font);
+            }
+        }
+    }
+
+    /* Title above grid */
+    draw_str_bg(lfb, lfb_pitch, OX, OY - 12,
+                "Palette 00-FF   [press any key]",
+                g_hud_bright, g_hud_dark, font);
 }
 
 /* --------------------------------------------------------------------------
@@ -1938,21 +1967,12 @@ int main(int argc, char *argv[])
     if (!g_direct_vram) {
         frame_buf = (unsigned char *)malloc(PIXELS);
         if (!frame_buf) {
-            free(g_dist);
             dpmi_free_dos();
             printf("Out of memory (frame buffer)\n");
             return 1;
         }
     }
     printf("Render     : %s\n", g_direct_vram ? "direct-to-VRAM (-directvram)" : "system-RAM + blit");
-
-    /* ---- Allocate distance table --------------------------------------- */
-    g_dist = (unsigned char *)malloc(PIXELS);
-    if (!g_dist) {
-        dpmi_free_dos();
-        printf("Out of memory (distance table)\n");
-        return 1;
-    }
 
     init_plasma_tables();
 
@@ -1963,7 +1983,6 @@ int main(int argc, char *argv[])
     }
     if (!lfb) {
         free(frame_buf);
-        free(g_dist);
         dpmi_free_dos();
         printf("Cannot map LFB at 0x%08lX\n", lfb_phys);
         return 1;
@@ -2011,7 +2030,6 @@ int main(int argc, char *argv[])
     if (!vbe_set_mode(target_mode)) {
         dpmi_unmap_physical(lfb);
         if (frame_buf) free(frame_buf);
-        free(g_dist);
         dpmi_free_dos();
         printf("Set mode 0x%03X failed\n", target_mode);
         return 1;
@@ -2215,7 +2233,6 @@ int main(int argc, char *argv[])
     if (!vbe_set_mode(target_mode)) {
         dpmi_unmap_physical(lfb);
         if (frame_buf) free(frame_buf);
-        free(g_dist);
         dpmi_free_dos();
         return 1;
     }
@@ -2229,10 +2246,16 @@ int main(int argc, char *argv[])
 
     /* ---- Palette ------------------------------------------------------- */
     build_plasma_palette(pal);
+    find_hud_colours(pal);
     vbe_set_palette(0, 256, pal);
 
     /* ---- BIOS font ----------------------------------------------------- */
     font = get_bios_font_8x8();
+
+    /* ---- Palette debug grid -------------------------------------------- */
+    show_palette_grid(lfb, lfb_pitch, font);
+    while (!kbhit()) {}          /* wait for keypress                      */
+    getch();                     /* consume it                             */
 
     /* ---- Main loop ----------------------------------------------------- */
     t           = 0;
@@ -2290,29 +2313,30 @@ int main(int argc, char *argv[])
                 const char *hwf_str  = g_hw_flip ? "YES" : "NO ";
                 sprintf(msg, "VSYNC:%s BUF:%s PMI:%s HWF:%s WC:%s FPS:%5.1f  [V] [ESC]",
                         sync_str, buf_str, pmi_str, hwf_str, wc_str, fps);
-                draw_str_bg(frame_buf, WIDTH, 4, 4, msg, 255, 0, font);
+                draw_str_bg(frame_buf, WIDTH, 4, 4, msg,
+                            g_hud_bright, g_hud_dark, font);
             }
 
             if (vsync_on && g_hw_flip) {
                 draw_str_2x(frame_buf, WIDTH, 4, 16,
                             "HW FLIP - GPU locked, tear-free  ",
-                            160, 0, font);
+                            g_hud_bright, g_hud_dark, font);
             } else if (!vsync_on && g_hw_flip) {
                 draw_str_2x(frame_buf, WIDTH, 4, 16,
                             "HW FLIP - tear-free, no throttle ",
-                            160, 0, font);
+                            g_hud_bright, g_hud_dark, font);
             } else if (vsync_on && g_sched_flip) {
                 draw_str_2x(frame_buf, WIDTH, 4, 16,
                             "VSYNC SCHED - non-blocking flip  ",
-                            180, 0, font);
+                            g_hud_bright, g_hud_dark, font);
             } else if (vsync_on) {
                 draw_str_2x(frame_buf, WIDTH, 4, 16,
                             "VSYNC ON  - tearing suppressed   ",
-                            200, 0, font);
+                            g_hud_bright, g_hud_dark, font);
             } else {
                 draw_str_2x(frame_buf, WIDTH, 4, 16,
                             "VSYNC OFF - watch for tear line! ",
-                            240, 0, font);
+                            g_hud_bright, g_hud_dark, font);
             }
 
             /* --- Present frame ------------------------------------------ */
@@ -2410,7 +2434,6 @@ int main(int argc, char *argv[])
     restore_mtrr();
     dpmi_unmap_physical(lfb);
     if (frame_buf) free(frame_buf);
-    free(g_dist);
     dpmi_free_dos();
 #ifdef __DJGPP__
     __djgpp_nearptr_disable();

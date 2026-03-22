@@ -6,14 +6,20 @@ LINK    = wlink
 CFLAGS  = -bt=dos -3r -ox -s -zq
 TARGET  = PLASMA
 
+OBJS    = $(TARGET).obj WAVE.obj
+
 all: $(TARGET).exe
 
-$(TARGET).obj: $(TARGET).C
+$(TARGET).obj: $(TARGET).C WAVE.H
 	$(CC) $(CFLAGS) $[@
 
-$(TARGET).exe: $(TARGET).obj
-	$(LINK) system dos4g name $(TARGET) file $(TARGET) option quiet
+WAVE.obj: WAVE.C WAVE.H
+	$(CC) $(CFLAGS) $[@
+
+$(TARGET).exe: $(OBJS)
+	$(LINK) system dos4g name $(TARGET) file $(TARGET),WAVE option quiet
 
 clean: .SYMBOLIC
 	del $(TARGET).obj
+	del WAVE.obj
 	del $(TARGET).exe
