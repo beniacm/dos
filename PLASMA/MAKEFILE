@@ -6,20 +6,24 @@ LINK    = wlink
 CFLAGS  = -bt=dos -3r -ox -s -zq
 TARGET  = PLASMA
 
-OBJS    = $(TARGET).obj WAVE.obj
+OBJS    = $(TARGET).obj VGA.obj WAVE.obj
 
 all: $(TARGET).exe
 
-$(TARGET).obj: $(TARGET).C WAVE.H
+$(TARGET).obj: $(TARGET).C VGA.H WAVE.H
+	$(CC) $(CFLAGS) $[@
+
+VGA.obj: VGA.C VGA.H
 	$(CC) $(CFLAGS) $[@
 
 WAVE.obj: WAVE.C WAVE.H
 	$(CC) $(CFLAGS) $[@
 
 $(TARGET).exe: $(OBJS)
-	$(LINK) system dos4g name $(TARGET) file $(TARGET),WAVE option quiet
+	$(LINK) system dos4g name $(TARGET) file $(TARGET),VGA,WAVE option quiet
 
 clean: .SYMBOLIC
 	del $(TARGET).obj
+	del VGA.obj
 	del WAVE.obj
 	del $(TARGET).exe

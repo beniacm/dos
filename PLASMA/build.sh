@@ -14,8 +14,9 @@ CFLAGS="-bt=dos -6r -ox -oh -on -zq"
 
 echo "Building PLASMA..."
 wcc386 $CFLAGS PLASMA.C
+wcc386 $CFLAGS VGA.C
 wcc386 $CFLAGS WAVE.C
-wlink system pmodew name PLASMA file PLASMA,WAVE option quiet
+wlink system pmodew name PLASMA file PLASMA,VGA,WAVE option quiet
 echo "Done: PLASMA.exe"
 
 echo "Building MTRRDIAG..."
