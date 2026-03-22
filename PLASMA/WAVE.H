@@ -5,10 +5,12 @@
  * height field.  Both the plasma colour demo and the water surface
  * demo build on this same wave engine.
  *
- * Tables (sine LUT + radial dx²) are initialised once via wave_init().
- * wave_fill_row() computes one scanline of the 4-wave sum as 16-bit
- * heights (range 0..765).  Callers choose their own time-parameter
- * speed scheme and output mapping (palette index, height field, etc.).
+ * Tables (sine LUT + radial dx² + cosine LUT + radial ddx) are
+ * initialised once via wave_init().
+ *
+ * wave_fill_row()      — height only (for plasma colour mapping)
+ * wave_fill_row_grad() — height + analytical x/y gradients (for
+ *                         water surface lighting without finite diffs)
  *
  * Pure C89 — compiles under DJGPP/GCC and OpenWatcom.
  */
@@ -19,10 +21,12 @@
 #define WAVE_HEIGHT  768
 
 /* Shared lookup tables — read-only after wave_init(). */
-extern unsigned char  wave_sintab[256];
-extern unsigned short wave_dx2[WAVE_WIDTH];
+extern unsigned char  wave_sintab[256];           /* 0..255 unsigned    */
+extern signed char    wave_costab[256];           /* -127..+127 signed  */
+extern unsigned short wave_dx2[WAVE_WIDTH];       /* radial distance²   */
+extern short          wave_ddx[WAVE_WIDTH];       /* d(dist)/dx × 256   */
 
-/* Initialise sine table and radial dx² table.  Call once at startup. */
+/* Initialise all tables.  Call once at startup. */
 void wave_init(void);
 
 /*
@@ -41,5 +45,20 @@ void wave_init(void);
 void wave_fill_row(short *row, int y,
                    unsigned int t1, unsigned int t2,
                    unsigned int t3, unsigned int t4);
+
+/*
+ * Fill one scanline with height AND analytical gradients.
+ *
+ *   row_h  — output: heights, WAVE_WIDTH shorts, range 0..765
+ *   row_nx — output: dh/dx,   WAVE_WIDTH shorts (signed)
+ *   row_ny — output: dh/dy,   WAVE_WIDTH shorts (signed)
+ *
+ * Gradients are computed via the chain rule from wave_costab[],
+ * eliminating the need for a multi-row ring buffer and finite
+ * difference stencil.
+ */
+void wave_fill_row_grad(short *row_h, short *row_nx, short *row_ny,
+                        int y, unsigned int t1, unsigned int t2,
+                        unsigned int t3, unsigned int t4);
 
 #endif /* WAVE_H */

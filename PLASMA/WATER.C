@@ -2,11 +2,15 @@
  * WATER.C — Water surface renderer: lit heightfield from plasma waves
  *
  * Uses the shared WAVE library for the underlying four-wave interference
- * pattern.  The height value itself provides the base palette index
- * (preserving the recognisable plasma pattern).  Finite differences
- * (stencil S=4) yield surface normals; a directional shade offset +
- * n^4 specular highlights create the illusion of a 3-D water surface
- * lit from the upper left.
+ * pattern.  wave_fill_row_grad() provides both the height AND the
+ * analytical x/y gradients (via cosine derivative + chain rule), so
+ * there is no need for a multi-row ring buffer or finite-difference
+ * stencil.
+ *
+ * The height value itself provides the base palette index (preserving
+ * the recognisable plasma pattern).  The analytical gradients yield
+ * surface normals; a directional shade offset + n^4 specular highlights
+ * create the illusion of a 3-D water surface lit from the upper left.
  *
  * Compiler paths:
  *   DJGPP/GCC + __SSE2__  — shading inner loop processes 4 pixels via
@@ -38,23 +42,23 @@ void water_init(void)
  *  Shading constants                                                        *
  * ======================================================================== */
 
-#define WATER_S     4
-#define WATER_ROWS  (2 * WATER_S + 1)
-#define WATER_SCALE 3
 #define WATER_FLAT  80
 
 /* ======================================================================== *
- *  Scalar shading fallback — pure C89, Watcom + DJGPP                     *
+ *  Scalar shading — pure C89, Watcom + DJGPP                               *
  *                                                                          *
  *  Uses the height value itself as the base palette index (preserving the  *
  *  plasma interference pattern), then shifts it with a directional shade   *
  *  offset and adds specular highlights for water sparkle.                  *
+ *                                                                          *
+ *  row_nx / row_ny are pre-computed analytical gradients from              *
+ *  wave_fill_row_grad() — no ring buffer or stencil needed.               *
  * ======================================================================== */
 
 static void shade_row_scalar(unsigned char *dst,
-                             const short *row_c,
-                             const short *row_u,
-                             const short *row_d,
+                             const short *row_h,
+                             const short *row_nx,
+                             const short *row_ny,
                              int width)
 {
     /* Light from upper-left at 45-degree elevation */
@@ -64,19 +68,14 @@ static void shade_row_scalar(unsigned char *dst,
     int x;
 
     for (x = 0; x < width; x++) {
-        int xl = x > WATER_S       ? x - WATER_S : 0;
-        int xr = x < width-WATER_S ? x + WATER_S : width - 1;
-        int base, nx, ny, dir, shade, dot_raw, rz, sp, idx;
+        int base, dir, shade, dot_raw, rz, sp, idx;
 
         /* Base brightness from height — keeps plasma pattern visible */
-        base = row_c[x] / 3;   /* 0..255 (height range 0..765) */
+        base = row_h[x] / 3;   /* 0..255 (height range 0..765) */
 
-        nx = (row_c[xl] - row_c[xr]) * WATER_SCALE;
-        ny = (row_u[x]  - row_d[x])  * WATER_SCALE;
-
-        /* Directional shade: dot(N_horizontal, L_horizontal) / 256 */
-        dir = nx * LX + ny * LY;
-        shade = dir / 256;
+        /* Directional shade from analytical gradient */
+        dir = (int)row_nx[x] * LX + (int)row_ny[x] * LY;
+        shade = dir / 512;
 
         /* Specular: Rz = 2 * dot_full / FLAT - LZ */
         dot_raw = dir + WATER_FLAT * LZ;
@@ -128,16 +127,24 @@ static __inline__ __m128i sse2_min_epi32(__m128i a, __m128i b)
     return _mm_or_si128(_mm_and_si128(gt, b), _mm_andnot_si128(gt, a));
 }
 
+/* Load 4 signed shorts and sign-extend to 4 signed ints (SSE2).
+ * Equivalent to SSE4.1's _mm_cvtepi16_epi32. */
+static __inline__ __m128i sse2_load4_s16_to_s32(const short *p)
+{
+    __m128i raw  = _mm_loadl_epi64((const __m128i *)p);
+    __m128i sign = _mm_srai_epi16(raw, 15);
+    return _mm_unpacklo_epi16(raw, sign);
+}
+
 static void shade_row_sse2(unsigned char *dst,
-                           const short *row_c,
-                           const short *row_u,
-                           const short *row_d,
+                           const short *row_h,
+                           const short *row_nx,
+                           const short *row_ny,
                            int width)
 {
     const __m128i vLX      = _mm_set1_epi32(-64);
     const __m128i vLY      = _mm_set1_epi32(-64);
     const __m128i vLZ      = _mm_set1_epi32(90);
-    const __m128i vSCALE   = _mm_set1_epi32(WATER_SCALE);
     const __m128i vDIV3    = _mm_set1_epi32(43691); /* /3 ≈ *43691 >> 17 */
     const __m128i vRCP     = _mm_set1_epi32(205);   /* /80 ≈ *205 >> 14  */
     const __m128i v2       = _mm_set1_epi32(2);
@@ -146,41 +153,24 @@ static void shade_row_sse2(unsigned char *dst,
     const __m128i vFLAT_LZ = _mm_set1_epi32(WATER_FLAT * 90);
     int x;
 
-    /* Process 4 pixels at a time; handle edges with scalar */
-    if (WATER_S > 0)
-        shade_row_scalar(dst, row_c, row_u, row_d, WATER_S);
-
-    for (x = WATER_S; x <= width - WATER_S - 4; x += 4) {
+    for (x = 0; x + 4 <= width; x += 4) {
         __m128i vnx, vny, vdir, vshade, vbase;
         __m128i vdot_raw, vrz, vsp, vidx, vout;
 
-        /* Gather base height values: row_c[x] / 3 */
-        vbase = _mm_set_epi32(row_c[x+3], row_c[x+2],
-                              row_c[x+1], row_c[x+0]);
+        /* Load 4 heights and divide by 3 */
+        vbase = sse2_load4_s16_to_s32(row_h + x);
         vbase = _mm_srai_epi32(sse2_mullo_epi32(vbase, vDIV3), 17);
 
-        /* Gather 4 nx values: (row_c[x-S] - row_c[x+S]) * SCALE */
-        vnx = _mm_set_epi32(
-            row_c[x+3-WATER_S] - row_c[x+3+WATER_S],
-            row_c[x+2-WATER_S] - row_c[x+2+WATER_S],
-            row_c[x+1-WATER_S] - row_c[x+1+WATER_S],
-            row_c[x+0-WATER_S] - row_c[x+0+WATER_S]);
-        vnx = sse2_mullo_epi32(vnx, vSCALE);
-
-        /* Gather 4 ny values: (row_u[x] - row_d[x]) * SCALE */
-        vny = _mm_set_epi32(
-            row_u[x+3] - row_d[x+3],
-            row_u[x+2] - row_d[x+2],
-            row_u[x+1] - row_d[x+1],
-            row_u[x+0] - row_d[x+0]);
-        vny = sse2_mullo_epi32(vny, vSCALE);
+        /* Load 4 analytical nx and ny */
+        vnx = sse2_load4_s16_to_s32(row_nx + x);
+        vny = sse2_load4_s16_to_s32(row_ny + x);
 
         /* dir = nx*LX + ny*LY (directional component only) */
         vdir = _mm_add_epi32(sse2_mullo_epi32(vnx, vLX),
                              sse2_mullo_epi32(vny, vLY));
 
-        /* shade = dir / 256 (arithmetic shift) */
-        vshade = _mm_srai_epi32(vdir, 8);
+        /* shade = dir / 512 (arithmetic shift right by 9) */
+        vshade = _mm_srai_epi32(vdir, 9);
 
         /* Specular: dot_raw = dir + FLAT*LZ, rz = 2*dot_raw/FLAT - LZ */
         vdot_raw = _mm_add_epi32(vdir, vFLAT_LZ);
@@ -210,7 +200,7 @@ static void shade_row_sse2(unsigned char *dst,
 
     /* Handle remaining pixels with scalar */
     if (x < width)
-        shade_row_scalar(dst + x, row_c + x, row_u + x, row_d + x,
+        shade_row_scalar(dst + x, row_h + x, row_nx + x, row_ny + x,
                          width - x);
 }
 
@@ -230,36 +220,20 @@ void water_render(unsigned char *buf, int pitch, unsigned int t)
     unsigned int t3 = (t * 7 + 151)   & 0xFF;
     unsigned int t4 = (t * 11 + 53)   & 0xFF;
 
-    short hring[WATER_ROWS][WATER_WIDTH];
-    int   ring_base = 0;
-
-    /* Pre-fill ring buffer */
-    for (y = 0; y < WATER_ROWS; y++) {
-        int sy = y - WATER_S;
-        if (sy < 0) sy = 0;
-        wave_fill_row(hring[y], sy, t1, t2, t3, t4);
-    }
+    short hrow[WATER_WIDTH];
+    short nxrow[WATER_WIDTH];
+    short nyrow[WATER_WIDTH];
 
     for (y = 0; y < WATER_HEIGHT; y++) {
         unsigned char *dst = buf + (unsigned long)y * pitch;
-        int ri_c = (y - ring_base + WATER_S) % WATER_ROWS;
-        int ri_u = (ri_c - WATER_S + WATER_ROWS) % WATER_ROWS;
-        int ri_d = (ri_c + WATER_S) % WATER_ROWS;
+
+        wave_fill_row_grad(hrow, nxrow, nyrow, y, t1, t2, t3, t4);
 
 #if WATER_USE_SSE2
-        shade_row_sse2(dst, hring[ri_c], hring[ri_u], hring[ri_d],
-                       WATER_WIDTH);
+        shade_row_sse2(dst, hrow, nxrow, nyrow, WATER_WIDTH);
 #else
-        shade_row_scalar(dst, hring[ri_c], hring[ri_u], hring[ri_d],
-                         WATER_WIDTH);
+        shade_row_scalar(dst, hrow, nxrow, nyrow, WATER_WIDTH);
 #endif
-
-        /* Advance ring buffer */
-        if (y + WATER_S + 1 < WATER_HEIGHT) {
-            int slot = (y - ring_base) % WATER_ROWS;
-            wave_fill_row(hring[slot], y + WATER_S + 1,
-                      t1, t2, t3, t4);
-        }
     }
 }
 
