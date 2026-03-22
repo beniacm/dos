@@ -1,16 +1,15 @@
-# PLASMA - 8bpp VESA Plasma Demo with VSync
+# PLASMA + WATERDRP - 8bpp VESA Demos
 # OpenWatcom 2.0 wmake build file
 
 CC      = wcc386
 LINK    = wlink
 CFLAGS  = -bt=dos -3r -ox -s -zq
-TARGET  = PLASMA
 
-OBJS    = $(TARGET).obj VGA.obj WAVE.obj
+all: PLASMA.exe WATERDRP.exe
 
-all: $(TARGET).exe
+# --- PLASMA ---
 
-$(TARGET).obj: $(TARGET).C VGA.H WAVE.H
+PLASMA.obj: PLASMA.C VGA.H WAVE.H
 	$(CC) $(CFLAGS) $[@
 
 VGA.obj: VGA.C VGA.H
@@ -19,11 +18,18 @@ VGA.obj: VGA.C VGA.H
 WAVE.obj: WAVE.C WAVE.H
 	$(CC) $(CFLAGS) $[@
 
-$(TARGET).exe: $(OBJS)
-	$(LINK) system dos4g name $(TARGET) file $(TARGET),VGA,WAVE option quiet
+PLASMA.exe: PLASMA.obj VGA.obj WAVE.obj
+	$(LINK) system dos4g name PLASMA file PLASMA,VGA,WAVE option quiet
+
+# --- WATERDRP ---
+
+WATERDRP.obj: WATERDRP.C VGA.H
+	$(CC) $(CFLAGS) $[@
+
+WATERDRP.exe: WATERDRP.obj VGA.obj
+	$(LINK) system dos4g name WATERDRP file WATERDRP,VGA option quiet
 
 clean: .SYMBOLIC
-	del $(TARGET).obj
-	del VGA.obj
-	del WAVE.obj
-	del $(TARGET).exe
+	del *.obj
+	del PLASMA.exe
+	del WATERDRP.exe

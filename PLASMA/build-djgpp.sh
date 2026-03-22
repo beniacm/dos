@@ -47,7 +47,18 @@ echo "Stripping..."
 $STRIP $OUT
 
 ls -la $OUT
-echo "Done: $OUT (uses CWSDPR0.EXE for ring-0 access)"
+echo "Done: $OUT"
+
+# --- WATERDRP ---
+WOUT=WDRPGCC.EXE
+echo ""
+echo "Building WATERDRP (water drop ripple demo)..."
+$CC $CFLAGS -o $WOUT WATERDRP.C VGA.C -lm
+$STUBEDIT $WOUT dpmi=CWSDPR0
+$STRIP $WOUT
+ls -la $WOUT
+echo "Done: $WOUT"
+
 echo ""
 echo "Requires CWSDPR0.EXE in the same directory or PATH."
 echo ""

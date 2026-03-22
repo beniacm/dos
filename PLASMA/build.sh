@@ -19,6 +19,11 @@ wcc386 $CFLAGS WAVE.C
 wlink system pmodew name PLASMA file PLASMA,VGA,WAVE option quiet
 echo "Done: PLASMA.exe"
 
+echo "Building WATERDRP..."
+wcc386 $CFLAGS WATERDRP.C
+wlink system pmodew name WATERDRP file WATERDRP,VGA option quiet
+echo "Done: WATERDRP.exe"
+
 echo "Building MTRRDIAG..."
 wcc386 $CFLAGS MTRRDIAG.C
 wlink system pmodew name MTRRDIAG file MTRRDIAG option quiet
