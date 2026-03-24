@@ -167,7 +167,8 @@ typedef struct {
 #define R_CLR_CMP_CNTL            0x15C0
 #define R_CLR_CMP_CLR_SRC         0x15C4
 #define R_CLR_CMP_MASK            0x15CC
-#define   CLR_CMP_FCN_NE          5UL           /* draw when src != key */
+#define   CLR_CMP_FCN_EQ          4UL           /* FCN=4: draw when src == key */
+#define   CLR_CMP_FCN_NE          5UL           /* FCN=5: draw when src != key */
 #define   CLR_CMP_SRC_SOURCE      (1UL << 24)   /* compare source pixels */
 
 /* AVIVO display controller registers (R500/RV515)
@@ -921,7 +922,9 @@ static void gpu_init_2d(void)
 
 /* Detect whether AVIVO D1GRPH controls the display.
    Reads D1GRPH_PRIMARY_SURFACE_ADDRESS after VBE mode set:
-   if it contains our FB base (VRAM range), AVIVO is active.
+   if it contains our FB base (VRAM range), AVIVO may be usable.
+   Also checks D1VGA_CONTROL — when VGA mode is active, D1GRPH
+   registers are ignored for scanout and AVIVO page flip has no effect.
    Matches the verification approach used by PLASMA.C -hwflip. */
 static void detect_flip_mode(void)
 {
@@ -929,13 +932,40 @@ static void detect_flip_mode(void)
     unsigned long d1vga   = rreg(R_D1VGA_CONTROL);
     unsigned long d1crtc  = rreg(R_D1CRTC_CONTROL);
 
+    g_avivo_flip = 0;  /* default: VGA path (safe fallback) */
+
     /* Primary check: does D1GRPH surface addr match our VRAM aperture?
        After ATOMBIOS VBE mode set, it should contain g_fb_location. */
-    if ((cur_surf & 0xFFF00000UL) == (g_fb_location & 0xFFF00000UL)) {
+    if ((cur_surf & 0xFFF00000UL) != (g_fb_location & 0xFFF00000UL))
+        return;  /* D1GRPH not configured for our FB — VGA path */
+
+    /* D1GRPH matches our FB.  Check if VGA mode is generating scanout.
+       When D1VGA_MODE_ENABLE is set, the VGA block drives the display
+       and D1GRPH surface address writes are ignored by the CRTC.
+       ATOMBIOS typically leaves VGA mode enabled after VBE mode set. */
+    if (!(d1vga & D1VGA_MODE_ENABLE)) {
+        /* VGA already disabled — AVIVO D1GRPH is active */
         g_avivo_flip = 1;
-    } else {
-        g_avivo_flip = 0;
+        return;
     }
+
+    /* VGA mode is active.  ATOMBIOS configured D1GRPH registers during
+       mode set, so we can transition to AVIVO scanout by disabling VGA.
+       This enables hardware page flipping for tear-free animation.
+       (Mirrors Linux radeon driver behaviour after mode set.) */
+    wreg(R_D1VGA_CONTROL, d1vga & ~D1VGA_MODE_ENABLE);
+
+    /* Also update D1GRPH_PITCH to match our (possibly aligned) pitch */
+    wreg(R_D1GRPH_PITCH, (unsigned long)g_pitch);
+
+    /* Brief spin to let the display controller pick up new state */
+    { volatile int d; for (d = 0; d < 50000; d++) {} }
+
+    /* Verify VGA was actually disabled */
+    if (!(rreg(R_D1VGA_CONTROL) & D1VGA_MODE_ENABLE)) {
+        g_avivo_flip = 1;
+    }
+    /* If still VGA, g_avivo_flip stays 0 → VGA vsync fallback */
 }
 
 /* AVIVO hardware page flip (kernel-style lock→write→wait→unlock).
@@ -1535,6 +1565,10 @@ static void demo_blit(void)
     gpu_fill(0, 0, g_xres, g_yres * 2, 0);
     gpu_wait_idle();
 
+    /* Ensure color compare is disabled (previous demo may leave state) */
+    gpu_wait_fifo(1);
+    wreg(R_CLR_CMP_CNTL, 0);
+
     bx = 0; by = 0; dx = 3; dy = 2;
     back_page = 1;
     fps_count = 0;
@@ -1824,6 +1858,10 @@ static void demo_parallax(void)
     gpu_fill(0, 0, g_xres, g_yres * 2, 0);
     gpu_wait_idle();
 
+    /* Reset color compare to clean state before keyed blits */
+    gpu_wait_fifo(1);
+    wreg(R_CLR_CMP_CNTL, 0);
+
     back_page = 1;
     scroll    = 0;
     fps_count = 0;
@@ -2047,6 +2085,18 @@ int main(void)
     }
     printf("  Mode 0x%03X: %dx%d pitch=%d  LFB=0x%08lX\n",
            g_vmode, g_xres, g_yres, g_pitch, g_lfb_phys);
+
+    /* Align pitch to 64 bytes — the Radeon 2D engine PITCH_OFFSET register
+       encodes pitch in 64-byte units. A non-aligned VBE pitch (e.g. 800)
+       causes GPU operations to use a different stride than the CRTC/CPU,
+       producing sheared/shredded rendering on all GPU blits. */
+    if (g_pitch & 63) {
+        int old_pitch = g_pitch;
+        g_pitch = (g_pitch + 63) & ~63;
+        printf("  Pitch aligned: %d -> %d (64-byte GPU requirement)\n",
+               old_pitch, g_pitch);
+    }
+
     {
         unsigned long pitch64 = ((unsigned long)g_pitch + 63) / 64;
         unsigned long po = (pitch64 << 22) |
@@ -2085,6 +2135,15 @@ int main(void)
     setup_palette();
     gpu_init_2d();
     detect_flip_mode();
+
+    /* If using VGA scanout (not AVIVO) and pitch was aligned, update
+       the VGA CRTC offset register so display pitch matches GPU pitch.
+       CRTC offset (CR13) = pitch / 8 in 256-color byte-mode. */
+    if (!g_avivo_flip && (g_pitch != g_xres)) {
+        unsigned char cr_val = (unsigned char)(g_pitch / 8);
+        outp(0x3D4, 0x13);
+        outp(0x3D5, cr_val);
+    }
 
     /* Verify GPU 2D engine: read back PITCH_OFFSET and do a test fill */
     {
@@ -2145,6 +2204,11 @@ int main(void)
             setup_palette();
             gpu_init_2d();
             detect_flip_mode();
+            if (!g_avivo_flip && (g_pitch != g_xres)) {
+                unsigned char cr_val = (unsigned char)(g_pitch / 8);
+                outp(0x3D4, 0x13);
+                outp(0x3D5, cr_val);
+            }
         }
     }
 
