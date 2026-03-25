@@ -3464,17 +3464,14 @@ int main(void)
         return 1;
     }
 
-    /* Compute page stride: round up so stride*pitch is 4KB-aligned */
-    {
-        unsigned long page_bytes;
-        g_page_stride = g_yres;
-        page_bytes = (unsigned long)g_page_stride * g_pitch;
-        if (page_bytes & 4095UL) {
-            g_page_stride = (int)((page_bytes + 4095UL) & ~4095UL) / g_pitch;
-            if ((unsigned long)g_page_stride * g_pitch & 4095UL)
-                g_page_stride = ((g_page_stride + 7) & ~7);
-        }
-    }
+    /* Compute page stride: smallest row count >= g_yres where
+       stride * pitch is 4KB-aligned.  Same algorithm as RADEON.C.
+       Required because PITCH_OFFSET encodes addresses in 1KB units
+       (bits [21:0] = byte_addr >> 10), so page boundaries must be
+       at least 1KB-aligned (4KB gives us flip alignment too). */
+    g_page_stride = g_yres;
+    while (((long)g_page_stride * g_pitch) & 4095L)
+        g_page_stride++;
 
     /* Map LFB — 4 pages for offscreen PITCH_OFFSET tests */
     lfb_sz = (unsigned long)g_pitch * g_page_stride * 4;
