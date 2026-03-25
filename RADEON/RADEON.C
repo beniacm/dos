@@ -1514,12 +1514,26 @@ static void demo_pattern(void)
     gpu_wait_idle();
 }
 
+/* Wait for next BIOS tick edge — gives precise timing start.
+   DOS clock() ticks at 18.2 Hz (~55ms); syncing to the edge
+   eliminates ±1 tick jitter that causes random 0ms readings. */
+static clock_t tick_sync(void)
+{
+    clock_t c = clock();
+    while (clock() == c) {}
+    return clock();
+}
+
+/* Minimum ticks a GPU benchmark must run to be reliable.
+   8 ticks ≈ 440ms at 18.2Hz → ±1 tick error < 13%. */
+#define BENCH_MIN_TICKS  8
+
 /* CPU vs GPU fill benchmark */
 static void demo_benchmark(void)
 {
     clock_t t0, t1;
     double cpu_ms, gpu_ms, rect_ms, rect_ms2;
-    int iters = 100;
+    int iters, gpu_iters;
     long rect_iters, rect_iters2;
     int i;
     unsigned char col;
@@ -1529,7 +1543,8 @@ static void demo_benchmark(void)
     gpu_fill(0, 0, g_xres, g_yres, 0);
     gpu_wait_idle();
 
-    /* --- CPU benchmark --- */
+    /* --- CPU benchmark (100 fills, ~1.8s, no sync needed) --- */
+    iters = 100;
     t0 = clock();
     for (i = 0; i < iters; i++) {
         int y;
@@ -1540,17 +1555,21 @@ static void demo_benchmark(void)
     t1 = clock();
     cpu_ms = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC;
 
-    /* --- GPU full-screen fill benchmark --- */
+    /* --- GPU full-screen fill benchmark (adaptive) --- */
     gpu_fill(0, 0, g_xres, g_yres, 0);
     gpu_wait_idle();
 
-    t0 = clock();
-    for (i = 0; i < iters; i++) {
-        col = (unsigned char)(i & 0xFF);
-        gpu_fill(0, 0, g_xres, g_yres, col);
-    }
-    gpu_wait_idle();
-    t1 = clock();
+    gpu_iters = 0;
+    t0 = tick_sync();
+    do {
+        for (i = 0; i < 100; i++) {
+            col = (unsigned char)((gpu_iters + i) & 0xFF);
+            gpu_fill(0, 0, g_xres, g_yres, col);
+        }
+        gpu_wait_idle();
+        gpu_iters += 100;
+        t1 = clock();
+    } while (t1 - t0 < BENCH_MIN_TICKS);
     gpu_ms = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC;
 
     /* --- GPU small-rect throughput benchmark (fast path) --- */
@@ -1564,11 +1583,12 @@ static void demo_benchmark(void)
         gpu_fill(0, 0, g_xres, g_yres, 0);
         gpu_wait_idle();
 
-        /* 3-reg path (color + pos + size per rect) */
+        /* 3-reg path (color + pos + size per rect) — adaptive */
         gpu_fill_setup();
         rect_iters = 0;
-        t0 = clock();
-        for (pass = 0; pass < 200; pass++) {
+        pass = 0;
+        t0 = tick_sync();
+        do {
             int rx, ry;
             col = (unsigned char)(pass & 0xFF);
             for (ry = 0; ry < rows; ry++)
@@ -1576,7 +1596,13 @@ static void demo_benchmark(void)
                     gpu_fill_fast(rx * rw, ry * rh, rw, rh,
                                   (unsigned char)(col + rx + ry));
             rect_iters += total_rects;
-        }
+            pass++;
+            if ((pass & 63) == 0) {
+                gpu_wait_idle();
+                t1 = clock();
+                if (t1 - t0 >= BENCH_MIN_TICKS) break;
+            }
+        } while (1);
         gpu_wait_idle();
         t1 = clock();
         rect_ms = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC;
@@ -1585,14 +1611,21 @@ static void demo_benchmark(void)
         gpu_fill_setup();
         gpu_fill_set_color(0x55);
         rect_iters2 = 0;
-        t0 = clock();
-        for (pass = 0; pass < 200; pass++) {
+        pass = 0;
+        t0 = tick_sync();
+        do {
             int rx, ry;
             for (ry = 0; ry < rows; ry++)
                 for (rx = 0; rx < cols; rx++)
                     gpu_fill_rect(rx * rw, ry * rh, rw, rh);
             rect_iters2 += total_rects;
-        }
+            pass++;
+            if ((pass & 63) == 0) {
+                gpu_wait_idle();
+                t1 = clock();
+                if (t1 - t0 >= BENCH_MIN_TICKS) break;
+            }
+        } while (1);
         gpu_wait_idle();
         t1 = clock();
         rect_ms2 = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC;
@@ -1603,10 +1636,12 @@ static void demo_benchmark(void)
     gpu_wait_idle();
 
     {
-        double total = (double)g_xres * g_yres * iters / (1024.0*1024.0);
-        double cpu_rate = (cpu_ms > 0) ? total / (cpu_ms/1000.0) : 0;
-        double gpu_rate = (gpu_ms > 0) ? total / (gpu_ms/1000.0) : 0;
-        double speedup  = (gpu_ms > 0) ? cpu_ms / gpu_ms : 0;
+        double cpu_total = (double)g_xres * g_yres * iters / (1024.0*1024.0);
+        double gpu_total = (double)g_xres * g_yres * gpu_iters / (1024.0*1024.0);
+        double cpu_rate = (cpu_ms > 0) ? cpu_total / (cpu_ms/1000.0) : 0;
+        double gpu_rate = (gpu_ms > 0) ? gpu_total / (gpu_ms/1000.0) : 0;
+        double speedup  = (cpu_ms > 0 && gpu_ms > 0)
+                        ? (cpu_ms / iters) / (gpu_ms / gpu_iters) : 0;
         double rps3     = (rect_ms > 0) ? (double)rect_iters / (rect_ms / 1000.0) : 0;
         double rpix3    = (rect_ms > 0) ? (double)rect_iters * 32 * 32 /
                           (rect_ms / 1000.0) / 1000000.0 : 0;
@@ -1616,14 +1651,16 @@ static void demo_benchmark(void)
 
         cpu_str_c(10, "=== CPU vs GPU Fill Benchmark ===", 255, 2);
 
-        sprintf(buf, "%d x full-screen fill (%dx%d, 8bpp)", iters, g_xres, g_yres);
+        sprintf(buf, "full-screen fill (%dx%d, 8bpp)", g_xres, g_yres);
         cpu_str_c(40, buf, 253, 1);
 
-        sprintf(buf, "CPU: %7.1f ms  (%5.1f MB/s)", cpu_ms, cpu_rate);
-        cpu_str(40, 70, buf, 251, 2);
+        sprintf(buf, "CPU: %7.1f ms / %d fills  (%5.1f MB/s)",
+                cpu_ms, iters, cpu_rate);
+        cpu_str(20, 70, buf, 251, 2);
 
-        sprintf(buf, "GPU: %7.1f ms  (%5.1f MB/s)", gpu_ms, gpu_rate);
-        cpu_str(40, 100, buf, 250, 2);
+        sprintf(buf, "GPU: %7.1f ms / %d fills  (%5.1f MB/s)",
+                gpu_ms, gpu_iters, gpu_rate);
+        cpu_str(20, 100, buf, 250, 2);
 
         if (gpu_ms > 0) {
             sprintf(buf, "GPU speedup: %.1fx", speedup);
@@ -1638,16 +1675,18 @@ static void demo_benchmark(void)
         sprintf(buf, "32x32 (2-reg): %6.0f Krect/s  %5.0f Mpix/s", rps2/1000.0, rpix2);
         cpu_str_c(200, buf, 254, 1);
 
-        /* Draw bar chart */
+        /* Draw bar chart (normalized to per-fill time) */
         {
             int bar_max = g_xres - 100;
             int cpu_bar, gpu_bar, bar_y;
-            double mx = cpu_ms;
-            if (gpu_ms > mx) mx = gpu_ms;
+            double cpu_per = (iters > 0) ? cpu_ms / iters : 0;
+            double gpu_per = (gpu_iters > 0) ? gpu_ms / gpu_iters : 0;
+            double mx = cpu_per;
+            if (gpu_per > mx) mx = gpu_per;
             if (mx <= 0) mx = 1;
 
-            cpu_bar = (int)(cpu_ms / mx * bar_max);
-            gpu_bar = (int)(gpu_ms / mx * bar_max);
+            cpu_bar = (int)(cpu_per / mx * bar_max);
+            gpu_bar = (int)(gpu_per / mx * bar_max);
             if (cpu_bar < 1) cpu_bar = 1;
             if (gpu_bar < 1) gpu_bar = 1;
 
