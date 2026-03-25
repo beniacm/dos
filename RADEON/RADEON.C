@@ -1283,6 +1283,27 @@ static void gpu_fill_set_color(unsigned char color)
     wreg(R_DP_BRUSH_FRGD_CLR, (unsigned long)color);
 }
 
+/* ---- Batched FIFO access for peak rect throughput ---- */
+
+/* FIFO depth for batching: 32 rects × 2 regs = 64 entries.
+   We wait once for 64 entries, then blast 32 rects directly. */
+#define FILL_BATCH  32
+
+/* Inlined register write indices for tight loops */
+#define MMIO_DST_Y_X          (R_DST_Y_X >> 2)
+#define MMIO_DST_HEIGHT_WIDTH  (R_DST_HEIGHT_WIDTH >> 2)
+#define MMIO_DP_BRUSH_FRGD_CLR (R_DP_BRUSH_FRGD_CLR >> 2)
+
+/* Fast XOR-shift PRNG — no modulo needed for power-of-2 masks */
+static unsigned long g_xor_state = 2463534242UL;
+static unsigned long xorshift(void)
+{
+    g_xor_state ^= g_xor_state << 13;
+    g_xor_state ^= g_xor_state >> 17;
+    g_xor_state ^= g_xor_state << 5;
+    return g_xor_state;
+}
+
 /* Hardware-accelerated screen-to-screen blit */
 static void gpu_blit(int sx, int sy, int dx, int dy, int w, int h)
 {
@@ -1566,12 +1587,12 @@ static void demo_pattern(void)
 static void demo_benchmark(void)
 {
     unsigned long t0lo, t0hi, t1lo, t1hi;
-    double cpu_ms, gpu_ms, rect_ms, rect_ms2;
+    double cpu_ms, gpu_ms, rect_ms, rect_ms2, rect_ms3;
     int iters = 100;
-    long rect_iters, rect_iters2;
+    long rect_iters, rect_iters2, rect_iters3;
     int i;
     unsigned char col;
-    char buf[80];
+    char buf[120];
 
     /* Warm up */
     gpu_fill(0, 0, g_xres, g_yres, 0);
@@ -1644,6 +1665,38 @@ static void demo_benchmark(void)
         gpu_wait_idle();
         rdtsc_read(&t1lo, &t1hi);
         rect_ms2 = tsc_to_ms(t1lo, t1hi, t0lo, t0hi);
+
+        /* Batched 2-reg path — one FIFO check per 32 rects, direct MMIO */
+        gpu_fill_setup();
+        gpu_fill_set_color(0xAA);
+        rect_iters3 = 0;
+        {
+            unsigned long hw_packed = ((unsigned long)rh << 16) | (unsigned long)rw;
+
+            rdtsc_read(&t0lo, &t0hi);
+            for (pass = 0; pass < 200; pass++) {
+                int rx, ry, pending;
+                pending = 0;
+                for (ry = 0; ry < rows; ry++) {
+                    for (rx = 0; rx < cols; rx++) {
+                        if (pending == 0)
+                            gpu_wait_fifo(FILL_BATCH * 2);
+                        g_mmio[MMIO_DST_Y_X] =
+                            ((unsigned long)(ry * rh) << 16) | (unsigned long)(rx * rw);
+                        g_mmio[MMIO_DST_HEIGHT_WIDTH] = hw_packed;
+                        if (++pending >= FILL_BATCH) {
+                            g_fifo_free = 0;
+                            pending = 0;
+                        }
+                    }
+                }
+                g_fifo_free = 0;
+                rect_iters3 += total_rects;
+            }
+            gpu_wait_idle();
+            rdtsc_read(&t1lo, &t1hi);
+            rect_ms3 = tsc_to_ms(t1lo, t1hi, t0lo, t0hi);
+        }
     }
 
     /* Display results */
@@ -1661,30 +1714,40 @@ static void demo_benchmark(void)
         double rps2     = (rect_ms2 > 0) ? (double)rect_iters2 / (rect_ms2 / 1000.0) : 0;
         double rpix2    = (rect_ms2 > 0) ? (double)rect_iters2 * 32 * 32 /
                           (rect_ms2 / 1000.0) / 1000000.0 : 0;
+        double rpsB     = (rect_ms3 > 0) ? (double)rect_iters3 / (rect_ms3 / 1000.0) : 0;
+        double rpixB    = (rect_ms3 > 0) ? (double)rect_iters3 * 32 * 32 /
+                          (rect_ms3 / 1000.0) / 1000000.0 : 0;
 
         cpu_str_c(10, "=== CPU vs GPU Fill Benchmark ===", 255, 2);
 
         sprintf(buf, "%d x full-screen fill (%dx%d, 8bpp)", iters, g_xres, g_yres);
-        cpu_str_c(40, buf, 253, 1);
+        cpu_str_c(36, buf, 253, 1);
 
         sprintf(buf, "CPU: %7.1f ms  (%5.1f MB/s)", cpu_ms, cpu_rate);
-        cpu_str(40, 70, buf, 251, 2);
+        cpu_str(40, 60, buf, 251, 2);
 
         sprintf(buf, "GPU: %7.1f ms  (%5.1f MB/s)", gpu_ms, gpu_rate);
-        cpu_str(40, 100, buf, 250, 2);
+        cpu_str(40, 86, buf, 250, 2);
 
         if (gpu_ms > 0) {
             sprintf(buf, "GPU speedup: %.1fx", speedup);
-            cpu_str_c(150, buf, 254, 3);
+            cpu_str_c(128, buf, 254, 3);
         }
 
         /* Small rect throughput — 3 regs (color varies) */
-        sprintf(buf, "32x32 (3-reg): %6.0f Krect/s  %5.0f Mpix/s", rps3/1000.0, rpix3);
-        cpu_str_c(180, buf, 250, 1);
+        sprintf(buf, "32x32 (3-reg):    %6.0f Krect/s  %5.0f Mpix/s",
+                rps3/1000.0, rpix3);
+        cpu_str(20, 166, buf, 250, 1);
 
-        /* 2-reg same-color peak throughput */
-        sprintf(buf, "32x32 (2-reg): %6.0f Krect/s  %5.0f Mpix/s", rps2/1000.0, rpix2);
-        cpu_str_c(200, buf, 254, 1);
+        /* 2-reg same-color */
+        sprintf(buf, "32x32 (2-reg):    %6.0f Krect/s  %5.0f Mpix/s",
+                rps2/1000.0, rpix2);
+        cpu_str(20, 186, buf, 254, 1);
+
+        /* Batched 2-reg (peak) */
+        sprintf(buf, "32x32 (batch-32): %6.0f Krect/s  %5.0f Mpix/s",
+                rpsB/1000.0, rpixB);
+        cpu_str(20, 206, buf, 255, 1);
 
         /* Draw bar chart */
         {
@@ -1716,56 +1779,77 @@ static void demo_benchmark(void)
 }
 
 /* Animated random GPU rectangles with throughput counter.
-   Uses fast fill path (3 regs per rect) + FIFO tracking for max throughput. */
+   Uses batched FIFO + XOR-shift PRNG for maximum throughput. */
 static void demo_flood(void)
 {
-    clock_t t0, last_upd;
+    unsigned long t0lo, t0hi, now_lo, now_hi;
     long count = 0, fps_count = 0;
     long long total_pixels = 0;
     char buf[80];
     int ch, loop_count = 0;
+    int pending;
 
     gpu_fill(0, 0, g_xres, g_yres, 0);
     gpu_wait_idle();
 
     cpu_str_c(4, "GPU Rectangle Flood - press any key to stop", 255, 1);
 
-    srand((unsigned int)(*(volatile unsigned long *)0x46CUL));
-    t0 = clock();
-    last_upd = t0;
+    g_xor_state = *(volatile unsigned long *)0x46CUL;
+    if (g_xor_state == 0) g_xor_state = 1;
+    rdtsc_read(&t0lo, &t0hi);
 
     /* Set up 2D engine for batch fills (invariant regs written once) */
     gpu_fill_setup();
+    pending = 0;
 
     while (1) {
-        int rx = rand() % g_xres;
-        int ry = rand() % g_yres + 14;
-        int rw = rand() % (g_xres / 4) + 4;
-        int rh = rand() % (g_yres / 4) + 4;
-        unsigned char rc = (unsigned char)(rand() & 0xFF);
+        unsigned long rnd;
+        int rx, ry, rw, rh;
+        unsigned char rc;
+
+        rnd = xorshift();
+        rx = (int)(rnd & 0x3FF) % g_xres;
+        ry = (int)((rnd >> 10) & 0x3FF) % g_yres + 14;
+        rnd = xorshift();
+        rw = (int)(rnd & 0xFF) + 4;
+        rh = (int)((rnd >> 8) & 0xFF) + 4;
+        rc = (unsigned char)(rnd >> 16);
 
         if (rx + rw > g_xres) rw = g_xres - rx;
         if (ry + rh > g_yres) rh = g_yres - ry;
         if (rw < 1 || rh < 1) continue;
 
-        gpu_fill_fast(rx, ry, rw, rh, rc);
+        /* Batched FIFO: check once per 21 rects (21×3 = 63 entries) */
+        if (pending == 0)
+            gpu_wait_fifo(63);
+        g_mmio[MMIO_DP_BRUSH_FRGD_CLR] = (unsigned long)rc;
+        g_mmio[MMIO_DST_Y_X] = ((unsigned long)ry << 16) | (unsigned long)rx;
+        g_mmio[MMIO_DST_HEIGHT_WIDTH] = ((unsigned long)rh << 16) | (unsigned long)rw;
+        if (++pending >= 21) {
+            g_fifo_free = 0;
+            pending = 0;
+        }
+
         count++;
         fps_count++;
         total_pixels += (long long)rw * rh;
 
-        /* Check keyboard less frequently (every 64 rects) */
-        if (++loop_count >= 64) {
+        /* Check keyboard less frequently (every 128 rects) */
+        if (++loop_count >= 128) {
             loop_count = 0;
             if (kbhit()) break;
         }
 
-        /* Update counter every ~4000 rects (reduces stall overhead) */
-        if (fps_count >= 4000) {
-            clock_t now = clock();
-            double elapsed = (double)(now - last_upd) / CLOCKS_PER_SEC;
+        /* Update counter every ~8000 rects */
+        if (fps_count >= 8000) {
+            double elapsed;
             double rps, mpps;
+            g_fifo_free = 0;
+            pending = 0;
+            rdtsc_read(&now_lo, &now_hi);
+            elapsed = tsc_to_ms(now_lo, now_hi, t0lo, t0hi) / 1000.0;
             if (elapsed <= 0) elapsed = 0.001;
-            rps = fps_count / elapsed;
+            rps = count / elapsed;
             mpps = (double)total_pixels / elapsed / 1000000.0;
 
             gpu_wait_idle();
@@ -1777,18 +1861,20 @@ static void demo_flood(void)
 
             /* Re-setup fast fill state after gpu_fill in header clear */
             gpu_fill_setup();
+            pending = 0;
 
             fps_count = 0;
-            total_pixels = 0;
-            last_upd = now;
         }
     }
     ch = getch();
     (void)ch;
+    g_fifo_free = 0;
 
     gpu_wait_idle();
     {
-        double total_sec = (double)(clock() - t0) / CLOCKS_PER_SEC;
+        double total_sec;
+        rdtsc_read(&now_lo, &now_hi);
+        total_sec = tsc_to_ms(now_lo, now_hi, t0lo, t0hi) / 1000.0;
         if (total_sec <= 0) total_sec = 0.001;
         gpu_fill(0, 0, g_xres, g_yres, 0);
         gpu_wait_idle();
