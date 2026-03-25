@@ -302,6 +302,7 @@ static unsigned char *g_lfb       = NULL;          /* LFB pointer   */
 static unsigned long  g_lfb_phys  = 0;
 static unsigned long  g_fb_location = 0;   /* GPU internal FB base address */
 static int g_xres, g_yres, g_pitch;
+static int g_page_stride;  /* rows per page, chosen so stride*pitch is 4KB-aligned */
 static unsigned short g_vmode;
 static unsigned char *g_font = NULL;
 static int g_fifo_free = 0;  /* tracked free FIFO entries (avoids MMIO reads) */
@@ -889,10 +890,22 @@ static void gpu_init_2d(void)
     pitch64 = ((unsigned long)g_pitch + 63) / 64;
     pitch_offset = (pitch64 << 22) | ((g_fb_location >> 10) & 0x003FFFFFUL);
 
-    gpu_wait_fifo(14);
+    gpu_wait_fifo(18);
+
+    /* Combined pitch/offset registers (used when GMC_DST_PITCH_OFFSET_CNTL
+       is set in DP_GUI_MASTER_CNTL, per xf86-video-ati) */
     wreg(R_DEFAULT_PITCH_OFFSET, pitch_offset);
     wreg(R_DST_PITCH_OFFSET, pitch_offset);
     wreg(R_SRC_PITCH_OFFSET, pitch_offset);
+
+    /* Also write the separate pitch/offset registers — the GPU may use
+       these when PITCH_OFFSET_CNTL bits are not set in DP_GUI_MASTER_CNTL.
+       On RV515, the combined register is FIFO-queued and may not read back;
+       setting the separate registers ensures a known-good state. */
+    wreg(R_DST_OFFSET, g_fb_location);
+    wreg(R_DST_PITCH,  (unsigned long)g_pitch);
+    wreg(R_SRC_OFFSET, g_fb_location);
+    wreg(R_SRC_PITCH,  (unsigned long)g_pitch);
 
     wreg(R_DEFAULT_SC_BOTTOM_RIGHT, (0x1FFF << 16) | 0x1FFF);
     wreg(R_SC_TOP_LEFT, 0);
@@ -1059,7 +1072,7 @@ static void flip_page(int back_page)
     if (g_avivo_flip) {
         /* hw_page_flip blocks until the flip is applied at vsync */
         hw_page_flip(g_fb_location +
-            (unsigned long)back_page * g_pitch * g_yres);
+            (unsigned long)back_page * g_pitch * g_page_stride);
     } else {
         /* VGA mode: vsync wait + VBE display start */
         RMI rm;
@@ -1068,7 +1081,7 @@ static void flip_page(int back_page)
         rm.eax = 0x4F07;
         rm.ebx = 0x0000;   /* immediate set (vsync already waited) */
         rm.ecx = 0;
-        rm.edx = (unsigned long)(back_page * g_yres);
+        rm.edx = (unsigned long)(back_page * g_page_stride);
         dpmi_rmint(0x10, &rm);
     }
 }
@@ -1581,7 +1594,7 @@ static void demo_blit(void)
     char buf[80];
 
     /* Sprite source stored on page 2 (offscreen, beyond display pages) */
-    sprite_y = g_yres * 2;
+    sprite_y = g_page_stride * 2;
 
     /* Widen scissor so GPU fill/blit can reach offscreen rows */
     gpu_wait_fifo(1);
@@ -1602,7 +1615,7 @@ static void demo_blit(void)
     gpu_wait_idle();
 
     /* Clear both display pages */
-    gpu_fill(0, 0, g_xres, g_yres * 2, 0);
+    gpu_fill(0, 0, g_xres, g_page_stride * 2, 0);
     gpu_wait_idle();
 
     /* Ensure color compare is disabled (previous demo may leave state) */
@@ -1622,7 +1635,7 @@ static void demo_blit(void)
         if (nx < 0 || nx + bw > g_xres) { dx = -dx; nx = bx + dx; }
         if (ny < 0 || ny + bh > g_yres - 16) { dy = -dy; ny = by + dy; }
 
-        back_y = back_page * g_yres;
+        back_y = back_page * g_page_stride;
 
         /* Clear the back buffer (GPU fill is very fast) */
         gpu_fill(0, back_y, g_xres, g_yres, 0);
@@ -1740,9 +1753,9 @@ static void gen_mountains(int base)
 
     for (x = 0; x < g_xres; x++) {
         h = g_yres * 35 / 100
-            + tri_wave(x * 7,        g_xres * 2, g_yres / 5)
-            + tri_wave(x * 13 + 80,  g_xres * 3, g_yres / 7)
-            + tri_wave(x * 29 + 200, g_xres,     g_yres / 10);
+            + tri_wave(x,             g_xres * 2, g_yres / 4)
+            + tri_wave(x * 3 + 80,   g_xres,     g_yres / 6)
+            + tri_wave(x * 7 + 200,  g_xres,     g_yres / 12);
         if (h < 40)                h = 40;
         if (h > g_yres * 7 / 10)  h = g_yres * 7 / 10;
         top = g_yres - h;
@@ -1767,8 +1780,8 @@ static void gen_hills(int base)
 
     for (x = 0; x < g_xres; x++) {
         h = g_yres * 22 / 100
-            + tri_wave(x * 11,       g_xres * 2, g_yres / 8)
-            + tri_wave(x * 23 + 50,  g_xres,     g_yres / 12);
+            + tri_wave(x * 2,        g_xres * 2, g_yres / 7)
+            + tri_wave(x * 5 + 50,   g_xres,     g_yres / 10);
         if (h < 20)            h = 20;
         if (h > g_yres / 2)   h = g_yres / 2;
         top = g_yres - h;
@@ -1864,7 +1877,7 @@ static void demo_parallax(void)
     unsigned long need;
 
     /* Verify VRAM can hold 2 display pages + 4 layer pages */
-    need = (unsigned long)g_pitch * g_yres * 6;
+    need = (unsigned long)g_pitch * g_page_stride * 6;
     if (g_vram_mb > 0 && need > g_vram_mb * 1024UL * 1024UL) {
         gpu_fill(0, 0, g_xres, g_yres, 0);
         gpu_wait_idle();
@@ -1876,7 +1889,7 @@ static void demo_parallax(void)
 
     /* Layer offscreen rows: page 2..5 (pages 0-1 are display buffers) */
     for (i = 0; i < PLAX_NLAYERS; i++)
-        layer_base[i] = g_yres * (2 + i);
+        layer_base[i] = g_page_stride * (2 + i);
 
     /* Widen scissor so GPU ops can reach offscreen VRAM */
     gpu_wait_fifo(1);
@@ -1895,7 +1908,7 @@ static void demo_parallax(void)
     gen_cityscape(layer_base[3]);
 
     /* Clear both display pages */
-    gpu_fill(0, 0, g_xres, g_yres * 2, 0);
+    gpu_fill(0, 0, g_xres, g_page_stride * 2, 0);
     gpu_wait_idle();
 
     /* Reset color compare to clean state before keyed blits */
@@ -1909,7 +1922,7 @@ static void demo_parallax(void)
     fps_t0    = clock();
 
     while (!kbhit()) {
-        back_y = back_page * g_yres;
+        back_y = back_page * g_page_stride;
 
         /* Composite layers back-to-front into back buffer.
            Scroll speeds: sky 1/8, mountains 1/4, hills 1/2, city 1x */
@@ -2145,6 +2158,15 @@ int main(void)
                po, pitch64, (g_fb_location >> 10) & 0x003FFFFFUL);
     }
 
+    /* Compute page stride: smallest row count >= g_yres where
+       stride * pitch is 4KB-aligned.  Required for AVIVO surface
+       address register which needs 4KB alignment on RV515. */
+    g_page_stride = g_yres;
+    while (((long)g_page_stride * g_pitch) & 4095L)
+        g_page_stride++;
+    printf("  Page stride: %d rows (%ld bytes, 4KB-aligned)\n",
+           g_page_stride, (long)g_page_stride * g_pitch);
+
     printf("\nPress any key to start graphics demo...\n");
     getch();
 
@@ -2159,7 +2181,7 @@ int main(void)
     }
 
     /* Map enough LFB for parallax demo: 2 display + 4 layer pages (6×) */
-    lfb_sz = (unsigned long)g_pitch * g_yres * 6;
+    lfb_sz = (unsigned long)g_pitch * g_page_stride * 6;
     if (g_vram_mb > 0 && lfb_sz > g_vram_mb * 1024UL * 1024UL)
         lfb_sz = g_vram_mb * 1024UL * 1024UL;
     lfb_sz = (lfb_sz + 4095UL) & ~4095UL;

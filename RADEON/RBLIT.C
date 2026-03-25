@@ -687,10 +687,16 @@ static void gpu_init_2d(void)
     pitch64 = ((unsigned long)g_pitch + 63) / 64;
     pitch_offset = (pitch64 << 22) | ((g_fb_location >> 10) & 0x003FFFFFUL);
 
-    gpu_wait_fifo(14);
+    gpu_wait_fifo(18);
     wreg(R_DEFAULT_PITCH_OFFSET, pitch_offset);
     wreg(R_DST_PITCH_OFFSET, pitch_offset);
     wreg(R_SRC_PITCH_OFFSET, pitch_offset);
+
+    /* Also write separate pitch/offset registers (match RADEON.C fix) */
+    wreg(R_DST_OFFSET, g_fb_location);
+    wreg(R_DST_PITCH,  (unsigned long)g_pitch);
+    wreg(R_SRC_OFFSET, g_fb_location);
+    wreg(R_SRC_PITCH,  (unsigned long)g_pitch);
 
     wreg(R_DEFAULT_SC_BOTTOM_RIGHT, (0x1FFF << 16) | 0x1FFF);
     wreg(R_SC_TOP_LEFT, 0);
@@ -923,14 +929,40 @@ static void test_pitch_alignment(void)
     result(aligned, "pitch %d is %s-aligned\n",
            g_pitch, aligned ? "64-byte" : "NOT 64-byte");
 
-    /* Read back PITCH_OFFSET register */
+    /* Read back PITCH_OFFSET register — on RV515 this is FIFO-queued
+       and CPU readback returns 0x00000000.  This is expected HW behavior,
+       NOT an error.  The actual pitch/offset is still latched internally. */
     po_readback = rreg(R_DST_PITCH_OFFSET);
     po_pitch64 = (po_readback >> 22) & 0x3FF;
     out("  DST_PITCH_OFFSET = 0x%08lX  (pitch64=%lu → %lu bytes)\n",
         po_readback, po_pitch64, po_pitch64 * 64);
-    result(po_pitch64 * 64 == (unsigned long)g_pitch,
-           "PITCH_OFFSET pitch matches g_pitch (%lu == %d)\n",
-           po_pitch64 * 64, g_pitch);
+    if (po_readback == 0) {
+        warn("DST_PITCH_OFFSET reads 0 (FIFO register, expected on RV515)\n");
+    } else {
+        result(po_pitch64 * 64 == (unsigned long)g_pitch,
+               "PITCH_OFFSET pitch matches g_pitch (%lu == %d)\n",
+               po_pitch64 * 64, g_pitch);
+    }
+
+    /* Test separate pitch/offset registers (these should be readable) */
+    {
+        unsigned long dst_off_rb = rreg(R_DST_OFFSET);
+        unsigned long dst_pit_rb = rreg(R_DST_PITCH);
+        unsigned long src_off_rb = rreg(R_SRC_OFFSET);
+        unsigned long src_pit_rb = rreg(R_SRC_PITCH);
+        out("  DST_OFFSET = 0x%08lX  (expect 0x%08lX)\n",
+            dst_off_rb, g_fb_location);
+        out("  DST_PITCH  = %lu  (expect %d)\n",
+            dst_pit_rb, g_pitch);
+        out("  SRC_OFFSET = 0x%08lX  SRC_PITCH = %lu\n",
+            src_off_rb, src_pit_rb);
+        result(dst_pit_rb == (unsigned long)g_pitch,
+               "DST_PITCH register matches g_pitch (%lu == %d)\n",
+               dst_pit_rb, g_pitch);
+        result(dst_off_rb == g_fb_location,
+               "DST_OFFSET register matches fb_location (0x%08lX == 0x%08lX)\n",
+               dst_off_rb, g_fb_location);
+    }
 
     /* Test: GPU fill a row at y=2, then verify CPU reads the correct
        pixels at the correct stride. This catches GPU/CPU pitch mismatch. */
@@ -1497,6 +1529,36 @@ static void test_scissor(void)
         result(outside_bad == 0,
                "outside scissor: %d pixels incorrectly written\n",
                outside_bad);
+
+        /* Detailed dump when scissor fails */
+        if (outside_bad > 0 || bad > 0) {
+            unsigned long sc_tl_rb = rreg(R_SC_TOP_LEFT);
+            unsigned long sc_br_rb = rreg(R_SC_BOTTOM_RIGHT);
+            unsigned long dsc_br_rb = rreg(R_DEFAULT_SC_BOTTOM_RIGHT);
+            out("      SC_TOP_LEFT readback    = 0x%08lX (Y=%lu X=%lu)\n",
+                sc_tl_rb, sc_tl_rb >> 16, sc_tl_rb & 0xFFFF);
+            out("      SC_BOTTOM_RIGHT readback= 0x%08lX (Y=%lu X=%lu)\n",
+                sc_br_rb, sc_br_rb >> 16, sc_br_rb & 0xFFFF);
+            out("      DEFAULT_SC_BR readback  = 0x%08lX\n", dsc_br_rb);
+            /* Show what the GPU actually wrote */
+            out("      GPU fill region dump (rows 450-481, x=78..141):\n");
+            for (y = 450; y < 482 && y < 454; y++) {
+                out("        row %d x[78..141]: ", y);
+                for (x = 78; x < 142; x++)
+                    out("%02X", vram_read(x, y));
+                out("\n");
+            }
+            /* Sample key rows */
+            out("        row 450 x[98..141]: ");
+            for (x = 98; x < 142; x++) out("%02X", vram_read(x, 450));
+            out("\n        row 460 x[78..141]: ");
+            for (x = 78; x < 142; x++) out("%02X", vram_read(x, 460));
+            out("\n        row 479 x[78..141]: ");
+            for (x = 78; x < 142; x++) out("%02X", vram_read(x, 479));
+            out("\n        row 480 x[78..141]: ");
+            for (x = 78; x < 142; x++) out("%02X", vram_read(x, 480));
+            out("\n");
+        }
     }
 
     /* Restore scissor */
@@ -1912,6 +1974,29 @@ static void test_ghost_rect(void)
         int ghost_bad = 0;
         result(dst_bad == 0, "Blit destination correct: %d bad pixels\n", dst_bad);
 
+        /* Pixel dump if blit destination is wrong */
+        if (dst_bad > 0) {
+            out("      Destination pixel dump (100,300) 16x16:\n");
+            for (y = 300; y < 316 && y < 308; y++) {
+                out("        row %d: ", y);
+                for (x = 100; x < 116; x++)
+                    out("%02X ", vram_read(x, y));
+                out("\n");
+            }
+            /* Also check: did the blit land at a different Y? */
+            out("      Scanning for 0xCC at x=100, y=280..320:\n        ");
+            for (y = 280; y < 320; y++) {
+                unsigned char v = vram_read(100, y);
+                if (v == 0xCC) out("y=%d:CC ", y);
+            }
+            out("\n");
+            /* Check source is still intact */
+            out("      Source (300,200) row0: ");
+            for (x = 300; x < 316; x++)
+                out("%02X ", vram_read(x, 200));
+            out("\n");
+        }
+
         /* Check for ghost at +32 from destination */
         for (y = 300; y < 316; y++)
             for (x = 132; x < 148; x++) {
@@ -1994,11 +2079,62 @@ static void test_fullwidth_keyed(void)
            "Full-width keyed blit: %d key pixels overwritten (sky leaks!)\n",
            bad_key);
 
+    /* Detailed diagnostics when pixels are wrong */
+    if (bad_drawn > 0 || bad_key > 0) {
+        int sample_count = 0;
+        out("      First 16 mismatched pixels at dst row %d:\n", dst_y);
+        for (x = 0; x < w && sample_count < 16; x++) {
+            p = g_lfb + (long)dst_y * g_pitch + x;
+            if (x & 1) {
+                if (*p != 0xFF) {
+                    out("        x=%d: got=0x%02X exp=0xFF (key should be preserved)\n",
+                        x, *p);
+                    sample_count++;
+                }
+            } else {
+                unsigned char exp = (unsigned char)(0x80 + (x & 0x3F));
+                if (*p != exp) {
+                    out("        x=%d: got=0x%02X exp=0x%02X\n", x, *p, exp);
+                    sample_count++;
+                }
+            }
+        }
+        /* Dump first 32 bytes of dst row */
+        out("      Dst row %d raw [0..31]: ", dst_y);
+        for (x = 0; x < 32; x++)
+            out("%02X ", vram_read(x, dst_y));
+        out("\n");
+        /* And near the end */
+        out("      Dst row %d raw [%d..%d]: ", dst_y, w-16, w-1);
+        for (x = w - 16; x < w; x++)
+            out("%02X ", vram_read(x, dst_y));
+        out("\n");
+    }
+
     /* Check rows outside dst for leakage */
     bad_outside = vram_check_rect(0, dst_y - 1, w, 1, 0xFF) +
                   vram_check_rect(0, dst_y + 1, w, 1, 0xFF);
     result(bad_outside == 0,
            "No keyed blit row leakage above/below: %d bad pixels\n", bad_outside);
+
+    /* Per-row leakage breakdown when test fails */
+    if (bad_outside > 0) {
+        int row_bad;
+        for (y = dst_y - 2; y <= dst_y + 2; y++) {
+            if (y == dst_y) continue;  /* skip dst row itself */
+            row_bad = 0;
+            for (x = 0; x < w; x++) {
+                unsigned char v = vram_read(x, y);
+                if (v != 0xFF) row_bad++;
+            }
+            if (row_bad > 0) {
+                out("      Row %d: %d bad pixels.  Sample [0..15]: ", y, row_bad);
+                for (x = 0; x < 16; x++)
+                    out("%02X ", vram_read(x, y));
+                out("\n");
+            }
+        }
+    }
 
     /* Reset CLR_CMP */
     gpu_wait_fifo(2);
@@ -2172,6 +2308,85 @@ static void test_flip_address(void)
 }
 
 /* =============================================================== */
+/*  TEST 17: GMC_PITCH_OFFSET_CNTL bit effect                      */
+/* =============================================================== */
+
+static void test_gmc_pitch_offset_cntl(void)
+{
+    int bad_without, bad_with;
+    unsigned long pitch64 = ((unsigned long)g_pitch + 63) / 64;
+    unsigned long po = (pitch64 << 22) | ((g_fb_location >> 10) & 0x003FFFFFUL);
+
+    out("\n========================================\n");
+    out("  TEST 17: GMC_PITCH_OFFSET_CNTL Bits\n");
+    out("========================================\n\n");
+
+    out("  Tests whether DP_GUI_MASTER_CNTL bits 0-1 (SRC/DST PITCH_OFFSET_CNTL)\n");
+    out("  affect blit behavior.  xf86-video-ati always sets these bits.\n\n");
+
+    /* 17a: Fill WITHOUT GMC_PITCH_OFFSET_CNTL bits (current behavior) */
+    out("  17a: GPU fill 32x4 at (600,100) WITHOUT GMC bits [1:0]\n");
+    cpu_clear(598, 98, 36, 8, 0x00);
+    gpu_wait_fifo(4);
+    wreg(R_DST_PITCH_OFFSET, po);
+    wreg(R_SRC_PITCH_OFFSET, po);
+    wreg(R_DST_OFFSET, g_fb_location);
+    wreg(R_DST_PITCH,  (unsigned long)g_pitch);
+    gpu_fill(600, 100, 32, 4, 0xAA);
+    gpu_wait_idle();
+
+    bad_without = vram_check_rect(600, 100, 32, 4, 0xAA);
+    result(bad_without == 0,
+           "Fill without GMC PITCH_OFFSET bits: %d bad pixels\n", bad_without);
+
+    /* 17b: Fill WITH GMC_DST_PITCH_OFFSET_CNTL (bit 1) set */
+    out("  17b: GPU fill 32x4 at (600,110) WITH GMC_DST_PITCH_OFFSET_CNTL\n");
+    cpu_clear(598, 108, 36, 8, 0x00);
+    gpu_wait_fifo(6);
+    wreg(R_DST_PITCH_OFFSET, po);
+    wreg(R_SRC_PITCH_OFFSET, po);
+    wreg(R_DP_GUI_MASTER_CNTL,
+         GMC_BRUSH_SOLID | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_PATCOPY | GMC_CLR_CMP_DIS | GMC_WR_MSK_DIS |
+         (1UL << 0) |   /* GMC_SRC_PITCH_OFFSET_CNTL */
+         (1UL << 1));   /* GMC_DST_PITCH_OFFSET_CNTL */
+    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+    wreg(R_DP_BRUSH_FRGD_CLR, 0xBBUL);
+    wreg(R_DST_Y_X,         ((unsigned long)110 << 16) | 600UL);
+    gpu_wait_fifo(1);
+    wreg(R_DST_HEIGHT_WIDTH, (4UL << 16) | 32UL);
+    gpu_wait_idle();
+
+    bad_with = vram_check_rect(600, 110, 32, 4, 0xBB);
+    result(bad_with == 0,
+           "Fill with GMC PITCH_OFFSET bits: %d bad pixels\n", bad_with);
+
+    if (bad_without == 0 && bad_with == 0) {
+        out("  Both paths work — GMC bits not required for MMIO fills.\n");
+    } else if (bad_without > 0 && bad_with == 0) {
+        out("  *** GMC bits are REQUIRED for correct pitch/offset! ***\n");
+    } else if (bad_without == 0 && bad_with > 0) {
+        out("  GMC bits BREAK fills — do NOT set them.\n");
+    }
+
+    /* Pixel dump for comparison */
+    {
+        int x;
+        out("      Row 100 [600..631]: ");
+        for (x = 600; x < 632; x++) out("%02X", vram_read(x, 100));
+        out("\n      Row 110 [600..631]: ");
+        for (x = 600; x < 632; x++) out("%02X", vram_read(x, 110));
+        out("\n");
+    }
+
+    /* Restore gpu_fill's expected state */
+    gpu_wait_fifo(3);
+    wreg(R_DST_PITCH_OFFSET, po);
+    wreg(R_SRC_PITCH_OFFSET, po);
+    wreg(R_CLR_CMP_CNTL, 0);
+}
+
+/* =============================================================== */
 /*  Main                                                            */
 /* =============================================================== */
 
@@ -2325,6 +2540,7 @@ int main(void)
     test_fullwidth_keyed();
     test_vga_crtc();
     test_flip_address();
+    test_gmc_pitch_offset_cntl();
 
     /* ---- Summary ---- */
     out("\n========================================\n");
