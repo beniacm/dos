@@ -180,8 +180,12 @@ typedef struct {
    Used for tear-free hardware page flipping via surface update lock.
    Reference: Linux kernel rs600.c rs600_page_flip() */
 #define R_D1GRPH_PRIMARY_SURFACE_ADDRESS   0x6110
-#define R_D1GRPH_PITCH                     0x6120
 #define R_D1GRPH_SECONDARY_SURFACE_ADDRESS 0x6118
+#define R_D1GRPH_PITCH                     0x6120
+#define R_D1GRPH_X_START                   0x612C  /* left edge of display window */
+#define R_D1GRPH_Y_START                   0x6130  /* top edge of display window */
+#define R_D1GRPH_X_END                     0x6134  /* right edge (exclusive) — must equal xres */
+#define R_D1GRPH_Y_END                     0x6138  /* bottom edge (exclusive) — must equal yres */
 #define R_D1GRPH_UPDATE                    0x6144
 #define   D1GRPH_SURFACE_UPDATE_PENDING    (1UL << 2)
 #define   D1GRPH_SURFACE_UPDATE_LOCK       (1UL << 16)
@@ -960,8 +964,16 @@ static void detect_flip_mode(void)
        (Mirrors Linux radeon driver behaviour after mode set.) */
     wreg(R_D1VGA_CONTROL, d1vga & ~D1VGA_MODE_ENABLE);
 
-    /* Also update D1GRPH_PITCH to match our (possibly aligned) pitch */
-    wreg(R_D1GRPH_PITCH, (unsigned long)g_pitch);
+    /* Set D1GRPH stride and display window.
+       ATOMBIOS may have set X_END = pitch (832) instead of xres (800),
+       which causes the controller to scan 832 pixels per line and show
+       the 32-byte padding area as a dark vertical stripe on the right.
+       X_START/Y_START = 0, X_END = xres, Y_END = yres. */
+    wreg(R_D1GRPH_PITCH,   (unsigned long)g_pitch);
+    wreg(R_D1GRPH_X_START, 0);
+    wreg(R_D1GRPH_Y_START, 0);
+    wreg(R_D1GRPH_X_END,   (unsigned long)g_xres);
+    wreg(R_D1GRPH_Y_END,   (unsigned long)g_yres);
 
     /* Brief spin to let the display controller pick up new state */
     { volatile int d; for (d = 0; d < 50000; d++) {} }
@@ -973,16 +985,33 @@ static void detect_flip_mode(void)
     /* If still VGA, g_avivo_flip stays 0 → VGA vsync fallback */
 }
 
+/* Wait for the AVIVO CRTC to enter vblank.
+   Used as a fallback when SURFACE_UPDATE_PENDING does not signal. */
+static void avivo_wait_vblank(void)
+{
+    int i;
+    /* If already in vblank, wait for it to end first */
+    for (i = 0; i < 500000; i++)
+        if (!(rreg(R_D1CRTC_STATUS) & D1CRTC_V_BLANK)) break;
+    /* Wait for next vblank to start */
+    for (i = 0; i < 500000; i++)
+        if (rreg(R_D1CRTC_STATUS) & D1CRTC_V_BLANK) break;
+}
+
 /* AVIVO hardware page flip.  Sequence per Linux kernel rs600_page_flip():
-     lock → write address → unlock (arms flip) → wait for pending=0 (vsync).
-   Blocks until the new surface is live, so the caller may immediately
-   write to the old (now-hidden) surface without a race. */
+     lock → write address → unlock (arms flip) → wait for vsync.
+   Blocks until the new surface is live so the caller can safely write
+   to the old (now-hidden) surface.
+
+   Primary sync: SURFACE_UPDATE_PENDING high→low (pending armed then applied).
+   Fallback:     AVIVO D1CRTC_V_BLANK via D1CRTC_STATUS when pending does not
+                 signal (observed on RV515 X1300 DevID 7142). */
 static void hw_page_flip(unsigned long surface_addr)
 {
     unsigned long tmp;
     int i;
 
-    /* Lock: prevents the display controller from latching a partial update */
+    /* Lock: prevents the controller latching a partial address update */
     tmp = rreg(R_D1GRPH_UPDATE);
     wreg(R_D1GRPH_UPDATE, tmp | D1GRPH_SURFACE_UPDATE_LOCK);
 
@@ -993,22 +1022,26 @@ static void hw_page_flip(unsigned long surface_addr)
     wreg(R_D1GRPH_SECONDARY_SURFACE_ADDRESS, surface_addr);
     wreg(R_D1GRPH_PRIMARY_SURFACE_ADDRESS, surface_addr);
 
-    /* Unlock: arms the flip — hardware latches it at next vsync */
+    /* Unlock: arms the flip — hardware applies it at next vsync */
     tmp = rreg(R_D1GRPH_UPDATE);
     wreg(R_D1GRPH_UPDATE, tmp & ~D1GRPH_SURFACE_UPDATE_LOCK);
 
-    /* Wait for SURFACE_UPDATE_PENDING to go high (flip is armed).
-       This happens in the same scanline as the unlock write. */
-    for (i = 0; i < 2000; i++) {
+    /* Wait for SURFACE_UPDATE_PENDING to go high (flip armed) */
+    for (i = 0; i < 4000; i++) {
         if (rreg(R_D1GRPH_UPDATE) & D1GRPH_SURFACE_UPDATE_PENDING)
             break;
     }
 
-    /* Wait for SURFACE_UPDATE_PENDING to clear (vsync: flip applied).
-       After this the new surface is live and the old one is safe to modify. */
-    for (i = 0; i < 200000; i++) {
-        if (!(rreg(R_D1GRPH_UPDATE) & D1GRPH_SURFACE_UPDATE_PENDING))
-            break;
+    if (rreg(R_D1GRPH_UPDATE) & D1GRPH_SURFACE_UPDATE_PENDING) {
+        /* Pending is high — wait for it to clear (flip applied at vsync) */
+        for (i = 0; i < 300000; i++) {
+            if (!(rreg(R_D1GRPH_UPDATE) & D1GRPH_SURFACE_UPDATE_PENDING))
+                return;
+        }
+    } else {
+        /* Pending bit did not signal — use CRTC vblank as fallback.
+           This is the observed behaviour on RV515 X1300 (DevID 7142). */
+        avivo_wait_vblank();
     }
 }
 
