@@ -10,6 +10,12 @@
  *   - Overlapping blit direction handling
  *   - Scissor clipping
  *   - Multi-operation state leakage (fill → blit → keyed blit)
+ *   - AVIVO display register state (D1VGA_CONTROL, D1GRPH_PITCH/X_END/Y_END)
+ *   - Vblank timing via D1CRTC_V_BLANK (validates fallback vsync path)
+ *   - Ghost rectangle: checks for pitch-mismatch echoes at +32-column offset
+ *   - Full-width keyed blit: reproduces parallax layer (diagnoses sky leak)
+ *   - VGA CRTC state: CR13 pitch register (controls VGA scanout stride)
+ *   - AVIVO page flip address verification
  *
  * Outputs BLITLOG.TXT for offline analysis.
  *
@@ -180,6 +186,27 @@ typedef struct {
 
 #define   HDP_SOFT_RESET           (1UL << 26)
 #define   HDP_APER_CNTL            (1UL << 23)
+
+/* AVIVO display controller registers (RV515/R500) */
+#define R_D1GRPH_PRIMARY_SURFACE_ADDRESS   0x6110
+#define R_D1GRPH_SECONDARY_SURFACE_ADDRESS 0x6118
+#define R_D1GRPH_PITCH                     0x6120
+#define R_D1GRPH_X_START                   0x612C
+#define R_D1GRPH_Y_START                   0x6130
+#define R_D1GRPH_X_END                     0x6134  /* must equal xres, not pitch */
+#define R_D1GRPH_Y_END                     0x6138
+#define R_D1GRPH_UPDATE                    0x6144
+#define   D1GRPH_SURFACE_UPDATE_PENDING    (1UL << 2)
+#define   D1GRPH_SURFACE_UPDATE_LOCK       (1UL << 16)
+#define R_D1GRPH_FLIP_CONTROL              0x6148
+/* VGA mode enable: when set the VGA block drives scanout, D1GRPH flips ignored */
+#define R_D1VGA_CONTROL                    0x0330
+#define   D1VGA_MODE_ENABLE                (1UL << 0)
+/* AVIVO CRTC control/status */
+#define R_D1CRTC_CONTROL                   0x6080
+#define   AVIVO_CRTC_EN                    (1UL << 0)
+#define R_D1CRTC_STATUS                    0x609C
+#define   D1CRTC_V_BLANK                   (1UL << 0)
 
 /* RV515 device IDs */
 #define ATI_VID  0x1002
@@ -1640,6 +1667,511 @@ static void test_register_readback(void)
 }
 
 /* =============================================================== */
+/*  TEST 11: AVIVO display controller register state                */
+/* =============================================================== */
+
+static void test_avivo_registers(void)
+{
+    unsigned long d1vga, grph_pitch, x_start, y_start, x_end, y_end;
+    unsigned long d1crtc_ctrl, d1crtc_stat;
+    unsigned long surf_pri, surf_sec;
+
+    out("\n========================================\n");
+    out("  TEST 11: AVIVO Display Register State\n");
+    out("========================================\n\n");
+
+    d1vga       = rreg(R_D1VGA_CONTROL);
+    grph_pitch  = rreg(R_D1GRPH_PITCH);
+    x_start     = rreg(R_D1GRPH_X_START);
+    y_start     = rreg(R_D1GRPH_Y_START);
+    x_end       = rreg(R_D1GRPH_X_END);
+    y_end       = rreg(R_D1GRPH_Y_END);
+    d1crtc_ctrl = rreg(R_D1CRTC_CONTROL);
+    d1crtc_stat = rreg(R_D1CRTC_STATUS);
+    surf_pri    = rreg(R_D1GRPH_PRIMARY_SURFACE_ADDRESS);
+    surf_sec    = rreg(R_D1GRPH_SECONDARY_SURFACE_ADDRESS);
+
+    out("  D1VGA_CONTROL    = 0x%08lX  (VGA mode %s)\n",
+        d1vga, (d1vga & D1VGA_MODE_ENABLE) ? "ACTIVE — D1GRPH flips ignored!" : "disabled, AVIVO active");
+    out("  D1CRTC_CONTROL   = 0x%08lX  (CRTC %s)\n",
+        d1crtc_ctrl, (d1crtc_ctrl & AVIVO_CRTC_EN) ? "enabled" : "DISABLED");
+    out("  D1CRTC_STATUS    = 0x%08lX  (currently %s)\n",
+        d1crtc_stat, (d1crtc_stat & D1CRTC_V_BLANK) ? "in vblank" : "active");
+    out("  D1GRPH_PITCH     = 0x%08lX  (%lu bytes)\n", grph_pitch, grph_pitch);
+    out("  D1GRPH_X_START   = %lu\n", x_start);
+    out("  D1GRPH_Y_START   = %lu\n", y_start);
+    out("  D1GRPH_X_END     = %lu  (pixel width should be %d)\n", x_end, g_xres);
+    out("  D1GRPH_Y_END     = %lu  (pixel height should be %d)\n", y_end, g_yres);
+    out("  SURF_PRIMARY     = 0x%08lX\n", surf_pri);
+    out("  SURF_SECONDARY   = 0x%08lX\n", surf_sec);
+
+    /* Key diagnosis: VGA mode active means hw_page_flip does nothing */
+    result(!(d1vga & D1VGA_MODE_ENABLE),
+           "D1VGA_MODE_ENABLE clear (AVIVO scanout active)\n");
+
+    /* CRTC must be enabled for display to work */
+    result(!!(d1crtc_ctrl & AVIVO_CRTC_EN),
+           "D1CRTC enabled\n");
+
+    /* Pitch must match g_pitch */
+    result(grph_pitch == (unsigned long)g_pitch,
+           "D1GRPH_PITCH (%lu) matches g_pitch (%d)\n",
+           grph_pitch, g_pitch);
+
+    /* X_END must equal xres (not pitch!) — dark vertical bar if wrong */
+    result(x_end == (unsigned long)g_xres,
+           "D1GRPH_X_END (%lu) == xres (%d)%s\n",
+           x_end, g_xres,
+           x_end == (unsigned long)g_pitch ? " [PROBLEM: set to pitch, causes dark bar!]" : "");
+
+    /* Y_END must equal yres */
+    result(y_end == (unsigned long)g_yres,
+           "D1GRPH_Y_END (%lu) == yres (%d)\n",
+           y_end, g_yres);
+
+    /* Surface address should be within VRAM */
+    result(surf_pri >= g_fb_location &&
+           surf_pri < g_fb_location + (unsigned long)g_vram_mb * 1024UL * 1024UL,
+           "SURF_PRIMARY (0x%08lX) within VRAM [0x%08lX+%luMB]\n",
+           surf_pri, g_fb_location, g_vram_mb);
+}
+
+/* =============================================================== */
+/*  TEST 12: Vblank timing measurement                              */
+/* =============================================================== */
+
+static void test_vblank_timing(void)
+{
+    /* Measure 5 vblank rising edges; report inter-frame period.
+       ~16.7ms at 60Hz.  If this times out → D1CRTC_V_BLANK not toggling
+       → avivo_wait_vblank() in RADEON.C spins forever / never syncs. */
+    int i, n, timeout_count = 0;
+    unsigned long periods[5];
+    unsigned long t_start, t_now, t_prev;
+
+    out("\n========================================\n");
+    out("  TEST 12: Vblank Timing (D1CRTC_V_BLANK)\n");
+    out("========================================\n\n");
+
+    /* Use busy-loop counter as a rough timer.  We calibrate by counting
+       iterations per "known" loop and converting to approximate ms. */
+
+    /* First, wait for vblank to go LOW (active region) */
+    for (i = 0; i < 1000000 && (rreg(R_D1CRTC_STATUS) & D1CRTC_V_BLANK); i++);
+    if (i == 1000000) {
+        out("  D1CRTC_V_BLANK stuck HIGH (always in vblank?) — no timing possible.\n");
+        result(0, "D1CRTC_V_BLANK transitions\n");
+        return;
+    }
+
+    /* Now measure rising edges (start of vblank) */
+    t_prev = 0;
+    n = 0;
+    for (n = 0; n < 5; n++) {
+        /* Wait for high (vblank start) */
+        for (i = 0; i < 5000000; i++) {
+            if (rreg(R_D1CRTC_STATUS) & D1CRTC_V_BLANK) break;
+        }
+        if (i == 5000000) { timeout_count++; break; }
+        t_now = (unsigned long)i; /* not wall-time, but records loop iterations */
+
+        /* Store raw loop counts between edges — not calibrated ms, but ratios work */
+        if (n > 0) periods[n-1] = t_now;
+
+        /* Wait for low (active region) before next edge */
+        for (i = 0; i < 5000000; i++) {
+            if (!(rreg(R_D1CRTC_STATUS) & D1CRTC_V_BLANK)) break;
+        }
+        if (i == 5000000) { timeout_count++; break; }
+    }
+
+    if (timeout_count > 0) {
+        out("  Timed out waiting for vblank transition (%d timeouts)\n", timeout_count);
+        result(0, "D1CRTC_V_BLANK transitions within timeout\n");
+        return;
+    }
+
+    /* Count total transitions observed — if we got 5 edges, it works */
+    out("  D1CRTC_V_BLANK observed %d rising edges (of 5 attempted)\n", n);
+    out("  Vblank loop-count intervals: %lu %lu %lu %lu\n",
+        periods[0], periods[1], periods[2], periods[3]);
+
+    result(n == 5, "D1CRTC_V_BLANK transitions: %d/5 seen%s\n",
+           n, n < 5 ? " [PROBLEM: fallback vblank in RADEON.C will not work!]" : "");
+
+    /* Sanity: intervals should be roughly equal (within 20%) */
+    if (n == 5) {
+        unsigned long mn = periods[0], mx = periods[0];
+        int j;
+        for (j = 1; j < 4; j++) {
+            if (periods[j] < mn) mn = periods[j];
+            if (periods[j] > mx) mx = periods[j];
+        }
+        /* Pass if max/min ratio < 1.5 */
+        result(mx < mn * 2,
+               "Vblank intervals consistent (min=%lu max=%lu)\n", mn, mx);
+    }
+}
+
+/* =============================================================== */
+/*  TEST 13: Ghost rectangle investigation                          */
+/* =============================================================== */
+/* The observed symptom: "slightly darker version of bounced rect  */
+/* to the right, wraps around on the left."  This is the signature */
+/* of the display controller scanning at a different pitch than    */
+/* the GPU rendered at, causing rows to appear shifted.            */
+/*                                                                  */
+/* Concretely: GPU renders at g_pitch=832, display scans at 800.   */
+/* Row N starts at byte 832*N in VRAM.  Display thinks rows are    */
+/* 800 bytes apart.  Row 1 of the image appears at pixel 32 of     */
+/* the display's "row 1" (800 vs 832 delta accumulates each row).  */
+/*                                                                  */
+/* This test:                                                       */
+/*   a) Fills a 16x16 block with a known pattern                   */
+/*   b) Scans a 100-pixel-wide zone around+right for stray pixels  */
+/*   c) Specifically checks at offset +32 (pitch padding width)    */
+/*   d) Also checks the first few columns (row-wrap) for echoes    */
+/* =============================================================== */
+
+static void test_ghost_rect(void)
+{
+    int x, y, bad_right, bad_left, bad_pitch_offset;
+    unsigned char *p;
+
+    out("\n========================================\n");
+    out("  TEST 13: Ghost Rectangle Investigation\n");
+    out("========================================\n\n");
+
+    /* 13a: Place a distinctive pattern at (300, 200), 16x16 */
+    out("  13a: Write pattern at (300,200) 16x16 = 0xCC, surround = 0x00\n");
+    /* Clear a wide area first */
+    cpu_clear(200, 190, 200, 40, 0x00);
+    /* Write the pattern via GPU fill */
+    gpu_fill(300, 200, 16, 16, 0xCC);
+    gpu_wait_idle();
+
+    /* Verify the source is correct */
+    {
+        int src_bad = vram_check_rect(300, 200, 16, 16, 0xCC);
+        result(src_bad == 0, "Source block correct: %d bad pixels\n", src_bad);
+    }
+
+    /* 13b: Check +32 to +48 columns from source X — this is where the ghost
+       would appear if display pitch != GPU pitch (pitch=832, visible=800,
+       padding=32, ghost at X+32 in display coordinates) */
+    out("  13b: Check for ghost at x=332..347 (source+32, pitch padding boundary)\n");
+    bad_pitch_offset = 0;
+    for (y = 200; y < 216; y++) {
+        for (x = 332; x < 348; x++) {
+            p = g_lfb + (long)y * g_pitch + x;
+            if (*p == 0xCC) bad_pitch_offset++;
+        }
+    }
+    result(bad_pitch_offset == 0,
+           "No ghost at +32 offset: %d stray 0xCC pixels%s\n",
+           bad_pitch_offset,
+           bad_pitch_offset > 0 ? " [PROBLEM: display pitch != GPU pitch!]" : "");
+
+    /* 13c: Check left edge of screen (x=0..16) at rows 200..215
+       for row-wrap ghost (if rows appear shifted, row 201 would
+       start 32 pixels into display row 200's territory, etc.) */
+    out("  13c: Check for row-wrap ghost at x=0..15 rows 200..216\n");
+    bad_left = 0;
+    for (y = 200; y < 217; y++) {
+        for (x = 0; x < 16; x++) {
+            p = g_lfb + (long)y * g_pitch + x;
+            if (*p == 0xCC) bad_left++;
+        }
+    }
+    result(bad_left == 0,
+           "No row-wrap ghost at left edge: %d stray 0xCC pixels\n",
+           bad_left);
+
+    /* 13d: Check a wide area to the right of the source (x=316..400)
+       for any stray 0xCC that shouldn't be there */
+    out("  13d: Scan wide area right of source (x=316..400) for stray pixels\n");
+    bad_right = 0;
+    for (y = 200; y < 216; y++) {
+        for (x = 316; x < 400; x++) {
+            p = g_lfb + (long)y * g_pitch + x;
+            if (*p == 0xCC) bad_right++;
+        }
+    }
+    result(bad_right == 0,
+           "No stray pixels right of source (x=316..400): %d found\n",
+           bad_right);
+
+    /* 13e: Blit the block to a different location and check for ghosts */
+    out("  13e: GPU blit (300,200)→(100,300) 16x16, check for ghost at (132,300)\n");
+    cpu_clear(80, 295, 200, 30, 0x00);
+    gpu_blit_fwd(300, 200, 100, 300, 16, 16);
+    gpu_wait_idle();
+
+    {
+        int dst_bad  = vram_check_rect(100, 300, 16, 16, 0xCC);
+        int ghost_bad = 0;
+        result(dst_bad == 0, "Blit destination correct: %d bad pixels\n", dst_bad);
+
+        /* Check for ghost at +32 from destination */
+        for (y = 300; y < 316; y++)
+            for (x = 132; x < 148; x++) {
+                p = g_lfb + (long)y * g_pitch + x;
+                if (*p == 0xCC) ghost_bad++;
+            }
+        result(ghost_bad == 0,
+               "No ghost at blit-dst+32 (132,300): %d stray pixels%s\n",
+               ghost_bad,
+               ghost_bad > 0 ? " [PROBLEM: confirms display pitch mismatch!]" : "");
+    }
+}
+
+/* =============================================================== */
+/*  TEST 14: Full-width keyed blit (parallax layer scenario)        */
+/* =============================================================== */
+
+static void test_fullwidth_keyed(void)
+{
+    int x, y, bad_drawn, bad_key, bad_outside;
+    unsigned char *p;
+    int src_y = 380, dst_y = 400;
+    int w = g_xres;  /* full visible width */
+
+    out("\n========================================\n");
+    out("  TEST 14: Full-Width Keyed Blit (Parallax)\n");
+    out("========================================\n\n");
+
+    /* Setup: clear destination row to 0xFF (sky color) */
+    out("  Setup: dst row %d = 0xFF (sky), src row %d = alternating key/non-key\n",
+        dst_y, src_y);
+    cpu_clear(0, dst_y - 1, w, 3, 0xFF);
+    /* Source: odd pixels = key (0x00 = transparent), even = non-key pattern */
+    for (x = 0; x < w; x++) {
+        p = g_lfb + (long)src_y * g_pitch + x;
+        *p = (x & 1) ? 0x00 : (unsigned char)(0x80 + (x & 0x3F));
+    }
+
+    /* FCN_NE blit: non-key pixels overwrite, key pixels preserve dest */
+    {
+        unsigned long po = ((unsigned long)(g_pitch/64) << 22) |
+                           ((g_lfb_phys - g_fb_location) >> 10);
+        gpu_wait_fifo(10);
+        wreg(R_DST_PITCH_OFFSET, po);
+        wreg(R_SRC_PITCH_OFFSET, po);
+        wreg(R_CLR_CMP_CNTL,
+             (CLR_CMP_FCN_NE << 0) | CLR_CMP_SRC_SOURCE);
+        wreg(R_CLR_CMP_CLR_SRC, 0x00000000UL);
+        wreg(R_CLR_CMP_MASK,    0x000000FFUL);
+        gpu_wait_fifo(8);
+        wreg(R_DP_GUI_MASTER_CNTL,
+             GMC_BRUSH_NONE | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+             ROP3_SRCCOPY | GMC_DP_SRC_MEMORY | GMC_WR_MSK_DIS);
+        wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+        wreg(R_SC_TOP_LEFT,      0);
+        wreg(R_SC_BOTTOM_RIGHT,  ((unsigned long)g_yres << 16) | (unsigned long)g_xres);
+        wreg(R_SRC_Y_X,          ((unsigned long)src_y << 16));
+        wreg(R_DST_Y_X,          ((unsigned long)dst_y << 16));
+        wreg(R_DST_HEIGHT_WIDTH,  (1UL << 16) | (unsigned long)w);
+    }
+    gpu_wait_idle();
+
+    /* Verify: non-key (even) pixels should be drawn, key (odd) pixels = 0xFF */
+    bad_drawn = 0;
+    bad_key   = 0;
+    for (x = 0; x < w; x++) {
+        p = g_lfb + (long)dst_y * g_pitch + x;
+        if (x & 1) {
+            /* key pixel: destination should remain 0xFF */
+            if (*p != 0xFF) bad_key++;
+        } else {
+            /* non-key: should match source */
+            unsigned char exp = (unsigned char)(0x80 + (x & 0x3F));
+            if (*p != exp) bad_drawn++;
+        }
+    }
+    result(bad_drawn == 0,
+           "Full-width keyed blit: %d non-key pixels wrong\n", bad_drawn);
+    result(bad_key == 0,
+           "Full-width keyed blit: %d key pixels overwritten (sky leaks!)\n",
+           bad_key);
+
+    /* Check rows outside dst for leakage */
+    bad_outside = vram_check_rect(0, dst_y - 1, w, 1, 0xFF) +
+                  vram_check_rect(0, dst_y + 1, w, 1, 0xFF);
+    result(bad_outside == 0,
+           "No keyed blit row leakage above/below: %d bad pixels\n", bad_outside);
+
+    /* Reset CLR_CMP */
+    gpu_wait_fifo(2);
+    wreg(R_CLR_CMP_CNTL, 0);
+}
+
+/* =============================================================== */
+/*  TEST 15: VGA CRTC register state                                */
+/* =============================================================== */
+
+static void test_vga_crtc(void)
+{
+    unsigned char cr13, cr01, cr14;
+    unsigned int expected_cr13;
+
+    out("\n========================================\n");
+    out("  TEST 15: VGA CRTC Register State\n");
+    out("========================================\n\n");
+
+    /* Read VGA CRTC registers via 0x3D4/0x3D5 */
+    outp(0x3D4, 0x13); cr13 = inp(0x3D5);   /* offset (pitch/2 in words, i.e. pitch/8) */
+    outp(0x3D4, 0x01); cr01 = inp(0x3D5);   /* horizontal display end - 1 (in chars) */
+    outp(0x3D4, 0x14); cr14 = inp(0x3D5);   /* underline location (DWord mode bit) */
+
+    expected_cr13 = (unsigned int)(g_pitch / 8);
+
+    out("  VGA CR13 (offset/pitch): 0x%02X = %u  (expect %u for pitch=%d)\n",
+        cr13, cr13, expected_cr13, g_pitch);
+    out("  VGA CR01 (h-disp end-1): 0x%02X = %u  (expect %u for xres=%d)\n",
+        cr01, cr01, (g_xres / 8) - 1, g_xres);
+    out("  VGA CR14 (underline):    0x%02X  (bit6=dword mode)\n", cr14);
+
+    /* CR13: controls the line pitch in VGA scanout path.
+       If != pitch/8 the display will show horizontal smearing/wrapping. */
+    result((unsigned int)cr13 == expected_cr13,
+           "CR13 = %u (expected %u = pitch(%d)/8)%s\n",
+           (unsigned int)cr13, expected_cr13, g_pitch,
+           (unsigned int)cr13 != expected_cr13
+               ? " [PROBLEM: VGA pitch mismatch → row wrap → ghost image!]" : "");
+
+    /* CR01: horizontal display end. In text mode this is char-based;
+       in 256-color graphics it's clock-based (xres/8 - 1). */
+    result((unsigned int)cr01 == (unsigned int)((g_xres / 8) - 1),
+           "CR01 = %u (expected %u = xres(%d)/8 - 1)\n",
+           (unsigned int)cr01, (g_xres / 8) - 1, g_xres);
+
+    /* Sanity: D1VGA_CONTROL and CRTC mode should agree */
+    {
+        unsigned long d1vga = rreg(R_D1VGA_CONTROL);
+        int vga_active = !!(d1vga & D1VGA_MODE_ENABLE);
+        out("  D1VGA_CONTROL = 0x%08lX (VGA scanout: %s)\n",
+            d1vga, vga_active ? "ACTIVE" : "disabled");
+        if (vga_active) {
+            out("  NOTE: VGA scanout is active — CR13 controls row stride.\n");
+            out("        If CR13 != pitch/8, you get ghost-image row wrapping.\n");
+        } else {
+            out("  NOTE: AVIVO scanout active — CR13 only matters if VGA active.\n");
+        }
+    }
+}
+
+/* =============================================================== */
+/*  TEST 16: AVIVO page flip address verification                   */
+/* =============================================================== */
+
+static void test_flip_address(void)
+{
+    unsigned long addr_before, addr_after;
+    unsigned long page0 = g_lfb_phys - g_fb_location;
+    unsigned long page1;
+    unsigned long pitch_bytes = (unsigned long)g_pitch;
+    unsigned long page1_offset;
+    int i;
+
+    out("\n========================================\n");
+    out("  TEST 16: AVIVO Page Flip Address\n");
+    out("========================================\n\n");
+
+    /* Page 1 starts at page0 + one screen's worth of bytes */
+    page1_offset = page0 + pitch_bytes * (unsigned long)g_yres;
+    /* Align to 4KB */
+    page1_offset = (page1_offset + 4095UL) & ~4095UL;
+    page1 = g_fb_location + page1_offset;
+
+    out("  g_lfb_phys    = 0x%08lX\n", g_lfb_phys);
+    out("  g_fb_location = 0x%08lX\n", g_fb_location);
+    out("  Page 0 offset = 0x%08lX  (phys = 0x%08lX)\n", page0, g_lfb_phys);
+    out("  Page 1 offset = 0x%08lX  (phys = 0x%08lX)\n", page1_offset, page1);
+    out("  Pitch         = %d bytes (%d rows per page)\n", g_pitch, g_yres);
+
+    /* Read current surface address */
+    addr_before = rreg(R_D1GRPH_PRIMARY_SURFACE_ADDRESS);
+    out("  SURF_PRIMARY before flip = 0x%08lX\n", addr_before);
+
+    /* Check VGA mode — if active, flips won't change SURF_PRIMARY */
+    {
+        unsigned long d1vga = rreg(R_D1VGA_CONTROL);
+        if (d1vga & D1VGA_MODE_ENABLE) {
+            out("  D1VGA_MODE_ENABLE is SET — AVIVO flip will have no effect!\n");
+            result(0, "D1VGA_MODE_ENABLE clear (required for AVIVO flips)\n");
+            return;
+        }
+    }
+
+    /* Simulate hw_page_flip sequence to page 1:
+       lock → write primary+secondary → unlock */
+    {
+        unsigned long tmp = rreg(R_D1GRPH_UPDATE);
+        wreg(R_D1GRPH_UPDATE, tmp | D1GRPH_SURFACE_UPDATE_LOCK);
+        wreg(R_D1GRPH_FLIP_CONTROL, 0);
+        wreg(R_D1GRPH_SECONDARY_SURFACE_ADDRESS, page1);
+        wreg(R_D1GRPH_PRIMARY_SURFACE_ADDRESS,   page1);
+        tmp = rreg(R_D1GRPH_UPDATE);
+        wreg(R_D1GRPH_UPDATE, tmp & ~D1GRPH_SURFACE_UPDATE_LOCK);
+    }
+
+    /* Check whether SURFACE_UPDATE_PENDING goes high */
+    {
+        int pending_seen = 0;
+        for (i = 0; i < 100000; i++) {
+            if (rreg(R_D1GRPH_UPDATE) & D1GRPH_SURFACE_UPDATE_PENDING) {
+                pending_seen = 1;
+                break;
+            }
+        }
+        out("  SURFACE_UPDATE_PENDING went high: %s (in %d iters)\n",
+            pending_seen ? "YES" : "NO", i);
+        if (!pending_seen)
+            out("  NOTE: If pending never goes high, hw_page_flip falls back to\n"
+                "        D1CRTC_V_BLANK — this is expected on some RV515 boards.\n");
+    }
+
+    /* Wait for vsync (either via pending or v_blank) */
+    for (i = 0; i < 500000; i++)
+        if (!(rreg(R_D1CRTC_STATUS) & D1CRTC_V_BLANK)) break;
+    for (i = 0; i < 500000; i++)
+        if (  rreg(R_D1CRTC_STATUS) & D1CRTC_V_BLANK)  break;
+    /* Wait for pending low (flip applied) */
+    for (i = 0; i < 300000; i++)
+        if (!(rreg(R_D1GRPH_UPDATE) & D1GRPH_SURFACE_UPDATE_PENDING)) break;
+
+    addr_after = rreg(R_D1GRPH_PRIMARY_SURFACE_ADDRESS);
+    out("  SURF_PRIMARY after flip  = 0x%08lX  (expected 0x%08lX)\n",
+        addr_after, page1);
+
+    result(addr_after == page1,
+           "Surface address updated to page1 (0x%08lX)%s\n",
+           page1, addr_after != page1 ? " [PROBLEM: flip did not apply!]" : "");
+
+    /* Flip back to page 0 */
+    {
+        unsigned long tmp = rreg(R_D1GRPH_UPDATE);
+        wreg(R_D1GRPH_UPDATE, tmp | D1GRPH_SURFACE_UPDATE_LOCK);
+        wreg(R_D1GRPH_FLIP_CONTROL, 0);
+        wreg(R_D1GRPH_SECONDARY_SURFACE_ADDRESS, g_lfb_phys);
+        wreg(R_D1GRPH_PRIMARY_SURFACE_ADDRESS,   g_lfb_phys);
+        tmp = rreg(R_D1GRPH_UPDATE);
+        wreg(R_D1GRPH_UPDATE, tmp & ~D1GRPH_SURFACE_UPDATE_LOCK);
+    }
+    /* Wait vsync */
+    for (i = 0; i < 500000; i++)
+        if (!(rreg(R_D1CRTC_STATUS) & D1CRTC_V_BLANK)) break;
+    for (i = 0; i < 500000; i++)
+        if (  rreg(R_D1CRTC_STATUS) & D1CRTC_V_BLANK)  break;
+
+    addr_after = rreg(R_D1GRPH_PRIMARY_SURFACE_ADDRESS);
+    out("  SURF_PRIMARY after flip-back = 0x%08lX  (expected 0x%08lX)\n",
+        addr_after, g_lfb_phys);
+    result(addr_after == g_lfb_phys,
+           "Surface address restored to page0 (0x%08lX)\n", g_lfb_phys);
+}
+
+/* =============================================================== */
 /*  Main                                                            */
 /* =============================================================== */
 
@@ -1786,6 +2318,13 @@ int main(void)
     test_cache_coherence();
     test_fullwidth();
     test_register_readback();
+    /* Diagnostic tests for flicker / ghost / sky-leak symptoms */
+    test_avivo_registers();
+    test_vblank_timing();
+    test_ghost_rect();
+    test_fullwidth_keyed();
+    test_vga_crtc();
+    test_flip_address();
 
     /* ---- Summary ---- */
     out("\n========================================\n");
