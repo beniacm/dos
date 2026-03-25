@@ -585,32 +585,97 @@ static void vbe_set_palette(int start, int count, const unsigned char *p)
     dpmi_rmint(0x10, &rm);
 }
 
+static void pal_set(unsigned char *p, int idx, int r, int g, int b)
+{
+    p[idx*4+0]=(unsigned char)r;
+    p[idx*4+1]=(unsigned char)g;
+    p[idx*4+2]=(unsigned char)b;
+    p[idx*4+3]=0;
+}
+
+static void pal_lerp(unsigned char *p, int i0, int i1,
+                     int r0, int g0, int b0, int r1, int g1, int b1)
+{
+    int i, n;
+    n = i1 - i0;
+    if (n <= 0) return;
+    for (i = 0; i <= n; i++) {
+        pal_set(p, i0 + i,
+                r0 + (r1 - r0) * i / n,
+                g0 + (g1 - g0) * i / n,
+                b0 + (b1 - b0) * i / n);
+    }
+}
+
 static void setup_palette(void)
 {
     unsigned char p[256 * 4];
     int i;
+    /* rainbow LUT for worm: R,G,B triples */
+    static const unsigned char rain[16][3] = {
+        {255, 30, 30},{255,100, 10},{255,180, 0},{255,255, 0},
+        {180,255, 0},{ 30,255, 30},{  0,255,150},{  0,255,255},
+        {  0,150,255},{  0, 80,255},{100, 40,255},{180,  0,255},
+        {255,  0,200},{255,  0,100},{255, 60, 60},{255,130, 30}
+    };
 
     init_dac();
     memset(p, 0, sizeof p);
 
-    for (i = 0; i < 32; i++) {
-        unsigned char v = (unsigned char)(i * 255 / 31);
-        p[( 1+i)*4+0]=0; p[( 1+i)*4+1]=0; p[( 1+i)*4+2]=v;
-        p[(33+i)*4+0]=0; p[(33+i)*4+1]=v; p[(33+i)*4+2]=0;
-        p[(65+i)*4+0]=v; p[(65+i)*4+1]=0; p[(65+i)*4+2]=0;
-        p[(97+i)*4+0]=0; p[(97+i)*4+1]=v; p[(97+i)*4+2]=v;
-        p[(129+i)*4+0]=v; p[(129+i)*4+1]=v; p[(129+i)*4+2]=0;
-        p[(161+i)*4+0]=v; p[(161+i)*4+1]=0; p[(161+i)*4+2]=v;
-        p[(193+i)*4+0]=v; p[(193+i)*4+1]=v; p[(193+i)*4+2]=v;
-    }
-    p[248*4+0]= 40; p[248*4+1]= 40; p[248*4+2]= 40;
-    p[249*4+0]= 80; p[249*4+1]= 80; p[249*4+2]= 80;
-    p[250*4+0]=  0; p[250*4+1]=255; p[250*4+2]=  0;
-    p[251*4+0]=255; p[251*4+1]=  0; p[251*4+2]=  0;
-    p[252*4+0]= 64; p[252*4+1]= 64; p[252*4+2]= 64;
-    p[253*4+0]=  0; p[253*4+1]=255; p[253*4+2]=255;
-    p[254*4+0]=255; p[254*4+1]=255; p[254*4+2]=  0;
-    p[255*4+0]=255; p[255*4+1]=255; p[255*4+2]=255;
+    /* 1-8: deep indigo to navy */
+    pal_lerp(p,  1,  8,  10, 5, 40,   20, 15, 80);
+    /* 9-20: navy to rich blue */
+    pal_lerp(p,  9, 20,  20, 15, 80,  60, 80,200);
+    /* 21-24: blue to pale cyan */
+    pal_lerp(p, 21, 24,  60, 80,200, 140,180,240);
+    /* 25-32: pale cyan to near-white horizon */
+    pal_lerp(p, 25, 32, 140,180,240, 220,235,255);
+
+    /* 33-48: far mountains -- blue-grey, lavender, misty */
+    pal_lerp(p, 33, 40, 120,130,170, 150,150,190);
+    pal_lerp(p, 41, 48, 150,150,190, 180,175,210);
+
+    /* 49-64: mid mountains -- purple, deep blue */
+    pal_lerp(p, 49, 56,  80, 60,140, 100, 80,180);
+    pal_lerp(p, 57, 64, 100, 80,180, 130,100,200);
+
+    /* 65-80: mid-near -- forest/dark green */
+    pal_lerp(p, 65, 72,  20, 80, 40,  40,120, 50);
+    pal_lerp(p, 73, 80,  40,120, 50,  60,150, 60);
+
+    /* 81-96: near mountains -- bright green, emerald */
+    pal_lerp(p, 81, 88,  30,160, 50,  50,200, 70);
+    pal_lerp(p, 89, 96,  50,200, 70,  80,230, 90);
+
+    /* 97-112: closer -- warm brown, sienna */
+    pal_lerp(p,  97,104, 140, 90, 40, 170,110, 50);
+    pal_lerp(p, 105,112, 170,110, 50, 200,130, 60);
+
+    /* 113-128: closest earth -- rich dark brown */
+    pal_lerp(p, 113,120, 100, 60, 30, 130, 75, 35);
+    pal_lerp(p, 121,128, 130, 75, 35, 160, 90, 40);
+
+    /* 129-144: foreground -- bright ochre, orange */
+    pal_lerp(p, 129,136, 200,150, 40, 230,170, 30);
+    pal_lerp(p, 137,144, 230,170, 30, 255,190, 20);
+
+    /* 145-160: very front -- deep red, crimson */
+    pal_lerp(p, 145,152, 180, 40, 30, 210, 50, 35);
+    pal_lerp(p, 153,160, 210, 50, 35, 240, 60, 40);
+
+    /* 200-215: worm body -- cycling bright rainbow */
+    for (i = 0; i < 16; i++)
+        pal_set(p, 200 + i, rain[i][0], rain[i][1], rain[i][2]);
+
+    /* UI/special colors */
+    pal_set(p, 248,  40, 40, 40);
+    pal_set(p, 249,  80, 80, 80);
+    pal_set(p, 250,   0,255,  0);
+    pal_set(p, 251, 255,  0,  0);
+    pal_set(p, 252,  64, 64, 64);
+    pal_set(p, 253,   0,255,255);
+    pal_set(p, 254, 255,255,  0);
+    pal_set(p, 255, 255,255,255);
 
     vbe_set_palette(0, 256, p);
 }
@@ -2031,140 +2096,200 @@ static void gen_diag_layer(int base, int cell_w, int cell_h,
 }
 
 /* =============================================================== */
-/*  Dune Chase: 16-layer desert parallax + 16 bouncing UFO sprites */
+/*  Dune Chase: 16-layer mountain parallax + 128-segment worm      */
 /* =============================================================== */
 
 #define DUNE_NLAYERS   16
-#define DUNE_NUFOS     16
-#define UFO_W          32
-#define UFO_H          16
+#define WORM_NSEGS    128
+#define WORM_W         12
+#define WORM_H         12
+#define WORM_COLS      10
+#define WORM_HIST     512
 
-/* ----- Generate desert sky gradient (layer 0, opaque) ------------ */
+/* ----- Generate bright sky gradient (layer 0, opaque) ------------ */
 static void gen_desert_sky(int base)
 {
-    int x, y, n, i;
+    int x, y, n, i, half;
 
-    /* Top = deep blue (index 1), fading to pale sandy blue at horizon */
+    half = g_yres / 2;
+
     for (y = 0; y < g_yres; y++) {
         unsigned char c;
-        if (y < g_yres / 2) {
-            /* Upper half: blue gradient (1-32) */
-            c = (unsigned char)(1 + y * 31 / (g_yres / 2));
-            if (c > 32) c = 32;
+        if (y < half) {
+            /* Upper half: deep indigo(1) -> rich blue(20) */
+            c = (unsigned char)(1 + y * 19 / half);
+            if (c > 20) c = 20;
         } else {
-            /* Lower half: warm yellow/sand wash (129-145) */
-            c = (unsigned char)(129 + (y - g_yres / 2) * 16 / (g_yres / 2));
-            if (c > 145) c = 145;
+            /* Lower half: blue(20) -> pale horizon white(32) */
+            c = (unsigned char)(20 + (y - half) * 12 / half);
+            if (c > 32) c = 32;
         }
         memset(g_lfb + (long)(base + y) * g_pitch, c, g_xres);
     }
 
-    /* Sparse bright sun spots near top */
+    /* Sparse stars in upper quarter */
     srand(12345);
-    n = g_xres / 8;
+    n = g_xres / 4;
     for (i = 0; i < n; i++) {
         x = rand() % g_xres;
+        y = rand() % (g_yres / 5);
+        g_lfb[(long)(base + y) * g_pitch + x] = 255;  /* white star */
+    }
+    /* A few bright yellow stars */
+    for (i = 0; i < n / 3; i++) {
+        x = rand() % g_xres;
         y = rand() % (g_yres / 4);
-        g_lfb[(long)(base + y) * g_pitch + x] = 254;  /* bright yellow dot */
+        g_lfb[(long)(base + y) * g_pitch + x] = 254;  /* yellow */
     }
 }
 
-/* ----- Generate a dune layer (layers 1-15, transparent above) ---- */
+/* ----- Generate a fractal mountain layer (layers 1-15, transparent above) */
 static void gen_dune_layer(int base, int layer_idx)
 {
-    int x, y, h, top;
-    int base_h, amp1, amp2, freq1, freq2, phase1, phase2;
+    int x, y, h, top, step, seg, half, left, right, mid_x;
+    int base_h, rough;
     unsigned char c_top, c_bot;
+    /* height map for each column */
+    static int hmap[832]; /* >= g_xres = 800, use g_pitch=832 max */
 
     /* Clear to transparent */
     for (y = 0; y < g_yres; y++)
         memset(g_lfb + (long)(base + y) * g_pitch, PLAX_TRANSP, g_xres);
 
-    /* Farther layers (lower idx) are shorter and paler.
-       Closer layers (higher idx) are taller and more saturated. */
-    base_h = g_yres * (4 + layer_idx * 2) / 100;
-    amp1   = g_yres * (3 + layer_idx) / 100;
-    amp2   = g_yres * (1 + layer_idx / 2) / 100;
-    freq1  = g_xres * (3 - layer_idx % 3) + layer_idx * 31;
-    freq2  = g_xres * (2 - layer_idx % 2) + layer_idx * 53 + 100;
-    if (freq1 < 80) freq1 = 80;
-    if (freq2 < 60) freq2 = 60;
-    phase1 = layer_idx * 137;
-    phase2 = layer_idx * 263 + 50;
+    /* --- Fractal midpoint displacement for the skyline --- */
+    srand((unsigned)(layer_idx * 7919 + 3571));
 
-    /* Color range: blend from yellow (129+) toward red/brown (65+)
-       as layers get closer */
-    if (layer_idx < 8) {
-        c_top = (unsigned char)(129 + layer_idx * 3);     /* yellow range */
-        c_bot = (unsigned char)(129 + layer_idx * 3 + 12);
-        if (c_top > 158) c_top = 158;
-        if (c_bot > 160) c_bot = 160;
-    } else {
-        c_top = (unsigned char)(65 + (layer_idx - 8) * 3);   /* red/brown */
-        c_bot = (unsigned char)(65 + (layer_idx - 8) * 3 + 15);
-        if (c_top > 92)  c_top = 92;
-        if (c_bot > 96)  c_bot = 96;
+    /* Base height and roughness scale with layer index.
+       layer 1 = farthest (short, smooth), layer 15 = closest (tall, jagged) */
+    base_h = g_yres * (5 + layer_idx * 3) / 100;
+    rough  = g_yres * (1 + layer_idx) / 50;
+
+    /* Initialize endpoints */
+    for (x = 0; x < g_xres; x++)
+        hmap[x] = base_h;
+
+    /* Seed a few anchors */
+    step = 128;
+    if (step > g_xres) step = g_xres;
+    for (x = 0; x < g_xres; x += step)
+        hmap[x] = base_h + (rand() % (rough * 2 + 1)) - rough;
+    hmap[0] = base_h + (rand() % (rough + 1));
+    hmap[g_xres - 1] = base_h + (rand() % (rough + 1));
+
+    /* Midpoint displacement passes */
+    for (seg = step; seg >= 2; seg /= 2) {
+        half = seg / 2;
+        for (x = 0; x + seg < g_xres; x += seg) {
+            left  = hmap[x];
+            right = hmap[x + seg];
+            mid_x = x + half;
+            if (mid_x < g_xres) {
+                int disp;
+                disp = (rough * half) / step;
+                if (disp < 1) disp = 1;
+                hmap[mid_x] = (left + right) / 2
+                             + (rand() % (disp * 2 + 1)) - disp;
+            }
+        }
     }
 
-    for (x = 0; x < g_xres; x++) {
-        h = base_h
-            + tri_wave(x + phase1, freq1, amp1)
-            + tri_wave(x * 2 + phase2, freq2, amp2);
-        if (h < 8) h = 8;
-        if (h > g_yres * 3 / 4) h = g_yres * 3 / 4;
-        top = g_yres - h;
+    /* Interpolate any remaining gaps (linear between set points) */
+    for (x = 0; x < g_xres - 1; x++) {
+        if (hmap[x] == base_h && x > 0) {
+            /* already filled by displacement, keep */
+        }
+    }
 
+    /* Clamp heights */
+    for (x = 0; x < g_xres; x++) {
+        if (hmap[x] < 8) hmap[x] = 8;
+        if (hmap[x] > g_yres * 3 / 4) hmap[x] = g_yres * 3 / 4;
+    }
+
+    /* Color ranges per layer group */
+    if (layer_idx <= 4) {
+        /* Far: blue-grey / lavender (33-48) to purple (49-64) */
+        c_top = (unsigned char)(33 + (layer_idx - 1) * 4);
+        c_bot = (unsigned char)(c_top + 12);
+        if (c_bot > 64) c_bot = 64;
+    } else if (layer_idx <= 7) {
+        /* Mid: purple(49-64) to forest green(65-80) */
+        c_top = (unsigned char)(49 + (layer_idx - 5) * 5);
+        c_bot = (unsigned char)(c_top + 14);
+        if (c_bot > 80) c_bot = 80;
+    } else if (layer_idx <= 11) {
+        /* Near: green(65-80) to emerald(81-96) to brown(97-112) */
+        c_top = (unsigned char)(65 + (layer_idx - 8) * 8);
+        c_bot = (unsigned char)(c_top + 14);
+        if (c_bot > 112) c_bot = 112;
+    } else {
+        /* Front: brown(113-128), ochre(129-144), crimson(145-160) */
+        c_top = (unsigned char)(113 + (layer_idx - 12) * 12);
+        c_bot = (unsigned char)(c_top + 14);
+        if (c_bot > 160) c_bot = 160;
+    }
+
+    /* Draw columns from mountain skyline downward with gradient */
+    for (x = 0; x < g_xres; x++) {
+        h = hmap[x];
+        top = g_yres - h;
         for (y = top; y < g_yres; y++) {
             int shade;
-            shade = (int)c_top + (y - top) * ((int)c_bot - (int)c_top) / h;
+            shade = (int)c_top + (y - top) * ((int)c_bot - (int)c_top) / (h > 0 ? h : 1);
+            if (shade < (int)c_top) shade = (int)c_top;
+            if (shade > (int)c_bot) shade = (int)c_bot;
             g_lfb[(long)(base + y) * g_pitch + x] = (unsigned char)shade;
         }
     }
 }
 
-/* ----- Generate UFO sprite at page 18 ----------------------------- */
-static void gen_ufo_sprite(int base)
+/* ----- Generate 128 worm ball sprites at staging page ------------- */
+static void gen_worm_sprites(int base)
 {
-    int x, y, cx, cy, dx, dy;
+    int si, row, col, sx, sy, x, y, cx, cy, r2, dx, dy;
+    unsigned char c;
+    int rows_needed;
 
-    /* Clear sprite area to transparent */
-    for (y = 0; y < UFO_H; y++)
-        memset(g_lfb + (long)(base + y) * g_pitch, PLAX_TRANSP, UFO_W);
+    /* Clear entire sprite area (WORM_COLS * WORM_W wide,
+       ceil(WORM_NSEGS/WORM_COLS) * WORM_H tall) */
+    rows_needed = ((WORM_NSEGS + WORM_COLS - 1) / WORM_COLS) * WORM_H;
+    for (y = 0; y < rows_needed && (base + y) < g_page_stride * 20; y++)
+        memset(g_lfb + (long)(base + y) * g_pitch, PLAX_TRANSP,
+               WORM_COLS * WORM_W);
 
-    cx = UFO_W / 2;
-    cy = UFO_H / 2;
+    for (si = 0; si < WORM_NSEGS; si++) {
+        row = si / WORM_COLS;
+        col = si % WORM_COLS;
+        sx = col * WORM_W;
+        sy = row * WORM_H;
+        cx = WORM_W / 2;
+        cy = WORM_H / 2;
+        r2 = (WORM_W / 2 - 1) * (WORM_W / 2 - 1);
+        c  = (unsigned char)(200 + (si % 16));
 
-    /* Dome: upper half-ellipse (rows 2..6), bright cyan */
-    for (y = 2; y <= 6; y++) {
-        int hw;
-        hw = 6 * (6 - (y - 2)) / 5;
-        if (hw < 1) hw = 1;
-        for (x = cx - hw; x <= cx + hw; x++)
-            if (x >= 0 && x < UFO_W)
-                g_lfb[(long)(base + y) * g_pitch + x] = 253;  /* bright cyan */
-    }
-
-    /* Body disc: rows 7..10, wide ellipse, bright white/yellow */
-    for (y = 7; y <= 10; y++) {
-        int hw;
-        hw = 14 - (y - 7) * 2;
-        if (hw < 6) hw = 6;
-        for (x = cx - hw; x <= cx + hw; x++) {
-            if (x >= 0 && x < UFO_W) {
-                unsigned char bc;
+        for (y = 0; y < WORM_H; y++) {
+            for (x = 0; x < WORM_W; x++) {
                 dx = x - cx;
-                dy = y - 8;
-                bc = (unsigned char)(254 - ((dx * dx + dy * dy) > 80 ? 6 : 0));
-                g_lfb[(long)(base + y) * g_pitch + x] = bc;
+                dy = y - cy;
+                if (dx * dx + dy * dy <= r2) {
+                    /* Head segment: add eyes */
+                    if (si == 0) {
+                        /* Eyes: two dark dots */
+                        if ((dx == -2 && dy == -1) || (dx == 2 && dy == -1))
+                            g_lfb[(long)(base + sy + y) * g_pitch + sx + x] = 0;
+                        else if (dx * dx + dy * dy <= (r2 * 2 / 3))
+                            g_lfb[(long)(base + sy + y) * g_pitch + sx + x] = 255;
+                        else
+                            g_lfb[(long)(base + sy + y) * g_pitch + sx + x] = 254;
+                    } else {
+                        /* Bright center, darker edge */
+                        if (dx * dx + dy * dy <= r2 / 3)
+                            g_lfb[(long)(base + sy + y) * g_pitch + sx + x] = 255;
+                        else
+                            g_lfb[(long)(base + sy + y) * g_pitch + sx + x] = c;
+                    }
+                }
             }
-        }
-    }
-
-    /* Landing lights: 3 dots at bottom */
-    for (x = cx - 6; x <= cx + 6; x += 6) {
-        for (dy = 11; dy <= 12; dy++) {
-            if (x >= 0 && x < UFO_W && dy < UFO_H)
-                g_lfb[(long)(base + dy) * g_pitch + x] = 255;  /* white */
         }
     }
 }
@@ -2172,13 +2297,13 @@ static void gen_ufo_sprite(int base)
 static void demo_dune_chase(void)
 {
     int layer_base[DUNE_NLAYERS];
-    unsigned long layer_off[DUNE_NLAYERS];  /* VRAM byte offset per layer */
-    unsigned long layer_po[DUNE_NLAYERS];   /* pre-computed PITCH_OFFSET */
+    unsigned long layer_off[DUNE_NLAYERS];
+    unsigned long layer_po[DUNE_NLAYERS];
     int sprite_base;
-    unsigned long sprite_off;               /* VRAM byte offset for sprite */
-    unsigned long sprite_po_val;            /* PITCH_OFFSET for sprite */
-    unsigned long stage_off;                /* staging area byte offset */
-    unsigned long stage_po;                 /* PITCH_OFFSET for staging */
+    unsigned long sprite_off;
+    unsigned long sprite_po_val;
+    unsigned long stage_off;
+    unsigned long stage_po;
     int back_page, back_y, scroll;
     long fps_count;
     clock_t fps_t0, t_render_start, t_render_end, t_frame_end;
@@ -2187,10 +2312,14 @@ static void demo_dune_chase(void)
     char buf[120];
     int i;
     unsigned long need;
+    int sprite_blit_w, sprite_blit_h;
 
-    /* UFO state arrays */
-    int ux[DUNE_NUFOS], uy[DUNE_NUFOS];
-    int udx[DUNE_NUFOS], udy[DUNE_NUFOS];
+    /* Worm state */
+    int worm_hx[WORM_HIST], worm_hy[WORM_HIST];
+    int worm_head;
+    int head_dx, head_dy;
+    int scroll_x;
+    int seg_row, seg_col, seg_sx, seg_sy;
 
     need = (unsigned long)g_pitch * g_page_stride * 20;
     if (g_vram_mb > 0 && need > g_vram_mb * 1024UL * 1024UL) {
@@ -2202,9 +2331,7 @@ static void demo_dune_chase(void)
         return;
     }
 
-    /* Compute layer offscreen row bases and VRAM byte offsets.
-       Pre-compute PITCH_OFFSET values so each blit carries its own
-       surface address — matching the xf86-video-ati driver pattern. */
+    /* Compute layer offscreen row bases and VRAM byte offsets */
     for (i = 0; i < DUNE_NLAYERS; i++) {
         layer_base[i] = g_page_stride * (2 + i);
         layer_off[i]  = (unsigned long)layer_base[i] * g_pitch;
@@ -2220,23 +2347,14 @@ static void demo_dune_chase(void)
     stage_off = (unsigned long)g_page_stride * g_pitch;
     stage_po  = make_pitch_offset(stage_off);
 
-    /* Widen scissor so GPU ops can reach offscreen VRAM.
-       With per-surface offsets, coordinates stay within 0..g_yres,
-       but we still need room for the 2-page display fill. */
+    /* Widen scissor for offscreen ops */
     gpu_wait_fifo(1);
     wreg(R_SC_BOTTOM_RIGHT, (0x3FFFUL << 16) | (unsigned long)g_xres);
 
-    /* Show generation message */
     gpu_fill(0, 0, g_xres, g_yres, 0);
     gpu_wait_idle();
-    cpu_str_c(g_yres / 2 - 20, "Generating 16-layer desert landscape...", 255, 2);
-    cpu_str_c(g_yres / 2 + 10, "Dune Chase: 16 layers + 16 UFOs", 253, 1);
-
-    /* Generate all 16 layers via staging through page 1.
-       CPU writes each layer into page 1 (within LFB range), then
-       GPU blits from page 1 to the final offscreen page.
-       Both src and dst PITCH_OFFSET + GMC control bits are written
-       in the SAME FIFO batch per blit (xf86 driver pattern). */
+    cpu_str_c(g_yres / 2 - 20, "Generating 16-layer mountain landscape...", 255, 2);
+    cpu_str_c(g_yres / 2 + 10, "Mountain Chase: 16 layers + 128-segment worm", 253, 1);
 
     /* Layer 0: sky (opaque) */
     gen_desert_sky(g_page_stride);
@@ -2244,7 +2362,7 @@ static void demo_dune_chase(void)
     gpu_wait_idle();
     gpu_flush_2d_cache();
 
-    /* Layers 1-15: dunes */
+    /* Layers 1-15: fractal mountains */
     for (i = 1; i < DUNE_NLAYERS; i++) {
         gen_dune_layer(g_page_stride, i);
         gpu_blit_po(stage_po, 0, 0, layer_po[i], 0, 0, g_xres, g_yres);
@@ -2252,26 +2370,31 @@ static void demo_dune_chase(void)
         gpu_flush_2d_cache();
     }
 
-    /* UFO sprite */
-    gen_ufo_sprite(g_page_stride);
-    gpu_blit_po(stage_po, 0, 0, sprite_po_val, 0, 0, UFO_W, UFO_H);
+    /* Worm sprites -- blit the entire sprite area */
+    gen_worm_sprites(g_page_stride);
+    sprite_blit_w = WORM_COLS * WORM_W;
+    sprite_blit_h = ((WORM_NSEGS + WORM_COLS - 1) / WORM_COLS) * WORM_H;
+    gpu_blit_po(stage_po, 0, 0, sprite_po_val, 0, 0,
+                sprite_blit_w, sprite_blit_h);
     gpu_wait_idle();
     gpu_flush_2d_cache();
 
-    /* Reset PITCH_OFFSET to default for gpu_fill (which lacks GMC bits) */
+    /* Reset PITCH_OFFSET to default */
     gpu_wait_fifo(2);
     wreg(R_DST_PITCH_OFFSET, g_default_po);
     wreg(R_SRC_PITCH_OFFSET, g_default_po);
 
-    /* Initialize UFO positions and velocities */
+    /* Initialize worm: head starts mid-screen, moving diagonally */
     srand(9999);
-    for (i = 0; i < DUNE_NUFOS; i++) {
-        ux[i]  = rand() % (g_xres - UFO_W);
-        uy[i]  = 20 + rand() % (g_yres - UFO_H - 40);
-        udx[i] = (rand() % 3) + 1;
-        udy[i] = (rand() % 3) + 1;
-        if (rand() % 2) udx[i] = -udx[i];
-        if (rand() % 2) udy[i] = -udy[i];
+    worm_head = 0;
+    head_dx = 5;
+    head_dy = 3;
+    worm_hx[0] = g_xres / 2;
+    worm_hy[0] = g_yres / 2;
+    /* Pre-fill history so all segments start at same spot */
+    for (i = 1; i < WORM_HIST; i++) {
+        worm_hx[i] = worm_hx[0];
+        worm_hy[i] = worm_hy[0];
     }
 
     /* Clear both display pages */
@@ -2292,40 +2415,50 @@ static void demo_dune_chase(void)
 
         t_render_start = clock();
 
-        /* Composite 16 layers back-to-front into back buffer.
-           Layer 0 at 1/16 speed, layer 15 at full speed.
-           Each blit writes SRC_PITCH_OFFSET, DST_PITCH_OFFSET, and
-           DP_GUI_MASTER_CNTL with GMC_*_PITCH_OFFSET_CNTL bits in a
-           single FIFO batch — ensuring the GPU reads per-surface offsets. */
-        plax_blit_wrap_po(layer_po[0], scroll / 16,
+        /* Composite 16 layers with exponential scroll speeds.
+           Layer 0 (far sky): very slow.  Layer 15 (front): ~8x faster. */
+        plax_blit_wrap_po(layer_po[0], scroll / 32,
                           g_default_po, back_y, g_yres, 0);
         for (i = 1; i < DUNE_NLAYERS; i++) {
-            plax_blit_wrap_po(layer_po[i], scroll * (i + 1) / 16,
+            scroll_x = (int)((long)scroll * (1 + (long)i * i) / 64);
+            plax_blit_wrap_po(layer_po[i], scroll_x,
                               g_default_po, back_y, g_yres, 1);
         }
 
-        /* Draw 16 UFO sprites with color-key transparency */
-        for (i = 0; i < DUNE_NUFOS; i++) {
-            gpu_blit_po_key(sprite_po_val, 0, 0,
-                            g_default_po, ux[i], back_y + uy[i],
-                            UFO_W, UFO_H, PLAX_TRANSP);
+        /* Draw 128 worm segments (tail first so head draws on top) */
+        for (i = WORM_NSEGS - 1; i >= 0; i--) {
+            int hi, wx, wy;
+            hi = (worm_head - i * 2 + WORM_HIST * 256) % WORM_HIST;
+            wx = worm_hx[hi];
+            wy = worm_hy[hi];
+            seg_row = i / WORM_COLS;
+            seg_col = i % WORM_COLS;
+            seg_sx  = seg_col * WORM_W;
+            seg_sy  = seg_row * WORM_H;
+            gpu_blit_po_key(sprite_po_val, seg_sx, seg_sy,
+                            g_default_po, wx, back_y + wy,
+                            WORM_W, WORM_H, PLAX_TRANSP);
         }
 
         gpu_wait_idle();
 
         t_render_end = clock();
 
-        /* Update UFO positions (bounce off edges) */
-        for (i = 0; i < DUNE_NUFOS; i++) {
-            ux[i] += udx[i];
-            uy[i] += udy[i];
-            if (ux[i] < 0)               { ux[i] = 0;               udx[i] = -udx[i]; }
-            if (ux[i] > g_xres - UFO_W)  { ux[i] = g_xres - UFO_W; udx[i] = -udx[i]; }
-            if (uy[i] < 16)              { uy[i] = 16;              udy[i] = -udy[i]; }
-            if (uy[i] > g_yres - UFO_H)  { uy[i] = g_yres - UFO_H; udy[i] = -udy[i]; }
+        /* Advance worm head */
+        {
+            int nx, ny;
+            nx = worm_hx[worm_head] + head_dx;
+            ny = worm_hy[worm_head] + head_dy;
+            if (nx < 0)              { nx = 0;              head_dx = -head_dx; }
+            if (nx > g_xres - WORM_W){ nx = g_xres - WORM_W; head_dx = -head_dx; }
+            if (ny < 16)             { ny = 16;             head_dy = -head_dy; }
+            if (ny > g_yres - WORM_H){ ny = g_yres - WORM_H; head_dy = -head_dy; }
+            worm_head = (worm_head + 1) % WORM_HIST;
+            worm_hx[worm_head] = nx;
+            worm_hy[worm_head] = ny;
         }
 
-        /* FPS counter (update every ~1 second) */
+        /* FPS counter */
         fps_count++;
         {
             clock_t now = clock();
@@ -2341,17 +2474,15 @@ static void demo_dune_chase(void)
             }
         }
 
-        /* HUD text (CPU writes directly to back buffer in LFB) */
-        sprintf(buf, "Dune Chase  16 layers + 16 UFOs  %.1f FPS  CPU:%d%%  [ESC quit]",
+        /* HUD */
+        sprintf(buf, "Mountain Chase  16 layers + 128-seg worm  %.1f FPS  CPU:%d%%  [ESC quit]",
                 fps, (int)(cpu_pct + 0.5));
         cpu_str(4, back_y + 4, buf, 255, 1);
 
-        /* Page flip: atomic, tear-free */
         flip_page(back_page);
 
         t_frame_end = clock();
 
-        /* Accumulate CPU utilization sample for this frame */
         {
             double render_t = (double)(t_render_end - t_render_start);
             double frame_t  = (double)(t_frame_end  - t_render_start);
@@ -2362,15 +2493,13 @@ static void demo_dune_chase(void)
         }
 
         back_page ^= 1;
-        scroll++;
+        scroll += 3;
         if (scroll >= g_xres * 1000) scroll = 0;
     }
     getch();
 
-    /* Restore display to page 0 */
     flip_restore_page0();
 
-    /* Reset PITCH_OFFSET to default and restore scissor for other demos */
     gpu_wait_fifo(3);
     wreg(R_DST_PITCH_OFFSET, g_default_po);
     wreg(R_SRC_PITCH_OFFSET, g_default_po);
