@@ -124,6 +124,8 @@ typedef struct {
 #define   GMC_DP_SRC_MEMORY        (2UL << 24)
 #define   GMC_CLR_CMP_DIS          (1UL << 28)
 #define   GMC_WR_MSK_DIS           (1UL << 30)
+#define   GMC_SRC_PITCH_OFFSET_CNTL (1UL << 0)
+#define   GMC_DST_PITCH_OFFSET_CNTL (1UL << 1)
 #define   ROP3_PATCOPY             (0xF0UL << 16)
 #define   ROP3_SRCCOPY             (0xCCUL << 16)
 
@@ -311,6 +313,7 @@ static unsigned long  g_lfb_phys  = 0;
 static unsigned long  g_fb_location = 0;   /* GPU internal FB base address */
 static int g_xres, g_yres, g_pitch;
 static int g_page_stride;  /* rows per page, chosen so stride*pitch is 4KB-aligned */
+static unsigned long g_default_po;   /* cached default PITCH_OFFSET (set in gpu_init_2d) */
 static unsigned short g_vmode;
 static unsigned char *g_font = NULL;
 static int g_fifo_free = 0;  /* tracked free FIFO entries (avoids MMIO reads) */
@@ -897,6 +900,7 @@ static void gpu_init_2d(void)
        Offset includes GPU internal FB base address from HDP_FB_LOCATION. */
     pitch64 = ((unsigned long)g_pitch + 63) / 64;
     pitch_offset = (pitch64 << 22) | ((g_fb_location >> 10) & 0x003FFFFFUL);
+    g_default_po = pitch_offset;
 
     gpu_wait_fifo(18);
 
@@ -1246,10 +1250,15 @@ static void gpu_blit_key(int sx, int sy, int dx, int dy, int w, int h,
 }
 
 /* ---------------------------------------------------------------
-   Per-surface PITCH_OFFSET helpers.
+   Per-surface PITCH_OFFSET blit functions.
    The R300-R500 2D engine has a 13-bit Y coordinate limit (max 8191).
-   For offscreen surfaces beyond row 8191, we must rebase the
-   SRC/DST PITCH_OFFSET so that Y coordinates stay within 0..8191.
+   For offscreen surfaces beyond row 8191, we must encode the surface
+   base into SRC/DST_PITCH_OFFSET and keep Y within 0..8191.
+
+   These functions write PITCH_OFFSET registers AND DP_GUI_MASTER_CNTL
+   with GMC_*_PITCH_OFFSET_CNTL bits in a single FIFO batch, matching
+   the xf86-video-ati driver pattern.  This guarantees the GPU reads
+   the per-surface offsets for each blit.
    ---------------------------------------------------------------*/
 
 /* Build a PITCH_OFFSET register value for a given VRAM byte offset */
@@ -1260,29 +1269,67 @@ static unsigned long make_pitch_offset(unsigned long vram_byte_off)
     return (pitch64 << 22) | ((gpu_addr >> 10) & 0x003FFFFFUL);
 }
 
-/* Set source surface base for subsequent blits (combined + separate) */
-static void set_src_surface(unsigned long vram_byte_off)
+/* Forward blit with explicit per-surface PITCH_OFFSET values */
+static void gpu_blit_po(unsigned long src_po, int sx, int sy,
+                        unsigned long dst_po, int dx, int dy,
+                        int w, int h)
 {
-    gpu_wait_fifo(3);
-    wreg(R_SRC_PITCH_OFFSET, make_pitch_offset(vram_byte_off));
-    wreg(R_SRC_OFFSET, g_fb_location + vram_byte_off);
-    wreg(R_SRC_PITCH,  (unsigned long)g_pitch);
+    gpu_wait_fifo(7);
+    wreg(R_DST_PITCH_OFFSET, dst_po);
+    wreg(R_SRC_PITCH_OFFSET, src_po);
+    wreg(R_DP_GUI_MASTER_CNTL,
+         GMC_DST_PITCH_OFFSET_CNTL | GMC_SRC_PITCH_OFFSET_CNTL |
+         GMC_BRUSH_NONE | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_SRCCOPY | GMC_DP_SRC_MEMORY | GMC_CLR_CMP_DIS |
+         GMC_WR_MSK_DIS);
+    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+    wreg(R_SRC_Y_X, ((unsigned long)sy << 16) | (unsigned long)(sx & 0xFFFF));
+    wreg(R_DST_Y_X, ((unsigned long)dy << 16) | (unsigned long)(dx & 0xFFFF));
+    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
 }
 
-/* Set destination surface base for subsequent blits/fills */
-static void set_dst_surface(unsigned long vram_byte_off)
+/* Keyed blit with explicit per-surface PITCH_OFFSET values.
+   Pixels matching `key` in the source are NOT drawn. */
+static void gpu_blit_po_key(unsigned long src_po, int sx, int sy,
+                            unsigned long dst_po, int dx, int dy,
+                            int w, int h, unsigned char key)
 {
-    gpu_wait_fifo(3);
-    wreg(R_DST_PITCH_OFFSET, make_pitch_offset(vram_byte_off));
-    wreg(R_DST_OFFSET, g_fb_location + vram_byte_off);
-    wreg(R_DST_PITCH,  (unsigned long)g_pitch);
+    gpu_wait_fifo(10);
+    wreg(R_CLR_CMP_CLR_SRC, (unsigned long)key);
+    wreg(R_CLR_CMP_MASK,    0x000000FFUL);
+    wreg(R_CLR_CMP_CNTL,    CLR_CMP_SRC_SOURCE | CLR_CMP_FCN_NE);
+    wreg(R_DST_PITCH_OFFSET, dst_po);
+    wreg(R_SRC_PITCH_OFFSET, src_po);
+    wreg(R_DP_GUI_MASTER_CNTL,
+         GMC_DST_PITCH_OFFSET_CNTL | GMC_SRC_PITCH_OFFSET_CNTL |
+         GMC_BRUSH_NONE | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_SRCCOPY | GMC_DP_SRC_MEMORY | GMC_WR_MSK_DIS);
+    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+    wreg(R_SRC_Y_X, ((unsigned long)sy << 16) | (unsigned long)(sx & 0xFFFF));
+    wreg(R_DST_Y_X, ((unsigned long)dy << 16) | (unsigned long)(dx & 0xFFFF));
+    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
 }
 
-/* Restore both surfaces to default (VRAM base, offset 0) */
-static void restore_surfaces(void)
+/* Parallax blit with scroll wrapping — uses per-surface PITCH_OFFSET */
+static void plax_blit_wrap_po(unsigned long src_po, int scroll_x,
+                              unsigned long dst_po, int dst_y,
+                              int h, int use_key)
 {
-    set_src_surface(0);
-    set_dst_surface(0);
+    int sx, w1, w2;
+    sx = scroll_x % g_xres;
+    if (sx < 0) sx += g_xres;
+    w1 = g_xres - sx;
+    w2 = sx;
+
+    if (use_key) {
+        gpu_blit_po_key(src_po, sx, 0, dst_po, 0, dst_y, w1, h, PLAX_TRANSP);
+        if (w2 > 0)
+            gpu_blit_po_key(src_po, 0, 0, dst_po, w1, dst_y, w2, h, PLAX_TRANSP);
+    } else {
+        gpu_blit_po(src_po, sx, 0, dst_po, 0, dst_y, w1, h);
+        if (w2 > 0)
+            gpu_blit_po(src_po, 0, 0, dst_po, w1, dst_y, w2, h);
+    }
 }
 
 /* Flush 2D destination cache (after GPU writes, before next read) */
@@ -2125,9 +2172,12 @@ static void demo_dune_chase(void)
 {
     int layer_base[DUNE_NLAYERS];
     unsigned long layer_off[DUNE_NLAYERS];  /* VRAM byte offset per layer */
+    unsigned long layer_po[DUNE_NLAYERS];   /* pre-computed PITCH_OFFSET */
     int sprite_base;
     unsigned long sprite_off;               /* VRAM byte offset for sprite */
+    unsigned long sprite_po_val;            /* PITCH_OFFSET for sprite */
     unsigned long stage_off;                /* staging area byte offset */
+    unsigned long stage_po;                 /* PITCH_OFFSET for staging */
     int back_page, back_y, scroll;
     long fps_count;
     clock_t fps_t0, t_render_start, t_render_end, t_frame_end;
@@ -2152,20 +2202,22 @@ static void demo_dune_chase(void)
     }
 
     /* Compute layer offscreen row bases and VRAM byte offsets.
-       Row bases are used for LFB staging; byte offsets are used for
-       per-surface PITCH_OFFSET to keep Y coords within 0..8191
-       (the R300-R500 2D engine has a 13-bit coordinate limit). */
+       Pre-compute PITCH_OFFSET values so each blit carries its own
+       surface address — matching the xf86-video-ati driver pattern. */
     for (i = 0; i < DUNE_NLAYERS; i++) {
         layer_base[i] = g_page_stride * (2 + i);
         layer_off[i]  = (unsigned long)layer_base[i] * g_pitch;
+        layer_po[i]   = make_pitch_offset(layer_off[i]);
     }
 
     /* Sprite sheet at page 18 */
-    sprite_base = g_page_stride * 18;
-    sprite_off  = (unsigned long)sprite_base * g_pitch;
+    sprite_base   = g_page_stride * 18;
+    sprite_off    = (unsigned long)sprite_base * g_pitch;
+    sprite_po_val = make_pitch_offset(sprite_off);
 
     /* Staging area = page 1 */
     stage_off = (unsigned long)g_page_stride * g_pitch;
+    stage_po  = make_pitch_offset(stage_off);
 
     /* Widen scissor so GPU ops can reach offscreen VRAM.
        With per-surface offsets, coordinates stay within 0..g_yres,
@@ -2181,37 +2233,34 @@ static void demo_dune_chase(void)
 
     /* Generate all 16 layers via staging through page 1.
        CPU writes each layer into page 1 (within LFB range), then
-       GPU blits from page 1 to the final offscreen page.  Both
-       src and dst use per-surface PITCH_OFFSET so Y stays < 8191. */
+       GPU blits from page 1 to the final offscreen page.
+       Both src and dst PITCH_OFFSET + GMC control bits are written
+       in the SAME FIFO batch per blit (xf86 driver pattern). */
 
     /* Layer 0: sky (opaque) */
     gen_desert_sky(g_page_stride);
-    set_src_surface(stage_off);
-    set_dst_surface(layer_off[0]);
-    gpu_blit_fwd(0, 0, 0, 0, g_xres, g_yres);
+    gpu_blit_po(stage_po, 0, 0, layer_po[0], 0, 0, g_xres, g_yres);
     gpu_wait_idle();
     gpu_flush_2d_cache();
 
     /* Layers 1-15: dunes */
     for (i = 1; i < DUNE_NLAYERS; i++) {
         gen_dune_layer(g_page_stride, i);
-        set_src_surface(stage_off);
-        set_dst_surface(layer_off[i]);
-        gpu_blit_fwd(0, 0, 0, 0, g_xres, g_yres);
+        gpu_blit_po(stage_po, 0, 0, layer_po[i], 0, 0, g_xres, g_yres);
         gpu_wait_idle();
         gpu_flush_2d_cache();
     }
 
     /* UFO sprite */
     gen_ufo_sprite(g_page_stride);
-    set_src_surface(stage_off);
-    set_dst_surface(sprite_off);
-    gpu_blit_fwd(0, 0, 0, 0, UFO_W, UFO_H);
+    gpu_blit_po(stage_po, 0, 0, sprite_po_val, 0, 0, UFO_W, UFO_H);
     gpu_wait_idle();
     gpu_flush_2d_cache();
 
-    /* Restore default surfaces for display page operations */
-    restore_surfaces();
+    /* Reset PITCH_OFFSET to default for gpu_fill (which lacks GMC bits) */
+    gpu_wait_fifo(2);
+    wreg(R_DST_PITCH_OFFSET, g_default_po);
+    wreg(R_SRC_PITCH_OFFSET, g_default_po);
 
     /* Initialize UFO positions and velocities */
     srand(9999);
@@ -2227,10 +2276,6 @@ static void demo_dune_chase(void)
     /* Clear both display pages */
     gpu_fill(0, 0, g_xres, g_page_stride * 2, 0);
     gpu_wait_idle();
-
-    /* Reset color compare to clean state before keyed blits */
-    gpu_wait_fifo(1);
-    wreg(R_CLR_CMP_CNTL, 0);
 
     back_page   = 1;
     scroll      = 0;
@@ -2248,22 +2293,21 @@ static void demo_dune_chase(void)
 
         /* Composite 16 layers back-to-front into back buffer.
            Layer 0 at 1/16 speed, layer 15 at full speed.
-           Each layer uses per-surface SRC_PITCH_OFFSET so all
-           source Y coordinates are 0..g_yres (within 8191 limit). */
-        set_src_surface(layer_off[0]);
-        plax_blit_wrap(0, scroll / 16,
-                       back_y, g_yres, 0);  /* sky: opaque */
+           Each blit writes SRC_PITCH_OFFSET, DST_PITCH_OFFSET, and
+           DP_GUI_MASTER_CNTL with GMC_*_PITCH_OFFSET_CNTL bits in a
+           single FIFO batch — ensuring the GPU reads per-surface offsets. */
+        plax_blit_wrap_po(layer_po[0], scroll / 16,
+                          g_default_po, back_y, g_yres, 0);
         for (i = 1; i < DUNE_NLAYERS; i++) {
-            set_src_surface(layer_off[i]);
-            plax_blit_wrap(0, scroll * (i + 1) / 16,
-                           back_y, g_yres, 1);  /* dunes: keyed */
+            plax_blit_wrap_po(layer_po[i], scroll * (i + 1) / 16,
+                              g_default_po, back_y, g_yres, 1);
         }
 
         /* Draw 16 UFO sprites with color-key transparency */
-        set_src_surface(sprite_off);
         for (i = 0; i < DUNE_NUFOS; i++) {
-            gpu_blit_key(0, 0, ux[i], back_y + uy[i],
-                         UFO_W, UFO_H, PLAX_TRANSP);
+            gpu_blit_po_key(sprite_po_val, 0, 0,
+                            g_default_po, ux[i], back_y + uy[i],
+                            UFO_W, UFO_H, PLAX_TRANSP);
         }
 
         gpu_wait_idle();
@@ -2289,7 +2333,6 @@ static void demo_dune_chase(void)
                 fps = (double)fps_count / elapsed;
                 fps_count = 0;
                 fps_t0 = now;
-                /* Update CPU% average over this interval */
                 if (cpu_samples > 0)
                     cpu_pct = cpu_acc / cpu_samples;
                 cpu_acc = 0.0;
@@ -2319,16 +2362,17 @@ static void demo_dune_chase(void)
 
         back_page ^= 1;
         scroll++;
-        if (scroll >= g_xres * 1000) scroll = 0;  /* prevent overflow */
+        if (scroll >= g_xres * 1000) scroll = 0;
     }
     getch();
 
     /* Restore display to page 0 */
     flip_restore_page0();
 
-    /* Restore default surfaces and scissor for other demos */
-    restore_surfaces();
-    gpu_wait_fifo(1);
+    /* Reset PITCH_OFFSET to default and restore scissor for other demos */
+    gpu_wait_fifo(3);
+    wreg(R_DST_PITCH_OFFSET, g_default_po);
+    wreg(R_SRC_PITCH_OFFSET, g_default_po);
     wreg(R_SC_BOTTOM_RIGHT,
          ((unsigned long)g_yres << 16) | (unsigned long)g_xres);
 }
