@@ -148,6 +148,13 @@ typedef struct {
 #define R_DST_LINE_PATCOUNT        0x1608
 
 /* R300+ specific registers */
+#define R_DSTCACHE_CTLSTAT         0x1714
+#define   R300_DC_FLUSH_2D         (1UL << 0)
+#define   R300_DC_FREE_2D          (1UL << 2)
+#define   R300_RB2D_DC_FLUSH_ALL   0x05UL
+#define R_WAIT_UNTIL               0x1720
+#define   WAIT_2D_IDLECLEAN        (1UL << 16)
+#define   WAIT_DMA_GUI_IDLE        (1UL << 9)
 #define R_RB3D_DSTCACHE_MODE       0x3258
 #define R_RB2D_DSTCACHE_MODE       0x3428
 #define R_RB2D_DSTCACHE_CTLSTAT    0x342C
@@ -1238,6 +1245,54 @@ static void gpu_blit_key(int sx, int sy, int dx, int dy, int w, int h,
     wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
 }
 
+/* ---------------------------------------------------------------
+   Per-surface PITCH_OFFSET helpers.
+   The R300-R500 2D engine has a 13-bit Y coordinate limit (max 8191).
+   For offscreen surfaces beyond row 8191, we must rebase the
+   SRC/DST PITCH_OFFSET so that Y coordinates stay within 0..8191.
+   ---------------------------------------------------------------*/
+
+/* Build a PITCH_OFFSET register value for a given VRAM byte offset */
+static unsigned long make_pitch_offset(unsigned long vram_byte_off)
+{
+    unsigned long pitch64  = (unsigned long)g_pitch / 64;
+    unsigned long gpu_addr = g_fb_location + vram_byte_off;
+    return (pitch64 << 22) | ((gpu_addr >> 10) & 0x003FFFFFUL);
+}
+
+/* Set source surface base for subsequent blits (combined + separate) */
+static void set_src_surface(unsigned long vram_byte_off)
+{
+    gpu_wait_fifo(3);
+    wreg(R_SRC_PITCH_OFFSET, make_pitch_offset(vram_byte_off));
+    wreg(R_SRC_OFFSET, g_fb_location + vram_byte_off);
+    wreg(R_SRC_PITCH,  (unsigned long)g_pitch);
+}
+
+/* Set destination surface base for subsequent blits/fills */
+static void set_dst_surface(unsigned long vram_byte_off)
+{
+    gpu_wait_fifo(3);
+    wreg(R_DST_PITCH_OFFSET, make_pitch_offset(vram_byte_off));
+    wreg(R_DST_OFFSET, g_fb_location + vram_byte_off);
+    wreg(R_DST_PITCH,  (unsigned long)g_pitch);
+}
+
+/* Restore both surfaces to default (VRAM base, offset 0) */
+static void restore_surfaces(void)
+{
+    set_src_surface(0);
+    set_dst_surface(0);
+}
+
+/* Flush 2D destination cache (after GPU writes, before next read) */
+static void gpu_flush_2d_cache(void)
+{
+    gpu_wait_fifo(2);
+    wreg(R_DSTCACHE_CTLSTAT, R300_RB2D_DC_FLUSH_ALL);
+    wreg(R_WAIT_UNTIL, WAIT_2D_IDLECLEAN | WAIT_DMA_GUI_IDLE);
+}
+
 /* =============================================================== */
 /*  VESA mode selection: find best 8bpp LFB mode                    */
 /* =============================================================== */
@@ -2069,7 +2124,10 @@ static void gen_ufo_sprite(int base)
 static void demo_dune_chase(void)
 {
     int layer_base[DUNE_NLAYERS];
+    unsigned long layer_off[DUNE_NLAYERS];  /* VRAM byte offset per layer */
     int sprite_base;
+    unsigned long sprite_off;               /* VRAM byte offset for sprite */
+    unsigned long stage_off;                /* staging area byte offset */
     int back_page, back_y, scroll;
     long fps_count;
     clock_t fps_t0, t_render_start, t_render_end, t_frame_end;
@@ -2093,14 +2151,25 @@ static void demo_dune_chase(void)
         return;
     }
 
-    /* Compute layer offscreen row bases: pages 2..17 */
-    for (i = 0; i < DUNE_NLAYERS; i++)
+    /* Compute layer offscreen row bases and VRAM byte offsets.
+       Row bases are used for LFB staging; byte offsets are used for
+       per-surface PITCH_OFFSET to keep Y coords within 0..8191
+       (the R300-R500 2D engine has a 13-bit coordinate limit). */
+    for (i = 0; i < DUNE_NLAYERS; i++) {
         layer_base[i] = g_page_stride * (2 + i);
+        layer_off[i]  = (unsigned long)layer_base[i] * g_pitch;
+    }
 
     /* Sprite sheet at page 18 */
     sprite_base = g_page_stride * 18;
+    sprite_off  = (unsigned long)sprite_base * g_pitch;
 
-    /* Widen scissor so GPU ops can reach offscreen VRAM */
+    /* Staging area = page 1 */
+    stage_off = (unsigned long)g_page_stride * g_pitch;
+
+    /* Widen scissor so GPU ops can reach offscreen VRAM.
+       With per-surface offsets, coordinates stay within 0..g_yres,
+       but we still need room for the 2-page display fill. */
     gpu_wait_fifo(1);
     wreg(R_SC_BOTTOM_RIGHT, (0x3FFFUL << 16) | (unsigned long)g_xres);
 
@@ -2111,29 +2180,38 @@ static void demo_dune_chase(void)
     cpu_str_c(g_yres / 2 + 10, "Dune Chase: 16 layers + 16 UFOs", 253, 1);
 
     /* Generate all 16 layers via staging through page 1.
-       CPU writes each layer to page 1 (within LFB range), then GPU
-       blits it to the final offscreen page (accessible to GPU but
-       potentially beyond the LFB mapping). */
-    {
-        int stage_base = g_page_stride;  /* page 1 as staging area */
+       CPU writes each layer into page 1 (within LFB range), then
+       GPU blits from page 1 to the final offscreen page.  Both
+       src and dst use per-surface PITCH_OFFSET so Y stays < 8191. */
 
-        /* Layer 0: sky (opaque) */
-        gen_desert_sky(stage_base);
-        gpu_blit_fwd(0, stage_base, 0, layer_base[0], g_xres, g_yres);
+    /* Layer 0: sky (opaque) */
+    gen_desert_sky(g_page_stride);
+    set_src_surface(stage_off);
+    set_dst_surface(layer_off[0]);
+    gpu_blit_fwd(0, 0, 0, 0, g_xres, g_yres);
+    gpu_wait_idle();
+    gpu_flush_2d_cache();
+
+    /* Layers 1-15: dunes */
+    for (i = 1; i < DUNE_NLAYERS; i++) {
+        gen_dune_layer(g_page_stride, i);
+        set_src_surface(stage_off);
+        set_dst_surface(layer_off[i]);
+        gpu_blit_fwd(0, 0, 0, 0, g_xres, g_yres);
         gpu_wait_idle();
-
-        /* Layers 1-15: dunes */
-        for (i = 1; i < DUNE_NLAYERS; i++) {
-            gen_dune_layer(stage_base, i);
-            gpu_blit_fwd(0, stage_base, 0, layer_base[i], g_xres, g_yres);
-            gpu_wait_idle();
-        }
-
-        /* UFO sprite */
-        gen_ufo_sprite(stage_base);
-        gpu_blit_fwd(0, stage_base, 0, sprite_base, UFO_W, UFO_H);
-        gpu_wait_idle();
+        gpu_flush_2d_cache();
     }
+
+    /* UFO sprite */
+    gen_ufo_sprite(g_page_stride);
+    set_src_surface(stage_off);
+    set_dst_surface(sprite_off);
+    gpu_blit_fwd(0, 0, 0, 0, UFO_W, UFO_H);
+    gpu_wait_idle();
+    gpu_flush_2d_cache();
+
+    /* Restore default surfaces for display page operations */
+    restore_surfaces();
 
     /* Initialize UFO positions and velocities */
     srand(9999);
@@ -2169,17 +2247,22 @@ static void demo_dune_chase(void)
         t_render_start = clock();
 
         /* Composite 16 layers back-to-front into back buffer.
-           Layer 0 at 1/16 speed, layer 15 at full speed. */
-        plax_blit_wrap(layer_base[0], scroll / 16,
+           Layer 0 at 1/16 speed, layer 15 at full speed.
+           Each layer uses per-surface SRC_PITCH_OFFSET so all
+           source Y coordinates are 0..g_yres (within 8191 limit). */
+        set_src_surface(layer_off[0]);
+        plax_blit_wrap(0, scroll / 16,
                        back_y, g_yres, 0);  /* sky: opaque */
         for (i = 1; i < DUNE_NLAYERS; i++) {
-            plax_blit_wrap(layer_base[i], scroll * (i + 1) / 16,
+            set_src_surface(layer_off[i]);
+            plax_blit_wrap(0, scroll * (i + 1) / 16,
                            back_y, g_yres, 1);  /* dunes: keyed */
         }
 
         /* Draw 16 UFO sprites with color-key transparency */
+        set_src_surface(sprite_off);
         for (i = 0; i < DUNE_NUFOS; i++) {
-            gpu_blit_key(0, sprite_base, ux[i], back_y + uy[i],
+            gpu_blit_key(0, 0, ux[i], back_y + uy[i],
                          UFO_W, UFO_H, PLAX_TRANSP);
         }
 
@@ -2243,7 +2326,8 @@ static void demo_dune_chase(void)
     /* Restore display to page 0 */
     flip_restore_page0();
 
-    /* Restore scissor */
+    /* Restore default surfaces and scissor for other demos */
+    restore_surfaces();
     gpu_wait_fifo(1);
     wreg(R_SC_BOTTOM_RIGHT,
          ((unsigned long)g_yres << 16) | (unsigned long)g_xres);
