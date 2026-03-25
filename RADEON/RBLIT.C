@@ -130,8 +130,10 @@ typedef struct {
 #define R_CLR_CMP_CNTL            0x15C0
 #define R_CLR_CMP_CLR_SRC         0x15C4
 #define R_CLR_CMP_MASK            0x15CC
-#define   CLR_CMP_FCN_EQ          4UL           /* FCN=4: draw when src == key */
-#define   CLR_CMP_FCN_NE          5UL           /* FCN=5: draw when src != key */
+/* Hardware-confirmed: FCN=4 draws when src != key; FCN=5 draws when src == key.
+   xf86 names these EQ_COLOR/NEQ_COLOR describing the *skip* condition. */
+#define   CLR_CMP_FCN_NE          4UL           /* skip-if-equal  → draw when src != key */
+#define   CLR_CMP_FCN_EQ          5UL           /* skip-if-neq    → draw when src == key */
 #define   CLR_CMP_SRC_SOURCE      (1UL << 24)   /* compare source pixels */
 
 /* R300+ cache control */

@@ -167,8 +167,13 @@ typedef struct {
 #define R_CLR_CMP_CNTL            0x15C0
 #define R_CLR_CMP_CLR_SRC         0x15C4
 #define R_CLR_CMP_MASK            0x15CC
-#define   CLR_CMP_FCN_EQ          4UL           /* FCN=4: draw when src == key */
-#define   CLR_CMP_FCN_NE          5UL           /* FCN=5: draw when src != key */
+/* FCN values hardware-confirmed by RBLIT.EXE VRAM readback on RV515 X1300:
+   FCN=4 draws pixels where src != key (xf86: RADEON_SRC_CMP_EQ_COLOR).
+   FCN=5 draws pixels where src == key (xf86: RADEON_SRC_CMP_NEQ_COLOR).
+   Despite the confusing xf86 names, EQ_COLOR=4 is the correct value for
+   transparent blits (skip equal/key pixels, draw the rest). */
+#define   CLR_CMP_FCN_NE          4UL           /* skip-if-equal  → draw when src != key */
+#define   CLR_CMP_FCN_EQ          5UL           /* skip-if-neq    → draw when src == key */
 #define   CLR_CMP_SRC_SOURCE      (1UL << 24)   /* compare source pixels */
 
 /* AVIVO display controller registers (R500/RV515)
@@ -968,39 +973,43 @@ static void detect_flip_mode(void)
     /* If still VGA, g_avivo_flip stays 0 → VGA vsync fallback */
 }
 
-/* AVIVO hardware page flip (kernel-style lock→write→wait→unlock).
-   Only works when D1GRPH is generating scanout (g_avivo_flip=1). */
+/* AVIVO hardware page flip.  Sequence per Linux kernel rs600_page_flip():
+     lock → write address → unlock (arms flip) → wait for pending=0 (vsync).
+   Blocks until the new surface is live, so the caller may immediately
+   write to the old (now-hidden) surface without a race. */
 static void hw_page_flip(unsigned long surface_addr)
 {
     unsigned long tmp;
     int i;
 
-    /* Lock surface updates */
+    /* Lock: prevents the display controller from latching a partial update */
     tmp = rreg(R_D1GRPH_UPDATE);
     wreg(R_D1GRPH_UPDATE, tmp | D1GRPH_SURFACE_UPDATE_LOCK);
 
-    /* Flip at vsync (not hsync) */
+    /* Flip at vsync, not hsync */
     wreg(R_D1GRPH_FLIP_CONTROL, 0);
 
-    /* Write new surface address (both primary + secondary) */
+    /* Write new surface address (primary and secondary must match) */
     wreg(R_D1GRPH_SECONDARY_SURFACE_ADDRESS, surface_addr);
     wreg(R_D1GRPH_PRIMARY_SURFACE_ADDRESS, surface_addr);
 
-    /* Wait for update_pending to go high (kernel does this) */
-    for (i = 0; i < 100000; i++) {
+    /* Unlock: arms the flip — hardware latches it at next vsync */
+    tmp = rreg(R_D1GRPH_UPDATE);
+    wreg(R_D1GRPH_UPDATE, tmp & ~D1GRPH_SURFACE_UPDATE_LOCK);
+
+    /* Wait for SURFACE_UPDATE_PENDING to go high (flip is armed).
+       This happens in the same scanline as the unlock write. */
+    for (i = 0; i < 2000; i++) {
         if (rreg(R_D1GRPH_UPDATE) & D1GRPH_SURFACE_UPDATE_PENDING)
             break;
     }
 
-    /* Unlock — hardware applies at next vsync boundary */
-    tmp = rreg(R_D1GRPH_UPDATE);
-    wreg(R_D1GRPH_UPDATE, tmp & ~D1GRPH_SURFACE_UPDATE_LOCK);
-}
-
-/* Returns 1 when the previous hw_page_flip has been applied. */
-static int hw_is_flip_done(void)
-{
-    return !(rreg(R_D1GRPH_UPDATE) & D1GRPH_SURFACE_UPDATE_PENDING);
+    /* Wait for SURFACE_UPDATE_PENDING to clear (vsync: flip applied).
+       After this the new surface is live and the old one is safe to modify. */
+    for (i = 0; i < 200000; i++) {
+        if (!(rreg(R_D1GRPH_UPDATE) & D1GRPH_SURFACE_UPDATE_PENDING))
+            break;
+    }
 }
 
 /* VGA retrace wait via Input Status Register 1 (port 0x3DA). */
@@ -1015,8 +1024,7 @@ static void wait_vsync(void)
 static void flip_page(int back_page)
 {
     if (g_avivo_flip) {
-        /* AVIVO: wait for previous flip, issue new one */
-        while (!hw_is_flip_done()) {}
+        /* hw_page_flip blocks until the flip is applied at vsync */
         hw_page_flip(g_fb_location +
             (unsigned long)back_page * g_pitch * g_yres);
     } else {
@@ -1037,7 +1045,6 @@ static void flip_restore_page0(void)
 {
     if (g_avivo_flip) {
         hw_page_flip(g_fb_location);
-        while (!hw_is_flip_done()) {}
     } else {
         RMI rm;
         memset(&rm, 0, sizeof rm);
