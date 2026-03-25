@@ -1924,6 +1924,311 @@ static void gen_diag_layer(int base, int cell_w, int cell_h,
     }
 }
 
+/* =============================================================== */
+/*  Dune Chase: 16-layer desert parallax + 16 bouncing UFO sprites */
+/* =============================================================== */
+
+#define DUNE_NLAYERS   16
+#define DUNE_NUFOS     16
+#define UFO_W          32
+#define UFO_H          16
+
+/* ----- Generate desert sky gradient (layer 0, opaque) ------------ */
+static void gen_desert_sky(int base)
+{
+    int x, y, n, i;
+
+    /* Top = deep blue (index 1), fading to pale sandy blue at horizon */
+    for (y = 0; y < g_yres; y++) {
+        unsigned char c;
+        if (y < g_yres / 2) {
+            /* Upper half: blue gradient (1-32) */
+            c = (unsigned char)(1 + y * 31 / (g_yres / 2));
+            if (c > 32) c = 32;
+        } else {
+            /* Lower half: warm yellow/sand wash (129-145) */
+            c = (unsigned char)(129 + (y - g_yres / 2) * 16 / (g_yres / 2));
+            if (c > 145) c = 145;
+        }
+        memset(g_lfb + (long)(base + y) * g_pitch, c, g_xres);
+    }
+
+    /* Sparse bright sun spots near top */
+    srand(12345);
+    n = g_xres / 8;
+    for (i = 0; i < n; i++) {
+        x = rand() % g_xres;
+        y = rand() % (g_yres / 4);
+        g_lfb[(long)(base + y) * g_pitch + x] = 254;  /* bright yellow dot */
+    }
+}
+
+/* ----- Generate a dune layer (layers 1-15, transparent above) ---- */
+static void gen_dune_layer(int base, int layer_idx)
+{
+    int x, y, h, top;
+    int base_h, amp1, amp2, freq1, freq2, phase1, phase2;
+    unsigned char c_top, c_bot;
+
+    /* Clear to transparent */
+    for (y = 0; y < g_yres; y++)
+        memset(g_lfb + (long)(base + y) * g_pitch, PLAX_TRANSP, g_xres);
+
+    /* Farther layers (lower idx) are shorter and paler.
+       Closer layers (higher idx) are taller and more saturated. */
+    base_h = g_yres * (4 + layer_idx * 2) / 100;
+    amp1   = g_yres * (3 + layer_idx) / 100;
+    amp2   = g_yres * (1 + layer_idx / 2) / 100;
+    freq1  = g_xres * (3 - layer_idx % 3) + layer_idx * 31;
+    freq2  = g_xres * (2 - layer_idx % 2) + layer_idx * 53 + 100;
+    if (freq1 < 80) freq1 = 80;
+    if (freq2 < 60) freq2 = 60;
+    phase1 = layer_idx * 137;
+    phase2 = layer_idx * 263 + 50;
+
+    /* Color range: blend from yellow (129+) toward red/brown (65+)
+       as layers get closer */
+    if (layer_idx < 8) {
+        c_top = (unsigned char)(129 + layer_idx * 3);     /* yellow range */
+        c_bot = (unsigned char)(129 + layer_idx * 3 + 12);
+        if (c_top > 158) c_top = 158;
+        if (c_bot > 160) c_bot = 160;
+    } else {
+        c_top = (unsigned char)(65 + (layer_idx - 8) * 3);   /* red/brown */
+        c_bot = (unsigned char)(65 + (layer_idx - 8) * 3 + 15);
+        if (c_top > 92)  c_top = 92;
+        if (c_bot > 96)  c_bot = 96;
+    }
+
+    for (x = 0; x < g_xres; x++) {
+        h = base_h
+            + tri_wave(x + phase1, freq1, amp1)
+            + tri_wave(x * 2 + phase2, freq2, amp2);
+        if (h < 8) h = 8;
+        if (h > g_yres * 3 / 4) h = g_yres * 3 / 4;
+        top = g_yres - h;
+
+        for (y = top; y < g_yres; y++) {
+            int shade;
+            shade = (int)c_top + (y - top) * ((int)c_bot - (int)c_top) / h;
+            g_lfb[(long)(base + y) * g_pitch + x] = (unsigned char)shade;
+        }
+    }
+}
+
+/* ----- Generate UFO sprite at page 18 ----------------------------- */
+static void gen_ufo_sprite(int base)
+{
+    int x, y, cx, cy, dx, dy;
+
+    /* Clear sprite area to transparent */
+    for (y = 0; y < UFO_H; y++)
+        memset(g_lfb + (long)(base + y) * g_pitch, PLAX_TRANSP, UFO_W);
+
+    cx = UFO_W / 2;
+    cy = UFO_H / 2;
+
+    /* Dome: upper half-ellipse (rows 2..6), bright cyan */
+    for (y = 2; y <= 6; y++) {
+        int hw;
+        hw = 6 * (6 - (y - 2)) / 5;
+        if (hw < 1) hw = 1;
+        for (x = cx - hw; x <= cx + hw; x++)
+            if (x >= 0 && x < UFO_W)
+                g_lfb[(long)(base + y) * g_pitch + x] = 253;  /* bright cyan */
+    }
+
+    /* Body disc: rows 7..10, wide ellipse, bright white/yellow */
+    for (y = 7; y <= 10; y++) {
+        int hw;
+        hw = 14 - (y - 7) * 2;
+        if (hw < 6) hw = 6;
+        for (x = cx - hw; x <= cx + hw; x++) {
+            if (x >= 0 && x < UFO_W) {
+                unsigned char bc;
+                dx = x - cx;
+                dy = y - 8;
+                bc = (unsigned char)(254 - ((dx * dx + dy * dy) > 80 ? 6 : 0));
+                g_lfb[(long)(base + y) * g_pitch + x] = bc;
+            }
+        }
+    }
+
+    /* Landing lights: 3 dots at bottom */
+    for (x = cx - 6; x <= cx + 6; x += 6) {
+        for (dy = 11; dy <= 12; dy++) {
+            if (x >= 0 && x < UFO_W && dy < UFO_H)
+                g_lfb[(long)(base + dy) * g_pitch + x] = 255;  /* white */
+        }
+    }
+}
+
+static void demo_dune_chase(void)
+{
+    int layer_base[DUNE_NLAYERS];
+    int sprite_base;
+    int back_page, back_y, scroll;
+    long fps_count;
+    clock_t fps_t0, t_render_start, t_render_end, t_frame_end;
+    double fps, cpu_pct, cpu_acc;
+    long cpu_samples;
+    char buf[120];
+    int i;
+    unsigned long need;
+
+    /* UFO state arrays */
+    int ux[DUNE_NUFOS], uy[DUNE_NUFOS];
+    int udx[DUNE_NUFOS], udy[DUNE_NUFOS];
+
+    need = (unsigned long)g_pitch * g_page_stride * 20;
+    if (g_vram_mb > 0 && need > g_vram_mb * 1024UL * 1024UL) {
+        gpu_fill(0, 0, g_xres, g_yres, 0);
+        gpu_wait_idle();
+        cpu_str_c(g_yres / 2, "Not enough VRAM for dune demo", 251, 2);
+        cpu_str_c(g_yres / 2 + 30, "Press any key...", 253, 1);
+        getch();
+        return;
+    }
+
+    /* Compute layer offscreen row bases: pages 2..17 */
+    for (i = 0; i < DUNE_NLAYERS; i++)
+        layer_base[i] = g_page_stride * (2 + i);
+
+    /* Sprite sheet at page 18 */
+    sprite_base = g_page_stride * 18;
+
+    /* Widen scissor so GPU ops can reach offscreen VRAM */
+    gpu_wait_fifo(1);
+    wreg(R_SC_BOTTOM_RIGHT, (0x1FFFUL << 16) | (unsigned long)g_xres);
+
+    /* Show generation message */
+    gpu_fill(0, 0, g_xres, g_yres, 0);
+    gpu_wait_idle();
+    cpu_str_c(g_yres / 2 - 20, "Generating 16-layer desert landscape...", 255, 2);
+    cpu_str_c(g_yres / 2 + 10, "Dune Chase: 16 layers + 16 UFOs", 253, 1);
+
+    /* Generate all 16 layers */
+    gen_desert_sky(layer_base[0]);
+    for (i = 1; i < DUNE_NLAYERS; i++)
+        gen_dune_layer(layer_base[i], i);
+
+    /* Generate UFO sprite */
+    gen_ufo_sprite(sprite_base);
+
+    /* Initialize UFO positions and velocities */
+    srand(9999);
+    for (i = 0; i < DUNE_NUFOS; i++) {
+        ux[i]  = rand() % (g_xres - UFO_W);
+        uy[i]  = 20 + rand() % (g_yres - UFO_H - 40);
+        udx[i] = (rand() % 3) + 1;
+        udy[i] = (rand() % 3) + 1;
+        if (rand() % 2) udx[i] = -udx[i];
+        if (rand() % 2) udy[i] = -udy[i];
+    }
+
+    /* Clear both display pages */
+    gpu_fill(0, 0, g_xres, g_page_stride * 2, 0);
+    gpu_wait_idle();
+
+    /* Reset color compare to clean state before keyed blits */
+    gpu_wait_fifo(1);
+    wreg(R_CLR_CMP_CNTL, 0);
+
+    back_page   = 1;
+    scroll      = 0;
+    fps_count   = 0;
+    fps         = 0.0;
+    cpu_pct     = 0.0;
+    cpu_acc     = 0.0;
+    cpu_samples = 0;
+    fps_t0      = clock();
+
+    while (!kbhit()) {
+        back_y = back_page * g_page_stride;
+
+        t_render_start = clock();
+
+        /* Composite 16 layers back-to-front into back buffer.
+           Layer 0 at 1/16 speed, layer 15 at full speed. */
+        plax_blit_wrap(layer_base[0], scroll / 16,
+                       back_y, g_yres, 0);  /* sky: opaque */
+        for (i = 1; i < DUNE_NLAYERS; i++) {
+            plax_blit_wrap(layer_base[i], scroll * (i + 1) / 16,
+                           back_y, g_yres, 1);  /* dunes: keyed */
+        }
+
+        /* Draw 16 UFO sprites with color-key transparency */
+        for (i = 0; i < DUNE_NUFOS; i++) {
+            gpu_blit_key(0, sprite_base, ux[i], back_y + uy[i],
+                         UFO_W, UFO_H, PLAX_TRANSP);
+        }
+
+        gpu_wait_idle();
+
+        t_render_end = clock();
+
+        /* Update UFO positions (bounce off edges) */
+        for (i = 0; i < DUNE_NUFOS; i++) {
+            ux[i] += udx[i];
+            uy[i] += udy[i];
+            if (ux[i] < 0)               { ux[i] = 0;               udx[i] = -udx[i]; }
+            if (ux[i] > g_xres - UFO_W)  { ux[i] = g_xres - UFO_W; udx[i] = -udx[i]; }
+            if (uy[i] < 16)              { uy[i] = 16;              udy[i] = -udy[i]; }
+            if (uy[i] > g_yres - UFO_H)  { uy[i] = g_yres - UFO_H; udy[i] = -udy[i]; }
+        }
+
+        /* FPS counter (update every ~1 second) */
+        fps_count++;
+        {
+            clock_t now = clock();
+            double elapsed = (double)(now - fps_t0) / CLOCKS_PER_SEC;
+            if (elapsed >= 1.0) {
+                fps = (double)fps_count / elapsed;
+                fps_count = 0;
+                fps_t0 = now;
+                /* Update CPU% average over this interval */
+                if (cpu_samples > 0)
+                    cpu_pct = cpu_acc / cpu_samples;
+                cpu_acc = 0.0;
+                cpu_samples = 0;
+            }
+        }
+
+        /* HUD text (CPU writes directly to back buffer in LFB) */
+        sprintf(buf, "Dune Chase  16 layers + 16 UFOs  %.1f FPS  CPU:%d%%  [ESC quit]",
+                fps, (int)(cpu_pct + 0.5));
+        cpu_str(4, back_y + 4, buf, 255, 1);
+
+        /* Page flip: atomic, tear-free */
+        flip_page(back_page);
+
+        t_frame_end = clock();
+
+        /* Accumulate CPU utilization sample for this frame */
+        {
+            double render_t = (double)(t_render_end - t_render_start);
+            double frame_t  = (double)(t_frame_end  - t_render_start);
+            if (frame_t > 0.0) {
+                cpu_acc += render_t * 100.0 / frame_t;
+                cpu_samples++;
+            }
+        }
+
+        back_page ^= 1;
+        scroll++;
+        if (scroll >= g_xres * 1000) scroll = 0;  /* prevent overflow */
+    }
+    getch();
+
+    /* Restore display to page 0 */
+    flip_restore_page0();
+
+    /* Restore scissor */
+    gpu_wait_fifo(1);
+    wreg(R_SC_BOTTOM_RIGHT,
+         ((unsigned long)g_yres << 16) | (unsigned long)g_xres);
+}
+
 static void demo_parallax_diag(void)
 {
     int layer_base[PLAX_NLAYERS];
@@ -2381,8 +2686,8 @@ int main(void)
         return 1;
     }
 
-    /* Map enough LFB for parallax demo: 2 display + 4 layer pages (6×) */
-    lfb_sz = (unsigned long)g_pitch * g_page_stride * 6;
+    /* Map enough LFB for dune demo: 2 display + 16 layers + 1 sprite + 1 spare (20×) */
+    lfb_sz = (unsigned long)g_pitch * g_page_stride * 20;
     if (g_vram_mb > 0 && lfb_sz > g_vram_mb * 1024UL * 1024UL)
         lfb_sz = g_vram_mb * 1024UL * 1024UL;
     lfb_sz = (lfb_sz + 4095UL) & ~4095UL;
@@ -2508,12 +2813,17 @@ int main(void)
     }
 
     if (ch != 27) {
-        /* === Demo 5: Diagnostic parallax (colored grids) === */
+        /* === Demo 5: Dune Chase (16 layers + 16 UFOs) === */
+        demo_dune_chase();
+    }
+
+    if (ch != 27) {
+        /* === Demo 6: Diagnostic parallax (colored grids) === */
         demo_parallax_diag();
     }
 
     if (ch != 27) {
-        /* === Demo 6: GPU parallax scrolling (scenic) === */
+        /* === Demo 7: GPU parallax scrolling (scenic) === */
         demo_parallax();
     }
 
