@@ -1249,6 +1249,8 @@ static void gpu_blit_key(int sx, int sy, int dx, int dy, int w, int h,
     wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
 }
 
+#define PLAX_TRANSP    0    /* palette index = transparent */
+
 /* ---------------------------------------------------------------
    Per-surface PITCH_OFFSET blit functions.
    The R300-R500 2D engine has a 13-bit Y coordinate limit (max 8191).
@@ -1792,7 +1794,6 @@ static void demo_blit(void)
 /* =============================================================== */
 
 #define PLAX_NLAYERS   4
-#define PLAX_TRANSP    0    /* palette index = transparent */
 
 /* Integer triangle wave.  t = input, period > 0, returns [-amp..+amp]. */
 static int tri_wave(int t, int period, int amp)
