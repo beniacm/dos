@@ -298,6 +298,7 @@ static unsigned short g_dseg = 0, g_dsel = 0;     /* DOS buffer    */
 static volatile unsigned long *g_mmio = NULL;      /* MMIO base     */
 static unsigned long  g_mmio_phys = 0;
 static unsigned long  g_vram_mb   = 0;
+static unsigned long  g_vesa_mem_kb = 0;   /* VESA-reported total memory (KB) */
 static unsigned char *g_lfb       = NULL;          /* LFB pointer   */
 static unsigned long  g_lfb_phys  = 0;
 static unsigned long  g_fb_location = 0;   /* GPU internal FB base address */
@@ -1253,6 +1254,8 @@ static int find_mode(void)
     if (!vbe_get_info(&vi)) return 0;
     if (vi.ver < 0x0200) return 0;
 
+    g_vesa_mem_kb = (unsigned long)vi.tot_mem * 64;  /* tot_mem is in 64KB blocks */
+
     seg = (vi.mode_ptr >> 16) & 0xFFFF;
     off = vi.mode_ptr & 0xFFFF;
     ml  = (unsigned short *)((seg << 4) + off);
@@ -1598,7 +1601,7 @@ static void demo_blit(void)
 
     /* Widen scissor so GPU fill/blit can reach offscreen rows */
     gpu_wait_fifo(1);
-    wreg(R_SC_BOTTOM_RIGHT, (0x1FFFUL << 16) | (unsigned long)g_xres);
+    wreg(R_SC_BOTTOM_RIGHT, (0x3FFFUL << 16) | (unsigned long)g_xres);
 
     /* Generate the rainbow-stripe sprite in offscreen VRAM */
     gpu_fill(0, sprite_y, bw, bh, 0);
@@ -2099,7 +2102,7 @@ static void demo_dune_chase(void)
 
     /* Widen scissor so GPU ops can reach offscreen VRAM */
     gpu_wait_fifo(1);
-    wreg(R_SC_BOTTOM_RIGHT, (0x1FFFUL << 16) | (unsigned long)g_xres);
+    wreg(R_SC_BOTTOM_RIGHT, (0x3FFFUL << 16) | (unsigned long)g_xres);
 
     /* Show generation message */
     gpu_fill(0, 0, g_xres, g_yres, 0);
@@ -2107,13 +2110,30 @@ static void demo_dune_chase(void)
     cpu_str_c(g_yres / 2 - 20, "Generating 16-layer desert landscape...", 255, 2);
     cpu_str_c(g_yres / 2 + 10, "Dune Chase: 16 layers + 16 UFOs", 253, 1);
 
-    /* Generate all 16 layers */
-    gen_desert_sky(layer_base[0]);
-    for (i = 1; i < DUNE_NLAYERS; i++)
-        gen_dune_layer(layer_base[i], i);
+    /* Generate all 16 layers via staging through page 1.
+       CPU writes each layer to page 1 (within LFB range), then GPU
+       blits it to the final offscreen page (accessible to GPU but
+       potentially beyond the LFB mapping). */
+    {
+        int stage_base = g_page_stride;  /* page 1 as staging area */
 
-    /* Generate UFO sprite */
-    gen_ufo_sprite(sprite_base);
+        /* Layer 0: sky (opaque) */
+        gen_desert_sky(stage_base);
+        gpu_blit_fwd(0, stage_base, 0, layer_base[0], g_xres, g_yres);
+        gpu_wait_idle();
+
+        /* Layers 1-15: dunes */
+        for (i = 1; i < DUNE_NLAYERS; i++) {
+            gen_dune_layer(stage_base, i);
+            gpu_blit_fwd(0, stage_base, 0, layer_base[i], g_xres, g_yres);
+            gpu_wait_idle();
+        }
+
+        /* UFO sprite */
+        gen_ufo_sprite(stage_base);
+        gpu_blit_fwd(0, stage_base, 0, sprite_base, UFO_W, UFO_H);
+        gpu_wait_idle();
+    }
 
     /* Initialize UFO positions and velocities */
     srand(9999);
@@ -2254,7 +2274,7 @@ static void demo_parallax_diag(void)
         layer_base[i] = g_page_stride * (2 + i);
 
     gpu_wait_fifo(1);
-    wreg(R_SC_BOTTOM_RIGHT, (0x1FFFUL << 16) | (unsigned long)g_xres);
+    wreg(R_SC_BOTTOM_RIGHT, (0x3FFFUL << 16) | (unsigned long)g_xres);
 
     gpu_fill(0, 0, g_xres, g_yres, 0);
     gpu_wait_idle();
@@ -2376,9 +2396,10 @@ static void demo_parallax(void)
     int layer_base[PLAX_NLAYERS];
     int back_page, back_y, scroll;
     long fps_count;
-    clock_t fps_t0;
-    double fps;
-    char buf[80];
+    clock_t fps_t0, t_render_start, t_render_end, t_frame_end;
+    double fps, cpu_pct, cpu_acc;
+    long cpu_samples;
+    char buf[120];
     int i;
     unsigned long need;
 
@@ -2399,7 +2420,7 @@ static void demo_parallax(void)
 
     /* Widen scissor so GPU ops can reach offscreen VRAM */
     gpu_wait_fifo(1);
-    wreg(R_SC_BOTTOM_RIGHT, (0x1FFFUL << 16) | (unsigned long)g_xres);
+    wreg(R_SC_BOTTOM_RIGHT, (0x3FFFUL << 16) | (unsigned long)g_xres);
 
     /* Show generation message on current visible page */
     gpu_fill(0, 0, g_xres, g_yres, 0);
@@ -2421,14 +2442,19 @@ static void demo_parallax(void)
     gpu_wait_fifo(1);
     wreg(R_CLR_CMP_CNTL, 0);
 
-    back_page = 1;
-    scroll    = 0;
-    fps_count = 0;
-    fps       = 0.0;
-    fps_t0    = clock();
+    back_page   = 1;
+    scroll      = 0;
+    fps_count   = 0;
+    fps         = 0.0;
+    cpu_pct     = 0.0;
+    cpu_acc     = 0.0;
+    cpu_samples = 0;
+    fps_t0      = clock();
 
     while (!kbhit()) {
         back_y = back_page * g_page_stride;
+
+        t_render_start = clock();
 
         /* Composite layers back-to-front into back buffer.
            Scroll speeds: sky 1/8, mountains 1/4, hills 1/2, city 1x */
@@ -2443,6 +2469,8 @@ static void demo_parallax(void)
 
         gpu_wait_idle();
 
+        t_render_end = clock();
+
         /* FPS counter (update every ~1 second) */
         fps_count++;
         {
@@ -2452,16 +2480,33 @@ static void demo_parallax(void)
                 fps = (double)fps_count / elapsed;
                 fps_count = 0;
                 fps_t0 = now;
+                /* Update CPU% average over this interval */
+                if (cpu_samples > 0)
+                    cpu_pct = cpu_acc / cpu_samples;
+                cpu_acc = 0.0;
+                cpu_samples = 0;
             }
         }
 
         /* HUD text (CPU writes directly to back buffer in LFB) */
-        sprintf(buf, "GPU Parallax  %d layers  %.1f FPS  [ESC quit]",
-                PLAX_NLAYERS, fps);
+        sprintf(buf, "GPU Parallax  %d layers  %.1f FPS  CPU:%d%%  [ESC quit]",
+                PLAX_NLAYERS, fps, (int)(cpu_pct + 0.5));
         cpu_str(4, back_y + 4, buf, 255, 1);
 
         /* Page flip: atomic, tear-free (AVIVO hw or VBE fallback) */
         flip_page(back_page);
+
+        t_frame_end = clock();
+
+        /* Accumulate CPU utilization sample for this frame */
+        {
+            double render_t = (double)(t_render_end - t_render_start);
+            double frame_t  = (double)(t_frame_end  - t_render_start);
+            if (frame_t > 0.0) {
+                cpu_acc += render_t * 100.0 / frame_t;
+                cpu_samples++;
+            }
+        }
 
         back_page ^= 1;
         scroll++;
@@ -2644,6 +2689,7 @@ int main(void)
     }
     printf("  Mode 0x%03X: %dx%d pitch=%d  LFB=0x%08lX\n",
            g_vmode, g_xres, g_yres, g_pitch, g_lfb_phys);
+    printf("  VESA mem  : %lu KB (%lu MB)\n", g_vesa_mem_kb, g_vesa_mem_kb / 1024);
 
     /* Align pitch to 64 bytes — the Radeon 2D engine PITCH_OFFSET register
        encodes pitch in 64-byte units. A non-aligned VBE pitch (e.g. 800)
@@ -2686,8 +2732,9 @@ int main(void)
         return 1;
     }
 
-    /* Map enough LFB for dune demo: 2 display + 16 layers + 1 sprite + 1 spare (20×) */
-    lfb_sz = (unsigned long)g_pitch * g_page_stride * 20;
+    /* Map LFB for 2 display + 4 offscreen pages (6x); dune demo stages
+       layers through page 1 and GPU-blits to higher offscreen pages. */
+    lfb_sz = (unsigned long)g_pitch * g_page_stride * 6;
     if (g_vram_mb > 0 && lfb_sz > g_vram_mb * 1024UL * 1024UL)
         lfb_sz = g_vram_mb * 1024UL * 1024UL;
     lfb_sz = (lfb_sz + 4095UL) & ~4095UL;
