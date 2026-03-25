@@ -93,6 +93,9 @@ typedef struct {
 #define R_WAIT_UNTIL               0x1720
 #define   WAIT_2D_IDLECLEAN        (1UL << 16)
 #define   WAIT_3D_IDLECLEAN        (1UL << 17)
+#define   WAIT_DMA_GUI_IDLE        (1UL << 9)
+#define R_DSTCACHE_CTLSTAT         0x1714
+#define   R300_RB2D_DC_FLUSH_ALL   0x05UL
 #define R_RBBM_GUICNTL             0x172C
 
 #define R_DST_OFFSET               0x1404
@@ -115,6 +118,8 @@ typedef struct {
 #define   GMC_DP_SRC_MEMORY        (2UL << 24)
 #define   GMC_CLR_CMP_DIS          (1UL << 28)
 #define   GMC_WR_MSK_DIS           (1UL << 30)
+#define   GMC_SRC_PITCH_OFFSET_CNTL (1UL << 0)
+#define   GMC_DST_PITCH_OFFSET_CNTL (1UL << 1)
 #define   ROP3_PATCOPY             (0xF0UL << 16)
 #define   ROP3_SRCCOPY             (0xCCUL << 16)
 
@@ -238,9 +243,11 @@ static unsigned long  g_mmio_phys = 0;
 static unsigned long  g_vram_mb   = 0;
 static unsigned char *g_lfb       = NULL;
 static unsigned long  g_lfb_phys  = 0;
+static unsigned long  g_lfb_size  = 0;   /* actual mapped LFB size */
 static unsigned long  g_fb_location = 0;
 static int g_xres, g_yres, g_pitch;
 static int g_vbe_pitch;    /* original VBE pitch before alignment */
+static int g_page_stride;  /* rows per page, 4KB-aligned */
 static unsigned short g_vmode;
 static int g_fifo_free = 0;
 static int g_num_gb_pipes = 1;
@@ -2387,6 +2394,973 @@ static void test_gmc_pitch_offset_cntl(void)
 }
 
 /* =============================================================== */
+/*  TEST 18-24: Comprehensive PITCH_OFFSET validation               */
+/*  These tests validate every assumption used by the dune chase    */
+/*  demo: per-blit PITCH_OFFSET with GMC bits, offscreen staging,   */
+/*  Y rebasing, color-key with PO, and consecutive PO switching.    */
+/* =============================================================== */
+
+/* Helper: build PITCH_OFFSET register value */
+static unsigned long make_pitch_offset(unsigned long vram_byte_off)
+{
+    unsigned long pitch64  = (unsigned long)g_pitch / 64;
+    unsigned long gpu_addr = g_fb_location + vram_byte_off;
+    return (pitch64 << 22) | ((gpu_addr >> 10) & 0x003FFFFFUL);
+}
+
+/* Helper: flush 2D dest cache */
+static void gpu_flush_2d(void)
+{
+    gpu_wait_fifo(2);
+    wreg(R_DSTCACHE_CTLSTAT, R300_RB2D_DC_FLUSH_ALL);
+    wreg(R_WAIT_UNTIL, WAIT_2D_IDLECLEAN | WAIT_DMA_GUI_IDLE);
+}
+
+/* Helper: reset PITCH_OFFSET to default */
+static void po_reset(void)
+{
+    unsigned long po = make_pitch_offset(0);
+    gpu_wait_fifo(6);
+    wreg(R_DST_PITCH_OFFSET, po);
+    wreg(R_SRC_PITCH_OFFSET, po);
+    wreg(R_DST_OFFSET, g_fb_location);
+    wreg(R_DST_PITCH,  (unsigned long)g_pitch);
+    wreg(R_SRC_OFFSET, g_fb_location);
+    wreg(R_SRC_PITCH,  (unsigned long)g_pitch);
+}
+
+/* Helper: fill using PO (matches RADEON.C gpu_blit_po pattern for fills) */
+static void gpu_fill_po(unsigned long dst_po, int x, int y, int w, int h,
+                        unsigned char color)
+{
+    gpu_wait_fifo(7);
+    wreg(R_DST_PITCH_OFFSET, dst_po);
+    wreg(R_DP_GUI_MASTER_CNTL,
+         GMC_DST_PITCH_OFFSET_CNTL |
+         GMC_BRUSH_SOLID | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_PATCOPY | GMC_CLR_CMP_DIS | GMC_WR_MSK_DIS);
+    wreg(R_DP_BRUSH_FRGD_CLR, (unsigned long)color);
+    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+    wreg(R_DST_Y_X, ((unsigned long)y << 16) | (unsigned long)x);
+    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
+}
+
+/* Helper: blit with per-blit PITCH_OFFSET + GMC bits (matches RADEON.C) */
+static void blit_po(unsigned long src_po, int sx, int sy,
+                    unsigned long dst_po, int dx, int dy,
+                    int w, int h)
+{
+    gpu_wait_fifo(7);
+    wreg(R_DST_PITCH_OFFSET, dst_po);
+    wreg(R_SRC_PITCH_OFFSET, src_po);
+    wreg(R_DP_GUI_MASTER_CNTL,
+         GMC_DST_PITCH_OFFSET_CNTL | GMC_SRC_PITCH_OFFSET_CNTL |
+         GMC_BRUSH_NONE | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_SRCCOPY | GMC_DP_SRC_MEMORY | GMC_CLR_CMP_DIS |
+         GMC_WR_MSK_DIS);
+    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+    wreg(R_SRC_Y_X, ((unsigned long)sy << 16) | (unsigned long)(sx & 0xFFFF));
+    wreg(R_DST_Y_X, ((unsigned long)dy << 16) | (unsigned long)(dx & 0xFFFF));
+    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
+}
+
+/* Helper: keyed blit with per-blit PITCH_OFFSET (matches RADEON.C) */
+static void blit_po_key(unsigned long src_po, int sx, int sy,
+                        unsigned long dst_po, int dx, int dy,
+                        int w, int h, unsigned char key)
+{
+    gpu_wait_fifo(10);
+    wreg(R_CLR_CMP_CLR_SRC, (unsigned long)key);
+    wreg(R_CLR_CMP_MASK,    0x000000FFUL);
+    wreg(R_CLR_CMP_CNTL,    CLR_CMP_SRC_SOURCE | CLR_CMP_FCN_NE);
+    wreg(R_DST_PITCH_OFFSET, dst_po);
+    wreg(R_SRC_PITCH_OFFSET, src_po);
+    wreg(R_DP_GUI_MASTER_CNTL,
+         GMC_DST_PITCH_OFFSET_CNTL | GMC_SRC_PITCH_OFFSET_CNTL |
+         GMC_BRUSH_NONE | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_SRCCOPY | GMC_DP_SRC_MEMORY | GMC_WR_MSK_DIS);
+    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+    wreg(R_SRC_Y_X, ((unsigned long)sy << 16) | (unsigned long)(sx & 0xFFFF));
+    wreg(R_DST_Y_X, ((unsigned long)dy << 16) | (unsigned long)(dx & 0xFFFF));
+    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
+}
+
+/* Helper: read pixel at (x,y) relative to a VRAM byte offset base */
+static unsigned char off_read(unsigned long vram_off, int x, int y)
+{
+    unsigned long addr = vram_off + (unsigned long)y * g_pitch + x;
+    if (addr >= g_lfb_size) return 0xEE;  /* out of range sentinel */
+    return g_lfb[addr];
+}
+
+/* Helper: write pixel at (x,y) relative to a VRAM byte offset base */
+static void off_write(unsigned long vram_off, int x, int y, unsigned char v)
+{
+    unsigned long addr = vram_off + (unsigned long)y * g_pitch + x;
+    if (addr < g_lfb_size)
+        g_lfb[addr] = v;
+}
+
+/* Helper: fill rect via CPU at offset base */
+static void off_fill(unsigned long vram_off, int x, int y,
+                     int w, int h, unsigned char v)
+{
+    int r, c;
+    for (r = y; r < y + h; r++)
+        for (c = x; c < x + w; c++)
+            off_write(vram_off, c, r, v);
+}
+
+/* Helper: check rect at offset base, return bad pixel count */
+static int off_check(unsigned long vram_off, int x, int y,
+                     int w, int h, unsigned char expect)
+{
+    int bad = 0, r, c;
+    for (r = y; r < y + h; r++)
+        for (c = x; c < x + w; c++)
+            if (off_read(vram_off, c, r) != expect) bad++;
+    return bad;
+}
+
+/* Helper: dump a row of pixels at offset base */
+static void off_dump_row(unsigned long vram_off, int y, int x0, int x1)
+{
+    int x;
+    out("      Row %d [%d..%d]: ", y, x0, x1 - 1);
+    for (x = x0; x < x1; x++)
+        out("%02X", off_read(vram_off, x, y));
+    out("\n");
+}
+
+/* ---- TEST 18: PITCH_OFFSET Encoding Validation ---- */
+static void test_po_encoding(void)
+{
+    unsigned long po0, po1, po2, po3;
+    unsigned long off0, off1, off2, off3;
+
+    out("\n========================================\n");
+    out("  TEST 18: PITCH_OFFSET Encoding\n");
+    out("========================================\n\n");
+
+    out("  Validates make_pitch_offset() encoding for various VRAM offsets.\n");
+    out("  FB_LOCATION=0x%08lX  Pitch=%d  Pitch/64=%lu\n\n",
+        g_fb_location, g_pitch, (unsigned long)g_pitch / 64);
+
+    off0 = 0;
+    off1 = (unsigned long)g_page_stride * g_pitch;
+    off2 = (unsigned long)g_page_stride * g_pitch * 2;
+    off3 = (unsigned long)g_page_stride * g_pitch * 10;
+
+    po0 = make_pitch_offset(off0);
+    po1 = make_pitch_offset(off1);
+    po2 = make_pitch_offset(off2);
+    po3 = make_pitch_offset(off3);
+
+    out("  Page stride: %d rows  Bytes per page: %lu\n",
+        g_page_stride, (unsigned long)g_page_stride * g_pitch);
+    out("  off=0x%08lX -> PO=0x%08lX (page 0, display)\n", off0, po0);
+    out("  off=0x%08lX -> PO=0x%08lX (page 1)\n", off1, po1);
+    out("  off=0x%08lX -> PO=0x%08lX (page 2)\n", off2, po2);
+    out("  off=0x%08lX -> PO=0x%08lX (page 10)\n", off3, po3);
+
+    /* Decode each PO value */
+    {
+        unsigned long vals[4];
+        int idx;
+        vals[0] = po0; vals[1] = po1; vals[2] = po2; vals[3] = po3;
+        for (idx = 0; idx < 4; idx++) {
+            unsigned long p = vals[idx];
+            unsigned long enc_pitch64 = (p >> 22) & 0xFF;
+            unsigned long enc_offset  = p & 0x003FFFFFUL;
+            unsigned long enc_addr    = enc_offset << 10;
+            out("    PO[%d]=0x%08lX -> pitch64=%lu (pitch=%lu) offset=0x%06lX (addr=0x%08lX)\n",
+                idx, p, enc_pitch64, enc_pitch64 * 64, enc_offset, enc_addr);
+        }
+    }
+
+    /* Sanity: pitch field should be the same for all */
+    {
+        int ok = 1;
+        unsigned long p0 = (po0 >> 22) & 0xFF;
+        if (((po1 >> 22) & 0xFF) != p0) ok = 0;
+        if (((po2 >> 22) & 0xFF) != p0) ok = 0;
+        if (((po3 >> 22) & 0xFF) != p0) ok = 0;
+        result(ok, "All PO values have same pitch field (%lu)\n", p0);
+    }
+
+    /* Sanity: offsets should increase */
+    {
+        int ok = (po1 & 0x003FFFFFUL) > (po0 & 0x003FFFFFUL) &&
+                 (po2 & 0x003FFFFFUL) > (po1 & 0x003FFFFFUL) &&
+                 (po3 & 0x003FFFFFUL) > (po2 & 0x003FFFFFUL);
+        result(ok, "PO offset field increases with VRAM offset\n");
+    }
+
+    /* Check offset alignment: GPU address must be 1KB-aligned */
+    {
+        int ok = 1;
+        if ((g_fb_location + off1) & 0x3FF) ok = 0;
+        if ((g_fb_location + off2) & 0x3FF) ok = 0;
+        result(ok, "VRAM page offsets are 1KB-aligned (required by PITCH_OFFSET)\n");
+    }
+
+    out("\n");
+}
+
+/* ---- TEST 19: gpu_fill with DST_PITCH_OFFSET + GMC bit ---- */
+static void test_po_fill(void)
+{
+    unsigned long po0, off1, po1;
+    int bad;
+
+    out("\n========================================\n");
+    out("  TEST 19: GPU Fill with DST_PITCH_OFFSET_CNTL\n");
+    out("========================================\n\n");
+
+    po0  = make_pitch_offset(0);
+    off1 = (unsigned long)g_page_stride * g_pitch;
+    po1  = make_pitch_offset(off1);
+
+    /* 19a: Fill at display page 0 using PO */
+    out("  19a: gpu_fill_po to display (PO=0x%08lX) at (100,400) 32x4\n", po0);
+    cpu_clear(98, 398, 36, 8, 0x00);
+    gpu_fill_po(po0, 100, 400, 32, 4, 0xA1);
+    gpu_wait_idle();
+    bad = vram_check_rect(100, 400, 32, 4, 0xA1);
+    result(bad == 0, "Fill via PO to display: %d bad pixels\n", bad);
+    if (bad > 0) {
+        int x;
+        out("      Row 400 [100..131]: ");
+        for (x = 100; x < 132; x++) out("%02X", vram_read(x, 400));
+        out("\n");
+    }
+
+    /* 19b: Fill at offscreen page 1 using PO, Y=0 should target row g_page_stride */
+    if (off1 + (unsigned long)g_pitch * 8 <= g_lfb_size) {
+        out("  19b: gpu_fill_po to page 1 (PO=0x%08lX) at (100,0) 32x4\n", po1);
+        off_fill(off1, 98, 0, 36, 8, 0x00);
+        gpu_fill_po(po1, 100, 0, 32, 4, 0xB2);
+        gpu_wait_idle();
+        gpu_flush_2d();
+        bad = off_check(off1, 100, 0, 32, 4, 0xB2);
+        result(bad == 0, "Fill via PO to page 1 (Y rebased): %d bad pixels\n", bad);
+        if (bad > 0) {
+            out("      Expected at VRAM offset 0x%08lX\n", off1);
+            off_dump_row(off1, 0, 100, 132);
+            off_dump_row(off1, 1, 100, 132);
+            /* Also check if it went to page 0 by mistake */
+            out("      Page 0 row %d [100..131]: ", g_page_stride);
+            {
+                int x;
+                for (x = 100; x < 132; x++) out("%02X", vram_read(x, g_page_stride));
+                out("\n");
+            }
+            /* Check absolute row 0 too */
+            out("      Page 0 row 0 [100..131]: ");
+            {
+                int x;
+                for (x = 100; x < 132; x++) out("%02X", vram_read(x, 0));
+                out("\n");
+            }
+        }
+        /* Verify display page was NOT clobbered */
+        {
+            int disp_bad = vram_check_rect(100, 0, 32, 4, 0x00);
+            result(disp_bad == 0,
+                   "Display page 0 not clobbered by PO fill: %d bad\n", disp_bad);
+        }
+    } else {
+        out("  19b: SKIPPED (LFB too small for page 1)\n");
+    }
+
+    po_reset();
+    out("\n");
+}
+
+/* ---- TEST 20: Basic blit_po copy within display ---- */
+static void test_po_blit_basic(void)
+{
+    unsigned long po0;
+    int bad;
+
+    out("\n========================================\n");
+    out("  TEST 20: blit_po Basic Copy (same surface)\n");
+    out("========================================\n\n");
+
+    po0 = make_pitch_offset(0);
+
+    /* Write a 16x4 pattern at (200,400) via CPU */
+    {
+        int r, c;
+        for (r = 0; r < 4; r++)
+            for (c = 0; c < 16; c++)
+                g_lfb[(long)(400 + r) * g_pitch + 200 + c] =
+                    (unsigned char)(0x30 + r * 16 + c);
+    }
+
+    /* Clear dest area */
+    cpu_clear(300, 400, 20, 8, 0x00);
+
+    /* blit_po: copy (200,400) -> (300,400) 16x4, both PO=display */
+    out("  20a: blit_po (200,400)->(300,400) 16x4, both PO=display\n");
+    blit_po(po0, 200, 400, po0, 300, 400, 16, 4);
+    gpu_wait_idle();
+
+    bad = 0;
+    {
+        int r, c;
+        for (r = 0; r < 4; r++)
+            for (c = 0; c < 16; c++) {
+                unsigned char expect = (unsigned char)(0x30 + r * 16 + c);
+                if (vram_read(300 + c, 400 + r) != expect) bad++;
+            }
+    }
+    result(bad == 0, "blit_po display-to-display: %d bad pixels\n", bad);
+    if (bad > 0) {
+        out("      Source row 400 [200..215]: ");
+        { int x; for (x = 200; x < 216; x++) out("%02X", vram_read(x, 400)); }
+        out("\n      Dest   row 400 [300..315]: ");
+        { int x; for (x = 300; x < 316; x++) out("%02X", vram_read(x, 400)); }
+        out("\n");
+    }
+
+    po_reset();
+    out("\n");
+}
+
+/* ---- TEST 21: Offscreen staging via blit_po ---- */
+static void test_po_staging(void)
+{
+    unsigned long off1, off2, po0, po1, po2;
+    int bad;
+
+    out("\n========================================\n");
+    out("  TEST 21: Offscreen Staging via blit_po\n");
+    out("========================================\n\n");
+
+    out("  This replicates the dune demo's staging pattern:\n");
+    out("  CPU -> page 1, gpu blit_po page 1 -> page 2, blit_po page 2 -> display\n\n");
+
+    po0  = make_pitch_offset(0);
+    off1 = (unsigned long)g_page_stride * g_pitch;
+    off2 = (unsigned long)g_page_stride * g_pitch * 2;
+    po1  = make_pitch_offset(off1);
+    po2  = make_pitch_offset(off2);
+
+    if (off2 + (unsigned long)g_pitch * (g_yres + 4) > g_lfb_size) {
+        out("  SKIPPED: LFB too small (need %lu, have %lu)\n",
+            off2 + (unsigned long)g_pitch * (g_yres + 4), g_lfb_size);
+        return;
+    }
+
+    /* 21a: CPU writes a striped pattern to page 1 */
+    out("  21a: CPU writes 64x8 stripe pattern to page 1\n");
+    {
+        int r, c;
+        for (r = 0; r < 8; r++)
+            for (c = 0; c < 64; c++)
+                off_write(off1, c, r, (unsigned char)((r & 1) ? 0xCC : 0x55));
+    }
+
+    /* 21b: GPU blit_po from page 1 to page 2 */
+    out("  21b: blit_po page1(0,0) -> page2(0,0) 64x8\n");
+    off_fill(off2, 0, 0, 68, 12, 0x00);
+    blit_po(po1, 0, 0, po2, 0, 0, 64, 8);
+    gpu_wait_idle();
+    gpu_flush_2d();
+
+    bad = 0;
+    {
+        int r, c;
+        for (r = 0; r < 8; r++)
+            for (c = 0; c < 64; c++) {
+                unsigned char expect = (unsigned char)((r & 1) ? 0xCC : 0x55);
+                if (off_read(off2, c, r) != expect) bad++;
+            }
+    }
+    result(bad == 0, "Stage page1->page2: %d bad of 512 pixels\n", bad);
+    if (bad > 0) {
+        out("      Page 1 src:\n");
+        off_dump_row(off1, 0, 0, 32);
+        off_dump_row(off1, 1, 0, 32);
+        out("      Page 2 dst:\n");
+        off_dump_row(off2, 0, 0, 32);
+        off_dump_row(off2, 1, 0, 32);
+        /* Check if data landed at ABSOLUTE row 0 */
+        out("      Abs row 0 [0..31]: ");
+        { int x; for (x = 0; x < 32; x++) out("%02X", vram_read(x, 0)); }
+        out("\n");
+        /* Check absolute address where page2 starts */
+        out("      Abs row %d [0..31]: ", g_page_stride * 2);
+        { int x; for (x = 0; x < 32; x++) out("%02X", vram_read(x, g_page_stride * 2)); }
+        out("\n");
+    }
+
+    /* 21c: GPU blit_po from page 2 back to display (page 0) */
+    out("  21c: blit_po page2(0,0) -> display(400,300) 64x8\n");
+    cpu_clear(398, 298, 68, 12, 0x00);
+    blit_po(po2, 0, 0, po0, 400, 300, 64, 8);
+    gpu_wait_idle();
+
+    bad = 0;
+    {
+        int r, c;
+        for (r = 0; r < 8; r++)
+            for (c = 0; c < 64; c++) {
+                unsigned char expect = (unsigned char)((r & 1) ? 0xCC : 0x55);
+                if (vram_read(400 + c, 300 + r) != expect) bad++;
+            }
+    }
+    result(bad == 0, "Stage page2->display: %d bad of 512 pixels\n", bad);
+    if (bad > 0) {
+        out("      Display dest:\n");
+        { int x; out("      Row 300 [400..431]: ");
+          for (x = 400; x < 432; x++) out("%02X", vram_read(x, 300)); out("\n"); }
+        { int x; out("      Row 301 [400..431]: ");
+          for (x = 400; x < 432; x++) out("%02X", vram_read(x, 301)); out("\n"); }
+    }
+
+    po_reset();
+    out("\n");
+}
+
+/* ---- TEST 22: Consecutive PO switching ---- */
+static void test_po_switching(void)
+{
+    unsigned long off1, off2, po0, po1, po2;
+    int bad1, bad2;
+
+    out("\n========================================\n");
+    out("  TEST 22: Consecutive PITCH_OFFSET Switching\n");
+    out("========================================\n\n");
+
+    out("  Tests that back-to-back blits with different PITCH_OFFSETs\n");
+    out("  each use their own PO, not a stale value.\n\n");
+
+    po0  = make_pitch_offset(0);
+    off1 = (unsigned long)g_page_stride * g_pitch;
+    off2 = (unsigned long)g_page_stride * g_pitch * 2;
+    po1  = make_pitch_offset(off1);
+    po2  = make_pitch_offset(off2);
+
+    if (off2 + (unsigned long)g_pitch * 8 > g_lfb_size) {
+        out("  SKIPPED: LFB too small\n");
+        return;
+    }
+
+    /* Write distinct patterns to page 1 and page 2 */
+    {
+        int r, c;
+        for (r = 0; r < 4; r++)
+            for (c = 0; c < 32; c++) {
+                off_write(off1, c, r, 0xAA);
+                off_write(off2, c, r, 0x55);
+            }
+    }
+
+    /* Clear two dst regions on display */
+    cpu_clear(100, 450, 36, 8, 0x00);
+    cpu_clear(200, 450, 36, 8, 0x00);
+
+    /* Issue two blits back-to-back with different SRC POs */
+    out("  22a: blit_po from page1 -> display(100,450) 32x4\n");
+    out("  22b: blit_po from page2 -> display(200,450) 32x4 (back-to-back)\n");
+    blit_po(po1, 0, 0, po0, 100, 450, 32, 4);
+    blit_po(po2, 0, 0, po0, 200, 450, 32, 4);
+    gpu_wait_idle();
+
+    bad1 = vram_check_rect(100, 450, 32, 4, 0xAA);
+    bad2 = vram_check_rect(200, 450, 32, 4, 0x55);
+
+    result(bad1 == 0,
+           "Blit from page1 (expect 0xAA): %d bad of 128\n", bad1);
+    result(bad2 == 0,
+           "Blit from page2 (expect 0x55): %d bad of 128\n", bad2);
+
+    if (bad1 > 0 || bad2 > 0) {
+        int x;
+        out("      Display row 450 [100..131]: ");
+        for (x = 100; x < 132; x++) out("%02X", vram_read(x, 450));
+        out("\n      Display row 450 [200..231]: ");
+        for (x = 200; x < 232; x++) out("%02X", vram_read(x, 450));
+        out("\n");
+        /* Cross-check: show what's in page1 and page2 */
+        out("      Page1 row 0 [0..31]: ");
+        for (x = 0; x < 32; x++) out("%02X", off_read(off1, x, 0));
+        out("\n      Page2 row 0 [0..31]: ");
+        for (x = 0; x < 32; x++) out("%02X", off_read(off2, x, 0));
+        out("\n");
+    }
+
+    po_reset();
+    out("\n");
+}
+
+/* ---- TEST 23: Color-keyed blit with PITCH_OFFSET ---- */
+static void test_po_colorkey(void)
+{
+    unsigned long off1, po0, po1;
+    int bad_key, bad_bg;
+
+    out("\n========================================\n");
+    out("  TEST 23: Color-Keyed blit_po\n");
+    out("========================================\n\n");
+
+    po0  = make_pitch_offset(0);
+    off1 = (unsigned long)g_page_stride * g_pitch;
+    po1  = make_pitch_offset(off1);
+
+    if (off1 + (unsigned long)g_pitch * 8 > g_lfb_size) {
+        out("  SKIPPED: LFB too small\n");
+        return;
+    }
+
+    /* Create a source pattern on page 1: alternating key/data pixels.
+       Key=0x00 (transparent), data=0xDD */
+    {
+        int r, c;
+        for (r = 0; r < 4; r++)
+            for (c = 0; c < 32; c++)
+                off_write(off1, c, r, (unsigned char)((c & 1) ? 0xDD : 0x00));
+    }
+
+    /* Prefill display dest with 0x77 (background) */
+    cpu_clear(500, 400, 36, 8, 0x77);
+
+    /* Keyed blit: skip pixels matching key=0x00 */
+    out("  23a: blit_po_key page1(0,0)->(500,400) 32x4, key=0x00\n");
+    blit_po_key(po1, 0, 0, po0, 500, 400, 32, 4, 0x00);
+    gpu_wait_idle();
+
+    /* Even columns should remain 0x77 (bg), odd columns should be 0xDD */
+    bad_key = 0;
+    bad_bg  = 0;
+    {
+        int r, c;
+        for (r = 0; r < 4; r++)
+            for (c = 0; c < 32; c++) {
+                unsigned char v = vram_read(500 + c, 400 + r);
+                if (c & 1) {
+                    if (v != 0xDD) bad_key++;
+                } else {
+                    if (v != 0x77) bad_bg++;
+                }
+            }
+    }
+    result(bad_key == 0 && bad_bg == 0,
+           "Keyed PO blit: %d data errors, %d key transparency errors\n",
+           bad_key, bad_bg);
+    if (bad_key > 0 || bad_bg > 0) {
+        int x;
+        out("      Source (page1) row 0 [0..31]: ");
+        for (x = 0; x < 32; x++) out("%02X", off_read(off1, x, 0));
+        out("\n      Dest (display) row 400 [500..531]: ");
+        for (x = 500; x < 532; x++) out("%02X", vram_read(x, 400));
+        out("\n      Expected: 77DD77DD77DD...  (bg where key, data where not)\n");
+    }
+
+    gpu_disable_cmp();
+    po_reset();
+    out("\n");
+}
+
+/* ---- TEST 24: Full-screen offscreen round-trip ---- */
+static void test_po_fullscreen(void)
+{
+    unsigned long off1, po0, po1;
+    int bad;
+    int tw, th;
+
+    out("\n========================================\n");
+    out("  TEST 24: Full-screen Offscreen Round-trip\n");
+    out("========================================\n\n");
+
+    out("  Tests the exact dune demo pattern at display resolution:\n");
+    out("  CPU fills page 1, blit_po page1->display full-screen.\n\n");
+
+    po0  = make_pitch_offset(0);
+    off1 = (unsigned long)g_page_stride * g_pitch;
+    po1  = make_pitch_offset(off1);
+
+    tw = g_xres;
+    th = g_yres;
+
+    if (off1 + (unsigned long)g_pitch * (th + 4) > g_lfb_size) {
+        out("  SKIPPED: LFB too small\n");
+        return;
+    }
+
+    /* CPU fills page 1 with a recognizable gradient */
+    out("  24a: CPU fills page 1 (%dx%d) with row-based gradient\n", tw, th);
+    {
+        int r, c;
+        for (r = 0; r < th; r++) {
+            unsigned char v = (unsigned char)((r * 251 / th) & 0xFF);
+            for (c = 0; c < tw; c++)
+                off_write(off1, c, r, v);
+        }
+    }
+
+    /* Clear display */
+    memset(g_lfb, 0x00, (long)g_pitch * th);
+
+    /* blit_po: page1 -> display, full screen */
+    out("  24b: blit_po page1 -> display (%dx%d)\n", tw, th);
+    blit_po(po1, 0, 0, po0, 0, 0, tw, th);
+    gpu_wait_idle();
+    gpu_flush_2d();
+
+    /* Verify display matches */
+    bad = 0;
+    {
+        int r, c;
+        for (r = 0; r < th; r++) {
+            unsigned char expect = (unsigned char)((r * 251 / th) & 0xFF);
+            for (c = 0; c < tw; c++)
+                if (vram_read(c, r) != expect) { bad++; break; }
+        }
+    }
+    result(bad == 0,
+           "Full-screen blit_po page1->display: %d bad rows of %d\n", bad, th);
+    if (bad > 0) {
+        int r;
+        out("      First 10 mismatched rows:\n");
+        for (r = 0; r < th && bad > 0; r++) {
+            unsigned char expect = (unsigned char)((r * 251 / th) & 0xFF);
+            unsigned char got = vram_read(0, r);
+            if (got != expect) {
+                out("        row %d: expect=0x%02X got=0x%02X [0..7]: ", r, expect, got);
+                { int x; for (x = 0; x < 8; x++) out("%02X", vram_read(x, r)); }
+                out("\n");
+                bad--;
+                if (bad <= 0) break;
+            }
+        }
+    }
+
+    po_reset();
+    out("\n");
+}
+
+/* ---- TEST 25: blit_po WITHOUT GMC bits (control test) ---- */
+static void test_po_no_gmc(void)
+{
+    unsigned long off1, po0, po1;
+    int bad_with, bad_without;
+
+    out("\n========================================\n");
+    out("  TEST 25: blit_po WITH vs WITHOUT GMC PO bits\n");
+    out("========================================\n\n");
+
+    out("  Compares blit behavior when GMC_*_PITCH_OFFSET_CNTL bits\n");
+    out("  are set vs not set.  This determines whether the GPU\n");
+    out("  actually needs these bits to read per-blit PITCH_OFFSET.\n\n");
+
+    po0  = make_pitch_offset(0);
+    off1 = (unsigned long)g_page_stride * g_pitch;
+    po1  = make_pitch_offset(off1);
+
+    if (off1 + (unsigned long)g_pitch * 8 > g_lfb_size) {
+        out("  SKIPPED: LFB too small\n");
+        return;
+    }
+
+    /* Fill page 1 with 0xBB via CPU */
+    {
+        int r, c;
+        for (r = 0; r < 4; r++)
+            for (c = 0; c < 32; c++)
+                off_write(off1, c, r, 0xBB);
+    }
+
+    /* 25a: WITH GMC bits (the correct xf86 way) */
+    out("  25a: blit WITH GMC PO bits\n");
+    cpu_clear(100, 480, 36, 8, 0x00);
+    blit_po(po1, 0, 0, po0, 100, 480, 32, 4);
+    gpu_wait_idle();
+    bad_with = vram_check_rect(100, 480, 32, 4, 0xBB);
+    result(bad_with == 0, "With GMC bits: %d bad of 128\n", bad_with);
+    if (bad_with > 0) {
+        int x;
+        out("      Display row 480 [100..131]: ");
+        for (x = 100; x < 132; x++) out("%02X", vram_read(x, 480));
+        out("\n");
+    }
+
+    /* 25b: WITHOUT GMC bits — write PITCH_OFFSET but DON'T set GMC flags.
+       This is what the old broken code did. */
+    out("  25b: blit WITHOUT GMC PO bits (old broken pattern)\n");
+    cpu_clear(200, 480, 36, 8, 0x00);
+    gpu_wait_fifo(7);
+    wreg(R_DST_PITCH_OFFSET, po0);
+    wreg(R_SRC_PITCH_OFFSET, po1);
+    wreg(R_DP_GUI_MASTER_CNTL,
+         /* NO GMC_*_PITCH_OFFSET_CNTL bits */
+         GMC_BRUSH_NONE | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_SRCCOPY | GMC_DP_SRC_MEMORY | GMC_CLR_CMP_DIS |
+         GMC_WR_MSK_DIS);
+    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+    wreg(R_SRC_Y_X, (0UL << 16) | 0UL);
+    wreg(R_DST_Y_X, (480UL << 16) | 200UL);
+    wreg(R_DST_HEIGHT_WIDTH, (4UL << 16) | 32UL);
+    gpu_wait_idle();
+    bad_without = vram_check_rect(200, 480, 32, 4, 0xBB);
+    result(bad_without == 0, "Without GMC bits: %d bad of 128\n", bad_without);
+    if (bad_without > 0) {
+        int x;
+        out("      Display row 480 [200..231]: ");
+        for (x = 200; x < 232; x++) out("%02X", vram_read(x, 480));
+        out("\n");
+    }
+
+    /* Interpretation */
+    if (bad_with == 0 && bad_without == 0) {
+        out("  RESULT: GMC bits NOT required — PO works either way\n");
+    } else if (bad_with == 0 && bad_without > 0) {
+        out("  RESULT: GMC bits ARE required — without them, PO is ignored\n");
+    } else if (bad_with > 0 && bad_without == 0) {
+        out("  RESULT: GMC bits BREAK blits — do NOT use them!\n");
+    } else {
+        out("  RESULT: Both methods fail — deeper issue with PITCH_OFFSET\n");
+    }
+
+    po_reset();
+    out("\n");
+}
+
+/* ---- TEST 26: Separate vs combined PITCH_OFFSET writes ---- */
+static void test_po_separate_regs(void)
+{
+    unsigned long off1, po0, po1;
+    int bad_combined, bad_separate;
+
+    out("\n========================================\n");
+    out("  TEST 26: Combined vs Separate Pitch/Offset Registers\n");
+    out("========================================\n\n");
+
+    out("  Tests if writing DST_OFFSET+DST_PITCH separately (without\n");
+    out("  the combined DST_PITCH_OFFSET) achieves the same result.\n\n");
+
+    po0  = make_pitch_offset(0);
+    off1 = (unsigned long)g_page_stride * g_pitch;
+    po1  = make_pitch_offset(off1);
+
+    if (off1 + (unsigned long)g_pitch * 8 > g_lfb_size) {
+        out("  SKIPPED: LFB too small\n");
+        return;
+    }
+
+    /* Fill page 1 with 0xCC via CPU */
+    {
+        int r, c;
+        for (r = 0; r < 4; r++)
+            for (c = 0; c < 32; c++)
+                off_write(off1, c, r, 0xCC);
+    }
+
+    /* 26a: Combined register (PITCH_OFFSET) with GMC bits */
+    out("  26a: Combined SRC_PITCH_OFFSET + GMC bits\n");
+    cpu_clear(100, 490, 36, 8, 0x00);
+    blit_po(po1, 0, 0, po0, 100, 490, 32, 4);
+    gpu_wait_idle();
+    bad_combined = vram_check_rect(100, 490, 32, 4, 0xCC);
+    result(bad_combined == 0,
+           "Combined PO+GMC: %d bad of 128\n", bad_combined);
+
+    /* 26b: Separate registers (SRC_OFFSET + SRC_PITCH), NO GMC bits */
+    out("  26b: Separate SRC_OFFSET+SRC_PITCH, no GMC bits\n");
+    cpu_clear(200, 490, 36, 8, 0x00);
+    gpu_wait_fifo(9);
+    wreg(R_SRC_PITCH_OFFSET, po1);  /* also write combined for reference */
+    wreg(R_SRC_OFFSET, g_fb_location + off1);
+    wreg(R_SRC_PITCH,  (unsigned long)g_pitch);
+    wreg(R_DST_PITCH_OFFSET, po0);
+    wreg(R_DST_OFFSET, g_fb_location);
+    wreg(R_DST_PITCH,  (unsigned long)g_pitch);
+    wreg(R_DP_GUI_MASTER_CNTL,
+         /* NO GMC_*_PITCH_OFFSET_CNTL bits */
+         GMC_BRUSH_NONE | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_SRCCOPY | GMC_DP_SRC_MEMORY | GMC_CLR_CMP_DIS |
+         GMC_WR_MSK_DIS);
+    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+    wreg(R_SRC_Y_X, (0UL << 16) | 0UL);
+    gpu_wait_fifo(2);
+    wreg(R_DST_Y_X, (490UL << 16) | 200UL);
+    wreg(R_DST_HEIGHT_WIDTH, (4UL << 16) | 32UL);
+    gpu_wait_idle();
+    bad_separate = vram_check_rect(200, 490, 32, 4, 0xCC);
+    result(bad_separate == 0,
+           "Separate regs (no GMC): %d bad of 128\n", bad_separate);
+
+    if (bad_combined > 0 || bad_separate > 0) {
+        int x;
+        out("      Row 490 [100..131] (combined): ");
+        for (x = 100; x < 132; x++) out("%02X", vram_read(x, 490));
+        out("\n      Row 490 [200..231] (separate): ");
+        for (x = 200; x < 232; x++) out("%02X", vram_read(x, 490));
+        out("\n");
+    }
+
+    /* Interpretation */
+    if (bad_combined == 0 && bad_separate == 0) {
+        out("  RESULT: Both combined+GMC and separate regs work\n");
+    } else if (bad_combined == 0 && bad_separate > 0) {
+        out("  RESULT: Combined+GMC required; separate regs alone don't work\n");
+    } else if (bad_combined > 0 && bad_separate == 0) {
+        out("  RESULT: Separate regs work; combined+GMC broken!\n");
+    } else {
+        out("  RESULT: Neither method works — fundamental PO issue\n");
+    }
+
+    po_reset();
+    out("\n");
+}
+
+/* ---- TEST 27: Large offset (simulating layer 10+) ---- */
+static void test_po_large_offset(void)
+{
+    unsigned long off_far, po0, po_far;
+    unsigned long max_lfb_row;
+    int bad;
+    int target_page;
+
+    out("\n========================================\n");
+    out("  TEST 27: Large VRAM Offset (beyond row 8191)\n");
+    out("========================================\n\n");
+
+    po0 = make_pitch_offset(0);
+
+    /* Find the highest page we can test within LFB mapping */
+    max_lfb_row = g_lfb_size / g_pitch;
+    target_page = (int)(max_lfb_row / g_page_stride) - 1;
+    if (target_page < 2) target_page = 2;
+
+    off_far = (unsigned long)target_page * g_page_stride * g_pitch;
+    po_far  = make_pitch_offset(off_far);
+
+    out("  Target page: %d (row %ld, VRAM offset 0x%08lX)\n",
+        target_page, (long)target_page * g_page_stride, off_far);
+    out("  Absolute row: %ld  (8191 limit: %s)\n",
+        (long)target_page * g_page_stride,
+        (long)target_page * g_page_stride > 8191 ? "EXCEEDS" : "within");
+    out("  PO=0x%08lX\n\n", po_far);
+
+    if (off_far + (unsigned long)g_pitch * 8 > g_lfb_size) {
+        out("  SKIPPED: LFB can't reach page %d\n", target_page);
+        return;
+    }
+
+    /* CPU writes pattern to far page */
+    {
+        int r, c;
+        for (r = 0; r < 4; r++)
+            for (c = 0; c < 32; c++)
+                off_write(off_far, c, r, 0xEE);
+    }
+
+    /* GPU blit from far page to display via PITCH_OFFSET */
+    out("  27a: blit_po from page %d -> display(300,480) 32x4\n", target_page);
+    cpu_clear(298, 478, 36, 8, 0x00);
+    blit_po(po_far, 0, 0, po0, 300, 480, 32, 4);
+    gpu_wait_idle();
+
+    bad = vram_check_rect(300, 480, 32, 4, 0xEE);
+    result(bad == 0,
+           "Large offset blit (page %d): %d bad of 128\n", target_page, bad);
+    if (bad > 0) {
+        int x;
+        out("      Far page data [0..31]: ");
+        for (x = 0; x < 32; x++) out("%02X", off_read(off_far, x, 0));
+        out("\n      Display row 480 [300..331]: ");
+        for (x = 300; x < 332; x++) out("%02X", vram_read(x, 480));
+        out("\n");
+    }
+
+    /* 27b: GPU blit TO far page, then read back via CPU */
+    out("  27b: gpu_fill_po to page %d, then CPU readback\n", target_page);
+    off_fill(off_far, 50, 0, 36, 8, 0x00);
+    gpu_fill_po(po_far, 50, 0, 32, 4, 0x99);
+    gpu_wait_idle();
+    gpu_flush_2d();
+
+    bad = off_check(off_far, 50, 0, 32, 4, 0x99);
+    result(bad == 0,
+           "gpu_fill_po to page %d, CPU readback: %d bad of 128\n",
+           target_page, bad);
+    if (bad > 0) {
+        off_dump_row(off_far, 0, 50, 82);
+        off_dump_row(off_far, 1, 50, 82);
+    }
+
+    po_reset();
+    out("\n");
+}
+
+/* ---- TEST 28: Register state after blit_po ---- */
+static void test_po_register_state(void)
+{
+    unsigned long off1, po0, po1;
+    unsigned long rd_dst_po, rd_src_po, rd_dst_off, rd_src_off;
+    unsigned long rd_dst_pitch, rd_src_pitch;
+
+    out("\n========================================\n");
+    out("  TEST 28: Register State After blit_po\n");
+    out("========================================\n\n");
+
+    out("  Reads back DST/SRC PITCH_OFFSET and separate offset/pitch\n");
+    out("  registers after a blit_po to understand GPU register model.\n\n");
+
+    po0  = make_pitch_offset(0);
+    off1 = (unsigned long)g_page_stride * g_pitch;
+    po1  = make_pitch_offset(off1);
+
+    /* First: read registers in default state */
+    out("  Default state (before any blit_po):\n");
+    po_reset();
+    gpu_wait_idle();
+    rd_dst_po    = rreg(R_DST_PITCH_OFFSET);
+    rd_src_po    = rreg(R_SRC_PITCH_OFFSET);
+    rd_dst_off   = rreg(R_DST_OFFSET);
+    rd_src_off   = rreg(R_SRC_OFFSET);
+    rd_dst_pitch = rreg(R_DST_PITCH);
+    rd_src_pitch = rreg(R_SRC_PITCH);
+    out("    DST_PITCH_OFFSET = 0x%08lX (expect 0x%08lX)\n", rd_dst_po, po0);
+    out("    SRC_PITCH_OFFSET = 0x%08lX (expect 0x%08lX)\n", rd_src_po, po0);
+    out("    DST_OFFSET       = 0x%08lX\n", rd_dst_off);
+    out("    DST_PITCH        = 0x%08lX (%lu)\n", rd_dst_pitch, rd_dst_pitch);
+    out("    SRC_OFFSET       = 0x%08lX\n", rd_src_off);
+    out("    SRC_PITCH        = 0x%08lX (%lu)\n", rd_src_pitch, rd_src_pitch);
+
+    /* Issue a blit_po with non-default PO */
+    if (off1 + (unsigned long)g_pitch * 8 <= g_lfb_size) {
+        off_fill(off1, 0, 0, 8, 4, 0x77);
+        blit_po(po1, 0, 0, po0, 600, 500, 4, 4);
+        gpu_wait_idle();
+
+        out("  After blit_po(src=page1, dst=display):\n");
+        rd_dst_po    = rreg(R_DST_PITCH_OFFSET);
+        rd_src_po    = rreg(R_SRC_PITCH_OFFSET);
+        rd_dst_off   = rreg(R_DST_OFFSET);
+        rd_src_off   = rreg(R_SRC_OFFSET);
+        rd_dst_pitch = rreg(R_DST_PITCH);
+        rd_src_pitch = rreg(R_SRC_PITCH);
+        out("    DST_PITCH_OFFSET = 0x%08lX (wrote 0x%08lX)\n", rd_dst_po, po0);
+        out("    SRC_PITCH_OFFSET = 0x%08lX (wrote 0x%08lX)\n", rd_src_po, po1);
+        out("    DST_OFFSET       = 0x%08lX\n", rd_dst_off);
+        out("    DST_PITCH        = 0x%08lX (%lu)\n", rd_dst_pitch, rd_dst_pitch);
+        out("    SRC_OFFSET       = 0x%08lX\n", rd_src_off);
+        out("    SRC_PITCH        = 0x%08lX (%lu)\n", rd_src_pitch, rd_src_pitch);
+
+        /* Note: PITCH_OFFSET is FIFO-queued and may read 0 */
+        if (rd_dst_po == 0 && rd_src_po == 0)
+            out("    (PITCH_OFFSET reads 0 — FIFO-queued, expected on RV515)\n");
+    }
+
+    po_reset();
+    out("\n");
+}
+
+/* =============================================================== */
 /*  Main                                                            */
 /* =============================================================== */
 
@@ -2490,15 +3464,28 @@ int main(void)
         return 1;
     }
 
-    /* Map LFB — need enough for test area (up to ~y=560) */
-    lfb_sz = (unsigned long)g_pitch * 600;
+    /* Compute page stride: round up so stride*pitch is 4KB-aligned */
+    {
+        unsigned long page_bytes;
+        g_page_stride = g_yres;
+        page_bytes = (unsigned long)g_page_stride * g_pitch;
+        if (page_bytes & 4095UL) {
+            g_page_stride = (int)((page_bytes + 4095UL) & ~4095UL) / g_pitch;
+            if ((unsigned long)g_page_stride * g_pitch & 4095UL)
+                g_page_stride = ((g_page_stride + 7) & ~7);
+        }
+    }
+
+    /* Map LFB — 4 pages for offscreen PITCH_OFFSET tests */
+    lfb_sz = (unsigned long)g_pitch * g_page_stride * 4;
     if (lfb_sz < (unsigned long)g_pitch * g_yres)
         lfb_sz = (unsigned long)g_pitch * g_yres;
     lfb_sz = (lfb_sz + 4095UL) & ~4095UL;
+    g_lfb_size = lfb_sz;
     g_lfb = (unsigned char *)dpmi_map(g_lfb_phys, lfb_sz);
     if (!g_lfb) {
         vbe_text();
-        out("ERROR: Cannot map LFB.\n");
+        out("ERROR: Cannot map LFB (%lu bytes).\n", lfb_sz);
         dpmi_unmap((void *)g_mmio);
         if (g_log) fclose(g_log);
         dpmi_free();
@@ -2519,8 +3506,10 @@ int main(void)
     memset(g_lfb, 0, (long)g_pitch * g_yres);
 
     out("\n  Running 2D blitter tests in graphics mode...\n");
-    out("  Resolution: %dx%d  Pitch: %d (VBE: %d)  VRAM: %luMB\n\n",
+    out("  Resolution: %dx%d  Pitch: %d (VBE: %d)  VRAM: %luMB\n",
         g_xres, g_yres, g_pitch, g_vbe_pitch, g_vram_mb);
+    out("  Page stride: %d rows  LFB mapped: %lu bytes (%lu KB)\n\n",
+        g_page_stride, g_lfb_size, g_lfb_size / 1024UL);
 
     /* ---- Run all tests ---- */
     test_fill_basic();
@@ -2541,6 +3530,19 @@ int main(void)
     test_vga_crtc();
     test_flip_address();
     test_gmc_pitch_offset_cntl();
+
+    /* PITCH_OFFSET comprehensive tests (TEST 18-28) */
+    test_po_encoding();
+    test_po_fill();
+    test_po_blit_basic();
+    test_po_staging();
+    test_po_switching();
+    test_po_colorkey();
+    test_po_fullscreen();
+    test_po_no_gmc();
+    test_po_separate_regs();
+    test_po_large_offset();
+    test_po_register_state();
 
     /* ---- Summary ---- */
     out("\n========================================\n");
