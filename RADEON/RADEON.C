@@ -1865,6 +1865,207 @@ static void gen_cityscape(int base)
 }
 
 /* ----- Main parallax loop ---------------------------------------- */
+
+/* Diagnostic grid layer generators.  Each draws a grid of hollow
+   rectangles in a distinctive color on a transparent background.
+   The grid spacing increases with depth (perspective cue) and each
+   cell contains a label so misaligned layers are immediately obvious. */
+
+static void gen_diag_layer(int base, int cell_w, int cell_h,
+                           unsigned char border_c, unsigned char label_c,
+                           const char *tag)
+{
+    int x, y, cx, cy;
+
+    /* Fill entire layer with transparency */
+    for (y = 0; y < g_yres; y++)
+        memset(g_lfb + (long)(base + y) * g_pitch, PLAX_TRANSP, g_xres);
+
+    /* Draw grid of hollow rectangles */
+    for (cx = 0; cx * cell_w < g_xres; cx++) {
+        int x0 = cx * cell_w;
+        int x1 = x0 + cell_w - 1;
+        if (x1 >= g_xres) x1 = g_xres - 1;
+
+        for (cy = 0; cy * cell_h < g_yres; cy++) {
+            int y0 = cy * cell_h;
+            int y1 = y0 + cell_h - 1;
+            if (y1 >= g_yres) y1 = g_yres - 1;
+
+            /* Top and bottom edges (2px thick) */
+            for (x = x0; x <= x1; x++) {
+                g_lfb[(long)(base + y0) * g_pitch + x] = border_c;
+                if (y0 + 1 < g_yres)
+                    g_lfb[(long)(base + y0 + 1) * g_pitch + x] = border_c;
+                g_lfb[(long)(base + y1) * g_pitch + x] = border_c;
+                if (y1 - 1 > y0 + 1)
+                    g_lfb[(long)(base + y1 - 1) * g_pitch + x] = border_c;
+            }
+            /* Left and right edges (2px thick) */
+            for (y = y0; y <= y1; y++) {
+                g_lfb[(long)(base + y) * g_pitch + x0] = border_c;
+                if (x0 + 1 <= x1)
+                    g_lfb[(long)(base + y) * g_pitch + x0 + 1] = border_c;
+                g_lfb[(long)(base + y) * g_pitch + x1] = border_c;
+                if (x1 - 1 > x0 + 1)
+                    g_lfb[(long)(base + y) * g_pitch + x1 - 1] = border_c;
+            }
+
+            /* Label inside cell: "A0" "A1" etc. (tag char + cell number) */
+            if (cell_w >= 24 && cell_h >= 16) {
+                char lbl[8];
+                int lx, li;
+                sprintf(lbl, "%s%d", tag, (cx + cy * 10) % 100);
+                lx = x0 + 4;
+                for (li = 0; lbl[li] && lx + 8 <= x1; li++, lx += 8)
+                    cpu_char(lx, base + y0 + 4, lbl[li], label_c, 1);
+            }
+        }
+    }
+}
+
+static void demo_parallax_diag(void)
+{
+    int layer_base[PLAX_NLAYERS];
+    int back_page, back_y, scroll;
+    long fps_count;
+    clock_t fps_t0;
+    double fps;
+    char buf[80];
+    int i;
+    unsigned long need;
+
+    need = (unsigned long)g_pitch * g_page_stride * 6;
+    if (g_vram_mb > 0 && need > g_vram_mb * 1024UL * 1024UL) {
+        gpu_fill(0, 0, g_xres, g_yres, 0);
+        gpu_wait_idle();
+        cpu_str_c(g_yres / 2, "Not enough VRAM for diag demo", 251, 2);
+        cpu_str_c(g_yres / 2 + 30, "Press any key...", 253, 1);
+        getch();
+        return;
+    }
+
+    for (i = 0; i < PLAX_NLAYERS; i++)
+        layer_base[i] = g_page_stride * (2 + i);
+
+    gpu_wait_fifo(1);
+    wreg(R_SC_BOTTOM_RIGHT, (0x1FFFUL << 16) | (unsigned long)g_xres);
+
+    gpu_fill(0, 0, g_xres, g_yres, 0);
+    gpu_wait_idle();
+    cpu_str_c(g_yres / 2 - 20, "Generating DIAGNOSTIC parallax layers...", 255, 2);
+    cpu_str_c(g_yres / 2 + 10,
+              "Layer 0=Blue  1=Red  2=Green  3=Yellow  grids", 253, 1);
+
+    /* Layer 0 (sky/back): blue grid, large cells — opaque background */
+    /* Fill with solid dark blue first (not transparent) */
+    {
+        int ly;
+        for (ly = 0; ly < g_yres; ly++)
+            memset(g_lfb + (long)(layer_base[0] + ly) * g_pitch, 2, g_xres);
+    }
+    /* Draw large grid on top */
+    {
+        int lx, ly;
+        for (ly = 0; ly < g_yres; ly += 100)
+            for (lx = 0; lx < g_xres; lx++)
+                g_lfb[(long)(layer_base[0] + ly) * g_pitch + lx] = 20;
+        for (lx = 0; lx < g_xres; lx += 100)
+            for (ly = 0; ly < g_yres; ly++)
+                g_lfb[(long)(layer_base[0] + ly) * g_pitch + lx] = 20;
+        /* Label cells */
+        for (ly = 0; ly < g_yres; ly += 100) {
+            for (lx = 0; lx < g_xres; lx += 100) {
+                char lbl[8];
+                sprintf(lbl, "B%d", ((lx/100) + (ly/100)*10) % 100);
+                if (lx + 24 < g_xres && ly + 12 < g_yres) {
+                    int ci;
+                    for (ci = 0; lbl[ci]; ci++)
+                        cpu_char(lx + 4 + ci * 8, layer_base[0] + ly + 4,
+                                 lbl[ci], 28, 1);
+                }
+            }
+        }
+    }
+
+    /* Layer 1 (mountains): red hollow grid, 80px cells */
+    gen_diag_layer(layer_base[1], 80, 80, 90, 75, "R");
+
+    /* Layer 2 (hills): green hollow grid, 60px cells */
+    gen_diag_layer(layer_base[2], 60, 60, 55, 45, "G");
+
+    /* Layer 3 (city/front): yellow hollow grid, 40px cells */
+    gen_diag_layer(layer_base[3], 40, 40, 155, 140, "Y");
+
+    /* Clear both display pages */
+    gpu_fill(0, 0, g_xres, g_page_stride * 2, 0);
+    gpu_wait_idle();
+
+    gpu_wait_fifo(1);
+    wreg(R_CLR_CMP_CNTL, 0);
+
+    back_page = 1;
+    scroll    = 0;
+    fps_count = 0;
+    fps       = 0.0;
+    fps_t0    = clock();
+
+    while (!kbhit()) {
+        back_y = back_page * g_page_stride;
+
+        /* Same scroll speeds as scenic parallax */
+        plax_blit_wrap(layer_base[0], scroll / 8,
+                       back_y, g_yres, 0);  /* blue bg: opaque */
+        plax_blit_wrap(layer_base[1], scroll / 4,
+                       back_y, g_yres, 1);  /* red grid: keyed */
+        plax_blit_wrap(layer_base[2], scroll / 2,
+                       back_y, g_yres, 1);  /* green grid: keyed */
+        plax_blit_wrap(layer_base[3], scroll,
+                       back_y, g_yres, 1);  /* yellow grid: keyed */
+
+        gpu_wait_idle();
+
+        fps_count++;
+        {
+            clock_t now = clock();
+            double elapsed = (double)(now - fps_t0) / CLOCKS_PER_SEC;
+            if (elapsed >= 1.0) {
+                fps = (double)fps_count / elapsed;
+                fps_count = 0;
+                fps_t0 = now;
+            }
+        }
+
+        sprintf(buf, "DIAG Parallax  %.1f FPS  scroll=%d  [ESC quit]",
+                fps, scroll);
+        cpu_str(4, back_y + 4, buf, 255, 1);
+
+        /* Legend at bottom */
+        cpu_str(4,   back_y + g_yres - 42,
+                "Blue=L0(1/8x) Red=L1(1/4x) Green=L2(1/2x) Yellow=L3(1x)",
+                253, 1);
+        sprintf(buf, "page=%d back_y=%d stride=%d pitch=%d",
+                back_page, back_y, g_page_stride, g_pitch);
+        cpu_str(4, back_y + g_yres - 28, buf, 254, 1);
+        sprintf(buf, "base[0]=%d [1]=%d [2]=%d [3]=%d",
+                layer_base[0], layer_base[1], layer_base[2], layer_base[3]);
+        cpu_str(4, back_y + g_yres - 14, buf, 254, 1);
+
+        flip_page(back_page);
+
+        back_page ^= 1;
+        scroll++;
+        if (scroll >= g_xres * 1000) scroll = 0;
+    }
+    getch();
+
+    flip_restore_page0();
+
+    gpu_wait_fifo(1);
+    wreg(R_SC_BOTTOM_RIGHT,
+         ((unsigned long)g_yres << 16) | (unsigned long)g_xres);
+}
+
 static void demo_parallax(void)
 {
     int layer_base[PLAX_NLAYERS];
@@ -2307,7 +2508,12 @@ int main(void)
     }
 
     if (ch != 27) {
-        /* === Demo 5: GPU parallax scrolling === */
+        /* === Demo 5: Diagnostic parallax (colored grids) === */
+        demo_parallax_diag();
+    }
+
+    if (ch != 27) {
+        /* === Demo 6: GPU parallax scrolling (scenic) === */
         demo_parallax();
     }
 
