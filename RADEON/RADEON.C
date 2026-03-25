@@ -318,6 +318,7 @@ static unsigned short g_vmode;
 static unsigned char *g_font = NULL;
 static int g_fifo_free = 0;  /* tracked free FIFO entries (avoids MMIO reads) */
 static int g_avivo_flip = 0; /* 1=AVIVO D1GRPH flip, 0=VBE+port 0x3DA */
+static double g_rdtsc_mhz = 0.0;  /* calibrated CPU MHz via RDTSC */
 
 static int  g_pci_bus, g_pci_dev, g_pci_func;
 static unsigned short g_pci_did;
@@ -732,6 +733,53 @@ static int gpu_mc_wait_idle(void)
             return 1;
     }
     return 0;
+}
+
+/* =============================================================== */
+/*  RDTSC high-resolution timer (ported from PLASMA/VGA.C)          */
+/* =============================================================== */
+
+static void rdtsc_read(unsigned long *lo, unsigned long *hi)
+{
+    unsigned long a, d;
+    __asm {
+        rdtsc
+        mov [a], eax
+        mov [d], edx
+    }
+    *lo = a;
+    *hi = d;
+}
+
+static double tsc_to_ms(unsigned long lo1, unsigned long hi1,
+                         unsigned long lo0, unsigned long hi0)
+{
+    double cycles = (double)hi1 * 4294967296.0 + (double)lo1
+                  - (double)hi0 * 4294967296.0 - (double)lo0;
+    return (g_rdtsc_mhz > 0.0) ? cycles / (g_rdtsc_mhz * 1000.0) : 0.0;
+}
+
+/* Calibrate RDTSC against BIOS tick counter (18.2065 Hz).
+   Takes ~220ms.  Must be called before any tsc_to_ms() use. */
+static void calibrate_rdtsc(void)
+{
+    volatile unsigned long *bios_ticks = (volatile unsigned long *)0x46CUL;
+    unsigned long bt0, bt1;
+    unsigned long lo0, hi0, lo1, hi1;
+    double elapsed_s, cycles;
+
+    bt0 = *bios_ticks;
+    while (*bios_ticks == bt0) {}
+
+    rdtsc_read(&lo0, &hi0);
+    bt0 = *bios_ticks;
+    while ((bt1 = *bios_ticks) - bt0 < 4) {}
+    rdtsc_read(&lo1, &hi1);
+
+    elapsed_s = (double)(bt1 - bt0) / 18.2065;
+    cycles    = (double)hi1 * 4294967296.0 + (double)lo1
+              - (double)hi0 * 4294967296.0 - (double)lo0;
+    g_rdtsc_mhz = (elapsed_s > 0.0) ? cycles / elapsed_s / 1.0e6 : 0.0;
 }
 
 /* Wait for at least `n` free FIFO entries.
@@ -1514,26 +1562,12 @@ static void demo_pattern(void)
     gpu_wait_idle();
 }
 
-/* Wait for next BIOS tick edge — gives precise timing start.
-   DOS clock() ticks at 18.2 Hz (~55ms); syncing to the edge
-   eliminates ±1 tick jitter that causes random 0ms readings. */
-static clock_t tick_sync(void)
-{
-    clock_t c = clock();
-    while (clock() == c) {}
-    return clock();
-}
-
-/* Minimum ticks a GPU benchmark must run to be reliable.
-   8 ticks ≈ 440ms at 18.2Hz → ±1 tick error < 13%. */
-#define BENCH_MIN_TICKS  8
-
-/* CPU vs GPU fill benchmark */
+/* CPU vs GPU fill benchmark — uses RDTSC for microsecond-accurate timing */
 static void demo_benchmark(void)
 {
-    clock_t t0, t1;
+    unsigned long t0lo, t0hi, t1lo, t1hi;
     double cpu_ms, gpu_ms, rect_ms, rect_ms2;
-    int iters, gpu_iters;
+    int iters = 100;
     long rect_iters, rect_iters2;
     int i;
     unsigned char col;
@@ -1543,34 +1577,29 @@ static void demo_benchmark(void)
     gpu_fill(0, 0, g_xres, g_yres, 0);
     gpu_wait_idle();
 
-    /* --- CPU benchmark (100 fills, ~1.8s, no sync needed) --- */
-    iters = 100;
-    t0 = clock();
+    /* --- CPU benchmark --- */
+    rdtsc_read(&t0lo, &t0hi);
     for (i = 0; i < iters; i++) {
         int y;
         col = (unsigned char)(i & 0xFF);
         for (y = 0; y < g_yres; y++)
             memset(g_lfb + y * g_pitch, col, g_xres);
     }
-    t1 = clock();
-    cpu_ms = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC;
+    rdtsc_read(&t1lo, &t1hi);
+    cpu_ms = tsc_to_ms(t1lo, t1hi, t0lo, t0hi);
 
-    /* --- GPU full-screen fill benchmark (adaptive) --- */
+    /* --- GPU full-screen fill benchmark --- */
     gpu_fill(0, 0, g_xres, g_yres, 0);
     gpu_wait_idle();
 
-    gpu_iters = 0;
-    t0 = tick_sync();
-    do {
-        for (i = 0; i < 100; i++) {
-            col = (unsigned char)((gpu_iters + i) & 0xFF);
-            gpu_fill(0, 0, g_xres, g_yres, col);
-        }
-        gpu_wait_idle();
-        gpu_iters += 100;
-        t1 = clock();
-    } while (t1 - t0 < BENCH_MIN_TICKS);
-    gpu_ms = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC;
+    rdtsc_read(&t0lo, &t0hi);
+    for (i = 0; i < iters; i++) {
+        col = (unsigned char)(i & 0xFF);
+        gpu_fill(0, 0, g_xres, g_yres, col);
+    }
+    gpu_wait_idle();
+    rdtsc_read(&t1lo, &t1hi);
+    gpu_ms = tsc_to_ms(t1lo, t1hi, t0lo, t0hi);
 
     /* --- GPU small-rect throughput benchmark (fast path) --- */
     {
@@ -1583,12 +1612,11 @@ static void demo_benchmark(void)
         gpu_fill(0, 0, g_xres, g_yres, 0);
         gpu_wait_idle();
 
-        /* 3-reg path (color + pos + size per rect) — adaptive */
+        /* 3-reg path (color + pos + size per rect) */
         gpu_fill_setup();
         rect_iters = 0;
-        pass = 0;
-        t0 = tick_sync();
-        do {
+        rdtsc_read(&t0lo, &t0hi);
+        for (pass = 0; pass < 200; pass++) {
             int rx, ry;
             col = (unsigned char)(pass & 0xFF);
             for (ry = 0; ry < rows; ry++)
@@ -1596,39 +1624,26 @@ static void demo_benchmark(void)
                     gpu_fill_fast(rx * rw, ry * rh, rw, rh,
                                   (unsigned char)(col + rx + ry));
             rect_iters += total_rects;
-            pass++;
-            if ((pass & 63) == 0) {
-                gpu_wait_idle();
-                t1 = clock();
-                if (t1 - t0 >= BENCH_MIN_TICKS) break;
-            }
-        } while (1);
+        }
         gpu_wait_idle();
-        t1 = clock();
-        rect_ms = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC;
+        rdtsc_read(&t1lo, &t1hi);
+        rect_ms = tsc_to_ms(t1lo, t1hi, t0lo, t0hi);
 
         /* 2-reg path (pos + size only, same color — peak throughput) */
         gpu_fill_setup();
         gpu_fill_set_color(0x55);
         rect_iters2 = 0;
-        pass = 0;
-        t0 = tick_sync();
-        do {
+        rdtsc_read(&t0lo, &t0hi);
+        for (pass = 0; pass < 200; pass++) {
             int rx, ry;
             for (ry = 0; ry < rows; ry++)
                 for (rx = 0; rx < cols; rx++)
                     gpu_fill_rect(rx * rw, ry * rh, rw, rh);
             rect_iters2 += total_rects;
-            pass++;
-            if ((pass & 63) == 0) {
-                gpu_wait_idle();
-                t1 = clock();
-                if (t1 - t0 >= BENCH_MIN_TICKS) break;
-            }
-        } while (1);
+        }
         gpu_wait_idle();
-        t1 = clock();
-        rect_ms2 = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC;
+        rdtsc_read(&t1lo, &t1hi);
+        rect_ms2 = tsc_to_ms(t1lo, t1hi, t0lo, t0hi);
     }
 
     /* Display results */
@@ -1636,12 +1651,10 @@ static void demo_benchmark(void)
     gpu_wait_idle();
 
     {
-        double cpu_total = (double)g_xres * g_yres * iters / (1024.0*1024.0);
-        double gpu_total = (double)g_xres * g_yres * gpu_iters / (1024.0*1024.0);
-        double cpu_rate = (cpu_ms > 0) ? cpu_total / (cpu_ms/1000.0) : 0;
-        double gpu_rate = (gpu_ms > 0) ? gpu_total / (gpu_ms/1000.0) : 0;
-        double speedup  = (cpu_ms > 0 && gpu_ms > 0)
-                        ? (cpu_ms / iters) / (gpu_ms / gpu_iters) : 0;
+        double total = (double)g_xres * g_yres * iters / (1024.0*1024.0);
+        double cpu_rate = (cpu_ms > 0) ? total / (cpu_ms/1000.0) : 0;
+        double gpu_rate = (gpu_ms > 0) ? total / (gpu_ms/1000.0) : 0;
+        double speedup  = (gpu_ms > 0) ? cpu_ms / gpu_ms : 0;
         double rps3     = (rect_ms > 0) ? (double)rect_iters / (rect_ms / 1000.0) : 0;
         double rpix3    = (rect_ms > 0) ? (double)rect_iters * 32 * 32 /
                           (rect_ms / 1000.0) / 1000000.0 : 0;
@@ -1651,16 +1664,14 @@ static void demo_benchmark(void)
 
         cpu_str_c(10, "=== CPU vs GPU Fill Benchmark ===", 255, 2);
 
-        sprintf(buf, "full-screen fill (%dx%d, 8bpp)", g_xres, g_yres);
+        sprintf(buf, "%d x full-screen fill (%dx%d, 8bpp)", iters, g_xres, g_yres);
         cpu_str_c(40, buf, 253, 1);
 
-        sprintf(buf, "CPU: %7.1f ms / %d fills  (%5.1f MB/s)",
-                cpu_ms, iters, cpu_rate);
-        cpu_str(20, 70, buf, 251, 2);
+        sprintf(buf, "CPU: %7.1f ms  (%5.1f MB/s)", cpu_ms, cpu_rate);
+        cpu_str(40, 70, buf, 251, 2);
 
-        sprintf(buf, "GPU: %7.1f ms / %d fills  (%5.1f MB/s)",
-                gpu_ms, gpu_iters, gpu_rate);
-        cpu_str(20, 100, buf, 250, 2);
+        sprintf(buf, "GPU: %7.1f ms  (%5.1f MB/s)", gpu_ms, gpu_rate);
+        cpu_str(40, 100, buf, 250, 2);
 
         if (gpu_ms > 0) {
             sprintf(buf, "GPU speedup: %.1fx", speedup);
@@ -1675,18 +1686,16 @@ static void demo_benchmark(void)
         sprintf(buf, "32x32 (2-reg): %6.0f Krect/s  %5.0f Mpix/s", rps2/1000.0, rpix2);
         cpu_str_c(200, buf, 254, 1);
 
-        /* Draw bar chart (normalized to per-fill time) */
+        /* Draw bar chart */
         {
             int bar_max = g_xres - 100;
             int cpu_bar, gpu_bar, bar_y;
-            double cpu_per = (iters > 0) ? cpu_ms / iters : 0;
-            double gpu_per = (gpu_iters > 0) ? gpu_ms / gpu_iters : 0;
-            double mx = cpu_per;
-            if (gpu_per > mx) mx = gpu_per;
+            double mx = cpu_ms;
+            if (gpu_ms > mx) mx = gpu_ms;
             if (mx <= 0) mx = 1;
 
-            cpu_bar = (int)(cpu_per / mx * bar_max);
-            gpu_bar = (int)(gpu_per / mx * bar_max);
+            cpu_bar = (int)(cpu_ms / mx * bar_max);
+            gpu_bar = (int)(gpu_ms / mx * bar_max);
             if (cpu_bar < 1) cpu_bar = 1;
             if (gpu_bar < 1) gpu_bar = 1;
 
@@ -1699,7 +1708,8 @@ static void demo_benchmark(void)
             gpu_wait_idle();
         }
 
-        sprintf(buf, "Flip: %s", g_avivo_flip ? "AVIVO hwflip" : "VBE+VGA vsync");
+        sprintf(buf, "Flip: %s   Timer: RDTSC @ %.0f MHz",
+                g_avivo_flip ? "AVIVO hwflip" : "VBE+VGA vsync", g_rdtsc_mhz);
         cpu_str_c(350, buf, 253, 1);
         cpu_str_c(g_yres - 20, "Press any key for GPU flood demo, ESC to quit", 253, 1);
     }
@@ -2830,6 +2840,11 @@ int main(void)
 
     printf("RADEON.EXE - ATI Radeon X1300 Pro DOS Hardware Demo\n");
     printf("===================================================\n\n");
+
+    /* Calibrate RDTSC for high-resolution timing (~220ms) */
+    printf("Calibrating RDTSC timer...");
+    calibrate_rdtsc();
+    printf(" %.1f MHz\n", g_rdtsc_mhz);
 
     /* Allocate DOS transfer buffer */
     if (!dpmi_alloc(64)) {
