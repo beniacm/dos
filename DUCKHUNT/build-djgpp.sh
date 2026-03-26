@@ -3,7 +3,7 @@ set -e
 
 # DJGPP cross-compiler build script for DUCKHUNT (Quack Hunt)
 # Target: Pentium D (Prescott core) - uses SSE/SSE2/SSE3
-DJGPP_ROOT="$(cd "$(dirname "$0")/../djgpp" && pwd)"
+DJGPP_ROOT="${DJGPP_ROOT:-/opt/djgpp}"
 
 export PATH="$DJGPP_ROOT/bin:$DJGPP_ROOT/i586-pc-msdosdjgpp/bin:$PATH"
 export GCC_EXEC_PREFIX="$DJGPP_ROOT/lib/gcc/"

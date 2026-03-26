@@ -1,225 +1,26 @@
 /*
  * RDIAG.C  -  ATI Radeon X1300 Pro (RV515/RV516) Hardware Diagnostic
- * For OpenWatcom 2.0, 32-bit DOS (PMODE/W or DOS/4GW)
  *
- * Produces TESTLOG.TXT with comprehensive hardware state dump:
- *   - Full PCI configuration space (256 bytes)
- *   - BAR probing with size detection
- *   - MMIO identification by probing each BAR for known register signatures
- *   - Complete GPU register dump from correct MMIO BAR
- *   - MC (memory controller) indirect register dump
- *   - VESA/VBE mode enumeration
- *   - DPMI capability check
- *   - VRAM read/write test
- *   - GPU 2D engine functional test
+ * Hardware-layer code (DPMI, PCI, VBE, MMIO) lives in RADEONHW.C / RADEONHW.H.
+ * This file contains only the diagnostic sections, RDIAG-specific helpers,
+ * and main().
  *
- * Run on real RV515/RV516 hardware and send back TESTLOG.TXT for analysis.
- *
- * Build: wcc386 -bt=dos -3r -ox -s -zq RDIAG.C
- *        wlink system pmodew name RDIAG file RDIAG option quiet
+ * RDIAG-specific extras (not in RADEONHW):
+ *   pci_rd8()          -- byte-granularity PCI config read
+ *   bar_probe_size()   -- BAR size detection via write-0xFFF/read/restore
+ *   dpmi_version_info()-- DPMI int 0x31 function 0x0400 query
+ *   rreg_at(base,off)  -- parameterised MMIO read (probes multiple BARs)
+ *   wreg_at(base,off,v)-- parameterised MMIO write
+ *   mc_rreg_at(base,r) -- parameterised MC indirect read
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include "RADEONHW.H"
 #include <stdarg.h>
 #include <conio.h>
-#include <i86.h>
 #include <time.h>
 
-/* =============================================================== */
-/*  Packed structures                                               */
-/* =============================================================== */
-#pragma pack(1)
-
-typedef struct {
-    char           sig[4];
-    unsigned short ver;
-    unsigned long  oem_str;
-    unsigned long  caps;
-    unsigned long  mode_ptr;
-    unsigned short tot_mem;
-    unsigned short oem_soft_rev;
-    unsigned long  oem_vendor;
-    unsigned long  oem_product;
-    unsigned long  oem_rev;
-    unsigned char  _pad[222];
-    unsigned char  oem_data[256];
-} VBEInfo;
-
-typedef struct {
-    unsigned short attr;
-    unsigned char  wina, winb;
-    unsigned short gran, winsz, sega, segb;
-    unsigned long  winfn;
-    unsigned short pitch;
-    unsigned short xres, yres;
-    unsigned char  xch, ych, planes, bpp, banks, model, bksz, pages, r1;
-    unsigned char  rmsk, rpos, gmsk, gpos, bmsk, bpos, amsk, apos, dcm;
-    unsigned long  lfb_phys;
-    unsigned char  _pad[212];
-} VBEMode;
-
-typedef struct {
-    unsigned long  edi, esi, ebp, _rz;
-    unsigned long  ebx, edx, ecx, eax;
-    unsigned short flags, es, ds, fs, gs;
-    unsigned short ip, cs, sp, ss;
-} RMI;
-
-#pragma pack()
-
-/* =============================================================== */
-/*  ATI Radeon register offsets (RV515/R300-R500)                    */
-/* =============================================================== */
-
-/* Identifiable registers — values that reveal whether we're reading
-   real MMIO or random VRAM */
-#define R_CONFIG_APER_0_BASE       0x0100  /* should match BAR0 phys addr */
-#define R_CONFIG_APER_SIZE         0x0108  /* aperture size */
-#define R_CONFIG_MEMSIZE           0x00F8  /* VRAM size in bytes */
-#define R_CONFIG_REG_1_BASE        0x010C  /* should match BAR2 phys addr */
-#define R_CONFIG_REG_APER_SIZE     0x0110  /* register aperture size */
-#define R_HOST_PATH_CNTL           0x0130
-#define R_HDP_FB_LOCATION          0x0134
-
-#define R_RBBM_STATUS              0x0E40
-#define   RBBM_FIFOCNT_MASK        0x007FUL
-#define   RBBM_ACTIVE              (1UL << 31)
-#define R_RBBM_SOFT_RESET          0x00F0
-
-#define R_VGA_RENDER_CONTROL       0x0300
-#define R_SURFACE_CNTL             0x0B00
-
-#define R_MC_IND_INDEX             0x0070
-#define R_MC_IND_DATA              0x0074
-
-#define R_CLOCK_CNTL_INDEX         0x0008
-#define R_CLOCK_CNTL_DATA          0x000C
-
-#define R_WAIT_UNTIL               0x1720
-#define R_RBBM_GUICNTL             0x172C
-#define R_ISYNC_CNTL               0x1724
-
-#define R_DST_OFFSET               0x1404
-#define R_DST_PITCH                0x1408
-#define R_DST_PITCH_OFFSET         0x142C
-#define R_SRC_PITCH_OFFSET         0x1428
-#define R_DEFAULT_PITCH_OFFSET     0x16E0
-#define R_DEFAULT_SC_BOTTOM_RIGHT  0x16E8
-#define R_SC_TOP_LEFT              0x16EC
-#define R_SC_BOTTOM_RIGHT          0x16F0
-
-#define R_DP_GUI_MASTER_CNTL      0x146C
-#define R_DP_BRUSH_FRGD_CLR       0x147C
-#define R_DP_BRUSH_BKGD_CLR       0x1478
-#define R_DP_SRC_FRGD_CLR         0x15D8
-#define R_DP_SRC_BKGD_CLR         0x15DC
-#define R_DP_CNTL                 0x16C0
-#define R_DP_DATATYPE             0x16C4
-#define R_DP_MIX                  0x16C8
-#define R_DP_WRITE_MASK           0x16CC
-
-#define R_DST_Y_X                 0x1438
-#define R_DST_HEIGHT_WIDTH        0x143C
-
-#define R_GB_ENABLE               0x4008
-#define R_GB_MSPOS0               0x4010
-#define R_GB_MSPOS1               0x4014
-#define R_GB_TILE_CONFIG          0x4018
-#define R_GB_SELECT               0x401C
-#define R_GB_AA_CONFIG            0x4020
-#define R_GB_PIPE_SELECT          0x402C
-
-#define R_DST_PIPE_CONFIG         0x170C
-#define R_SU_REG_DEST             0x42C8
-#define R_VAP_INDEX_OFFSET        0x208C
-
-#define R_GA_ENHANCE              0x4274
-
-#define R_RB3D_DSTCACHE_MODE      0x3258
-#define R_RB2D_DSTCACHE_MODE      0x3428
-#define R_RB2D_DSTCACHE_CTLSTAT   0x342C
-#define   RB2D_DC_FLUSH_ALL       0x0FUL
-#define   RB2D_DC_BUSY            (1UL << 31)
-
-#define R_RB3D_DSTCACHE_CTLSTAT_RS 0x4E4C
-#define R_ZB_ZCACHE_CTLSTAT        0x4F18
-
-/* GMC bits for 2D engine test */
-#define GMC_BRUSH_SOLID            (13UL << 4)
-#define GMC_DST_8BPP               (2UL << 8)
-#define GMC_SRC_DATATYPE_COLOR     (3UL << 12)
-#define GMC_CLR_CMP_DIS            (1UL << 28)
-#define GMC_WR_MSK_DIS             (1UL << 30)
-#define ROP3_PATCOPY               (0xF0UL << 16)
-#define DST_X_LEFT_TO_RIGHT        1UL
-#define DST_Y_TOP_TO_BOTTOM        2UL
-
-/* RV515 MC indirect registers */
-#define RV515_MC_STATUS            0x0000
-#define RV515_MC_FB_LOCATION       0x0001
-#define RV515_MC_CNTL              0x0005
-#define RV515_MC_MISC_LAT_TIMER    0x0009
-#define RV515_MC_MISC_UMA_CNTL     0x000C
-
-/* MM_INDEX/MM_DATA indirect MMIO access */
-#define R_MM_INDEX                 0x0000
-#define R_MM_DATA                  0x0004
-
-/* RBBM engine control */
-#define R_RBBM_CNTL               0x0E44
-
-/* Soft reset bits (for engine reset tests) */
-#define SOFT_RESET_CP              (1UL << 0)
-#define SOFT_RESET_HI              (1UL << 1)
-#define SOFT_RESET_SE              (1UL << 2)
-#define SOFT_RESET_RE              (1UL << 3)
-#define SOFT_RESET_PP              (1UL << 4)
-#define SOFT_RESET_E2              (1UL << 5)
-#define SOFT_RESET_RB             (1UL << 6)
-
-/* Host path control HDP bits (for engine reset tests) */
-#define HDP_SOFT_RESET             (1UL << 26)
-#define HDP_APER_CNTL              (1UL << 23)
-
-/* D1/D2 VGA control registers (AVIVO display) */
-#define R_D1VGA_CONTROL            0x0330
-#define R_D2VGA_CONTROL            0x0338
-
-/* ATI vendor ID */
-#define ATI_VID  0x1002
-
-/* =============================================================== */
-/*  Device ID table                                                 */
-/* =============================================================== */
-
-typedef struct { unsigned short did; const char *name; } DevEntry;
-
-static const DevEntry g_devtab[] = {
-    { 0x7100, "RV515"            }, { 0x7101, "RV515 Sec"       },
-    { 0x7102, "RV515 HyperMem"   }, { 0x7109, "RV515"           },
-    { 0x710A, "RV515"            }, { 0x7140, "RV515 PRO"       },
-    { 0x7141, "RV515 PRO Sec"    }, { 0x7142, "RV515 X1300"     },
-    { 0x7143, "RV505 X1300/X1550"}, { 0x7146, "RV515 X1300 XT"  },
-    { 0x714E, "RV515 X1300"      },
-    { 0x7181, "RV516 X1300/X1550"}, { 0x7183, "RV516 X1300 PRO" },
-    { 0x7186, "RV516 Mobile"     }, { 0x7187, "RV516 X1300 Sec" },
-    { 0x718A, "RV516 Mobile"     }, { 0x718B, "RV516 Mobile"    },
-    { 0x718C, "RV516 Mobile"     }, { 0x718D, "RV516 Mobile"    },
-    { 0x719F, "RV516 X1550"      },
-    { 0, NULL }
-};
-
-/* =============================================================== */
-/*  Global state                                                    */
-/* =============================================================== */
-
-static unsigned short g_dseg = 0, g_dsel = 0;
+/* RDIAG-specific: log-file handle (also used by RDIAG's out() function) */
 static FILE *g_log = NULL;
-static int g_pci_bus, g_pci_dev, g_pci_func;
-static unsigned short g_pci_did;
-static const char *g_card_name = "Unknown";
 
 /* =============================================================== */
 /*  Dual output: console + log file                                 */
@@ -239,69 +40,24 @@ static void out(const char *fmt, ...)
     }
 }
 
-/* =============================================================== */
-/*  DPMI helpers                                                    */
-/* =============================================================== */
-
-static int dpmi_alloc(unsigned short para)
-{
-    union REGS r;
-    memset(&r, 0, sizeof r);
-    r.x.eax = 0x0100;  r.x.ebx = para;
-    int386(0x31, &r, &r);
-    if (r.x.cflag) return 0;
-    g_dseg = (unsigned short)r.x.eax;
-    g_dsel = (unsigned short)r.x.edx;
-    return 1;
-}
-
-static void dpmi_free(void)
-{
-    union REGS r;
-    if (!g_dsel) return;
-    memset(&r, 0, sizeof r);
-    r.x.eax = 0x0101;  r.x.edx = g_dsel;
-    int386(0x31, &r, &r);
-    g_dsel = g_dseg = 0;
-}
-
-static int dpmi_rmint(unsigned char n, RMI *p)
-{
-    union REGS r;  struct SREGS sr;
-    segread(&sr);
-    memset(&r, 0, sizeof r);
-    r.x.eax = 0x0300;  r.x.ebx = n;  r.x.ecx = 0;
-    r.x.edi = (unsigned int)p;
-    int386x(0x31, &r, &r, &sr);
-    return !(r.x.cflag);
-}
-
-static void *dpmi_map(unsigned long phys, unsigned long sz)
-{
-    union REGS r;
-    memset(&r, 0, sizeof r);
-    r.x.eax = 0x0800;
-    r.x.ebx = (phys >> 16) & 0xFFFF;  r.x.ecx = phys & 0xFFFF;
-    r.x.esi = (sz   >> 16) & 0xFFFF;  r.x.edi = sz   & 0xFFFF;
-    int386(0x31, &r, &r);
-    if (r.x.cflag) return NULL;
-    return (void *)(((r.x.ebx & 0xFFFF) << 16) | (r.x.ecx & 0xFFFF));
-}
-
-static void dpmi_unmap(void *p)
-{
-    union REGS r;
-    unsigned long a = (unsigned long)p;
-    if (!p) return;
-    memset(&r, 0, sizeof r);
-    r.x.eax = 0x0801;
-    r.x.ebx = (a >> 16) & 0xFFFF;  r.x.ecx = a & 0xFFFF;
-    int386(0x31, &r, &r);
-}
 
 /* Get DPMI version info */
 static void dpmi_version_info(void)
 {
+#ifdef __DJGPP__
+    /* DJGPP: call DPMI interrupt directly via __dpmi_int() */
+    __dpmi_regs r;
+    memset(&r, 0, sizeof r);
+    r.x.ax = 0x0400;
+    __dpmi_int(0x31, &r);
+    out("  DPMI version   : %d.%02d\n",
+        (int)(r.x.ax >> 8), (int)(r.x.ax & 0xFF));
+    out("  Processor type : %d86\n", (int)(r.x.cx & 0xFF));
+    out("  Flags (DX)     : 0x%04X\n", (unsigned)(r.x.dx & 0xFFFF));
+    out("    32-bit progs : %s\n", (r.x.dx & 1) ? "YES" : "no");
+    out("    Reflection   : %s\n", (r.x.dx & 2) ? "virt 86" : "real mode");
+    out("    Virt memory  : %s\n", (r.x.dx & 4) ? "YES" : "no");
+#else
     union REGS r;
     memset(&r, 0, sizeof r);
     r.x.eax = 0x0400;
@@ -313,77 +69,18 @@ static void dpmi_version_info(void)
     out("    32-bit progs : %s\n", (r.x.edx & 1) ? "YES" : "no");
     out("    Reflection   : %s\n", (r.x.edx & 2) ? "virt 86" : "real mode");
     out("    Virt memory  : %s\n", (r.x.edx & 4) ? "YES" : "no");
+#endif
 }
 
-/* =============================================================== */
-/*  PCI configuration via Mechanism 1                               */
-/* =============================================================== */
+/* pci_rd32/pci_wr32/pci_rd16 are provided by RADEONHW.C */
 
-static unsigned long pci_rd32(int b, int d, int f, int reg)
-{
-    outpd(0xCF8, 0x80000000UL | ((unsigned long)b<<16) |
-          ((unsigned long)d<<11) | ((unsigned long)f<<8) | (reg & 0xFC));
-    return inpd(0xCFC);
-}
-
-static void pci_wr32(int b, int d, int f, int reg, unsigned long v)
-{
-    outpd(0xCF8, 0x80000000UL | ((unsigned long)b<<16) |
-          ((unsigned long)d<<11) | ((unsigned long)f<<8) | (reg & 0xFC));
-    outpd(0xCFC, v);
-}
-
-static unsigned short pci_rd16(int b, int d, int f, int reg)
-{
-    unsigned long v = pci_rd32(b, d, f, reg & ~3);
-    return (unsigned short)(v >> ((reg & 2) * 8));
-}
-
+/* Byte-granularity PCI config read — RDIAG-specific (used for full config dump) */
 static unsigned char pci_rd8(int b, int d, int f, int reg)
 {
     unsigned long v = pci_rd32(b, d, f, reg & ~3);
     return (unsigned char)(v >> ((reg & 3) * 8));
 }
 
-/* Scan for ATI RV515/RV516 */
-static int pci_find_radeon(void)
-{
-    int b, d, fn, i;
-    unsigned long id;
-    unsigned short vid, did;
-    unsigned char hdr;
-
-    for (b = 0; b < 256; b++) {
-        for (d = 0; d < 32; d++) {
-            for (fn = 0; fn < 8; fn++) {
-                id = pci_rd32(b, d, fn, 0x00);
-                vid = (unsigned short)(id & 0xFFFF);
-                did = (unsigned short)(id >> 16);
-                if (vid == 0xFFFF || vid == 0) goto next_dev;
-
-                if (vid == ATI_VID) {
-                    for (i = 0; g_devtab[i].name; i++) {
-                        if (g_devtab[i].did == did) {
-                            g_pci_bus  = b;
-                            g_pci_dev  = d;
-                            g_pci_func = fn;
-                            g_pci_did  = did;
-                            g_card_name = g_devtab[i].name;
-                            return 1;
-                        }
-                    }
-                }
-                if (fn == 0) {
-                    hdr = (unsigned char)(pci_rd32(b,d,0,0x0C) >> 16);
-                    if (!(hdr & 0x80)) break;
-                }
-                continue;
-next_dev:       if (fn == 0) break;
-            }
-        }
-    }
-    return 0;
-}
 
 /* =============================================================== */
 /*  BAR probing — determine size of each BAR                        */
@@ -420,37 +117,6 @@ static unsigned long bar_probe_size(int b, int d, int f, int bar_reg)
     }
 }
 
-/* =============================================================== */
-/*  VBE helpers                                                     */
-/* =============================================================== */
-
-static unsigned char *dosbuf(void)
-{ return (unsigned char *)((unsigned long)g_dseg << 4); }
-
-static int vbe_get_info(VBEInfo *out_info)
-{
-    RMI rm;
-    memset(&rm, 0, sizeof rm);
-    memset(dosbuf(), 0, 512);
-    memcpy(dosbuf(), "VBE2", 4);
-    rm.eax = 0x4F00;  rm.es = g_dseg;  rm.edi = 0;
-    if (!dpmi_rmint(0x10, &rm)) return 0;
-    if ((rm.eax & 0xFFFF) != 0x004F) return 0;
-    memcpy(out_info, dosbuf(), sizeof(VBEInfo));
-    return 1;
-}
-
-static int vbe_get_mode(unsigned short m, VBEMode *out_mode)
-{
-    RMI rm;
-    memset(&rm, 0, sizeof rm);
-    memset(dosbuf(), 0, 256);
-    rm.eax = 0x4F01;  rm.ecx = m;  rm.es = g_dseg;  rm.edi = 0;
-    if (!dpmi_rmint(0x10, &rm)) return 0;
-    if ((rm.eax & 0xFFFF) != 0x004F) return 0;
-    memcpy(out_mode, dosbuf(), sizeof(VBEMode));
-    return 1;
-}
 
 /* =============================================================== */
 /*  MMIO register access (parameterized by base pointer)            */
@@ -476,6 +142,8 @@ static unsigned long mc_rreg_at(volatile unsigned long *base, unsigned long reg)
     wreg_at(base, R_MC_IND_INDEX, 0);
     return r;
 }
+
+/* =============================================================== */
 
 /* =============================================================== */
 /*  SECTION 1: Full PCI config space dump (256 bytes)               */
@@ -678,7 +346,8 @@ typedef struct {
 } MmioProbe;
 
 static MmioProbe g_probes[6];
-static volatile unsigned long *g_mmio = NULL;
+/* g_mmio is the shared global from RADEONHW.C (extern in RADEONHW.H);
+   probe_bars_for_mmio() sets it to the identified MMIO BAR base. */
 static int g_mmio_bar = -1;
 
 static void probe_bars_for_mmio(void)

@@ -1,15 +1,38 @@
 # RADEON - OpenWatcom 2.0 Makefile (wmake)
 
 CC      = wcc386
-CFLAGS  = -bt=dos -3r -ox -s -zq -fp3
+CFLAGS  = -bt=dos -5r -ox -s -zq -fp5
 LINK    = wlink
 
-RADEON.EXE : RADEON.OBJ
-	$(LINK) system dos4g name RADEON file RADEON option quiet
+# RADEONHW.OBJ: shared hardware layer (DPMI, PCI, VBE, MMIO, GPU engine, etc.)
+RADEONHW.OBJ : RADEONHW.C RADEONHW.H
+	$(CC) $(CFLAGS) RADEONHW.C
 
-RADEON.OBJ : RADEON.C
+RADEON.EXE : RADEON.OBJ RADEONHW.OBJ
+	$(LINK) system dos4g name RADEON file { RADEON RADEONHW } option quiet
+
+RADEON.OBJ : RADEON.C RADEONHW.H
 	$(CC) $(CFLAGS) RADEON.C
 
+RBLIT.EXE : RBLIT.OBJ RADEONHW.OBJ
+	$(LINK) system pmodew name RBLIT file { RBLIT RADEONHW } option quiet
+
+RBLIT.OBJ : RBLIT.C RADEONHW.H
+	$(CC) $(CFLAGS) RBLIT.C
+
+RDIAG.EXE : RDIAG.OBJ RADEONHW.OBJ
+	$(LINK) system pmodew name RDIAG file { RDIAG RADEONHW } option quiet
+
+RDIAG.OBJ : RDIAG.C RADEONHW.H
+	$(CC) $(CFLAGS) RDIAG.C
+
+all : RADEON.EXE RBLIT.EXE RDIAG.EXE .SYMBOLIC
+
 clean : .SYMBOLIC
-	@if exist RADEON.OBJ del RADEON.OBJ
-	@if exist RADEON.EXE del RADEON.EXE
+	@if exist RADEON.OBJ   del RADEON.OBJ
+	@if exist RADEON.EXE   del RADEON.EXE
+	@if exist RBLIT.OBJ    del RBLIT.OBJ
+	@if exist RBLIT.EXE    del RBLIT.EXE
+	@if exist RDIAG.OBJ    del RDIAG.OBJ
+	@if exist RDIAG.EXE    del RDIAG.EXE
+	@if exist RADEONHW.OBJ del RADEONHW.OBJ

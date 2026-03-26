@@ -6,7 +6,7 @@ set -e
 #
 # Uses CWSDPR0.EXE (ring-0 DPMI server) so the program has full access
 # to MTRR/PAT/CR4 — no need for a separate WCINIT helper.
-DJGPP_ROOT="$(cd "$(dirname "$0")/../djgpp" && pwd)"
+DJGPP_ROOT="${DJGPP_ROOT:-/opt/djgpp}"
 
 export PATH="$DJGPP_ROOT/bin:$DJGPP_ROOT/i586-pc-msdosdjgpp/bin:$PATH"
 export GCC_EXEC_PREFIX="$DJGPP_ROOT/lib/gcc/"

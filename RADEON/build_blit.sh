@@ -5,7 +5,8 @@ export WATCOM=/opt/watcom
 export PATH=$WATCOM/binl64:$WATCOM/binl:$WATCOM/binw:$PATH
 export INCLUDE=$WATCOM/h
 
-echo "Building RBLIT..."
-wcc386 -bt=dos -3r -ox -s -zq RBLIT.C
-wlink system pmodew name RBLIT file RBLIT option quiet
+echo "Building RBLIT (shared HW layer + blitter tests)..."
+wcc386 -bt=dos -5r -ox -s -zq RADEONHW.C
+wcc386 -bt=dos -5r -ox -s -zq RBLIT.C
+wlink system pmodew name RBLIT file { RBLIT RADEONHW } option quiet
 echo "Done: RBLIT.exe"
