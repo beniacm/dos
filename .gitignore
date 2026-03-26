@@ -1,2 +1,19 @@
 capture/
 djgpp
+
+# Build artifacts
+*.o
+*.obj
+*.map
+*.err
+*.sym
+
+# Reference repos (cloned separately)
+xf86-video-ati/
+xf-haiku-radeon/
+
+# Screenshots / large media
+*.png
+*.jpg
+*.jpeg
+*.zip

@@ -17,7 +17,7 @@ cycles=auto
 [autoexec]
 mount c $DIR
 c:
-PLASMA.EXE -pmi
+WATER.EXE -pmi
 EOF
 
 dosbox -conf "$CONF"
