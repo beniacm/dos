@@ -612,7 +612,38 @@ static void setup_palette(void)
 {
     unsigned char p[256 * 4];
     int i;
-    /* rainbow LUT for worm: R,G,B triples */
+
+    init_dac();
+    memset(p, 0, sizeof p);
+
+    /* Standard 32-entry color ramps used by pattern, blit, flood demos */
+    for (i = 0; i < 32; i++) {
+        unsigned char v = (unsigned char)(i * 255 / 31);
+        p[( 1+i)*4+0]=0; p[( 1+i)*4+1]=0; p[( 1+i)*4+2]=v;   /* 1-32 blue */
+        p[(33+i)*4+0]=0; p[(33+i)*4+1]=v; p[(33+i)*4+2]=0;     /* 33-64 green */
+        p[(65+i)*4+0]=v; p[(65+i)*4+1]=0; p[(65+i)*4+2]=0;     /* 65-96 red */
+        p[(97+i)*4+0]=0; p[(97+i)*4+1]=v; p[(97+i)*4+2]=v;     /* 97-128 cyan */
+        p[(129+i)*4+0]=v; p[(129+i)*4+1]=v; p[(129+i)*4+2]=0;  /* 129-160 yellow */
+        p[(161+i)*4+0]=v; p[(161+i)*4+1]=0; p[(161+i)*4+2]=v;  /* 161-192 magenta */
+        p[(193+i)*4+0]=v; p[(193+i)*4+1]=v; p[(193+i)*4+2]=v;  /* 193-224 gray */
+    }
+    p[248*4+0]= 40; p[248*4+1]= 40; p[248*4+2]= 40;
+    p[249*4+0]= 80; p[249*4+1]= 80; p[249*4+2]= 80;
+    p[250*4+0]=  0; p[250*4+1]=255; p[250*4+2]=  0;
+    p[251*4+0]=255; p[251*4+1]=  0; p[251*4+2]=  0;
+    p[252*4+0]= 64; p[252*4+1]= 64; p[252*4+2]= 64;
+    p[253*4+0]=  0; p[253*4+1]=255; p[253*4+2]=255;
+    p[254*4+0]=255; p[254*4+1]=255; p[254*4+2]=  0;
+    p[255*4+0]=255; p[255*4+1]=255; p[255*4+2]=255;
+
+    vbe_set_palette(0, 256, p);
+}
+
+/* Mountain-themed palette for dune chase demo only */
+static void setup_dune_palette(void)
+{
+    unsigned char p[256 * 4];
+    int i;
     static const unsigned char rain[16][3] = {
         {255, 30, 30},{255,100, 10},{255,180, 0},{255,255, 0},
         {180,255, 0},{ 30,255, 30},{  0,255,150},{  0,255,255},
@@ -623,16 +654,13 @@ static void setup_palette(void)
     init_dac();
     memset(p, 0, sizeof p);
 
-    /* 1-8: deep indigo to navy */
+    /* Sky: 1-32 deep indigo → rich blue → pale horizon */
     pal_lerp(p,  1,  8,  10, 5, 40,   20, 15, 80);
-    /* 9-20: navy to rich blue */
     pal_lerp(p,  9, 20,  20, 15, 80,  60, 80,200);
-    /* 21-24: blue to pale cyan */
     pal_lerp(p, 21, 24,  60, 80,200, 140,180,240);
-    /* 25-32: pale cyan to near-white horizon */
     pal_lerp(p, 25, 32, 140,180,240, 220,235,255);
 
-    /* 33-48: far mountains -- blue-grey, lavender, misty */
+    /* 33-48: far mountains -- blue-grey, lavender */
     pal_lerp(p, 33, 40, 120,130,170, 150,150,190);
     pal_lerp(p, 41, 48, 150,150,190, 180,175,210);
 
@@ -640,27 +668,27 @@ static void setup_palette(void)
     pal_lerp(p, 49, 56,  80, 60,140, 100, 80,180);
     pal_lerp(p, 57, 64, 100, 80,180, 130,100,200);
 
-    /* 65-80: mid-near -- forest/dark green */
+    /* 65-80: mid-near -- forest green */
     pal_lerp(p, 65, 72,  20, 80, 40,  40,120, 50);
     pal_lerp(p, 73, 80,  40,120, 50,  60,150, 60);
 
-    /* 81-96: near mountains -- bright green, emerald */
+    /* 81-96: near -- bright emerald */
     pal_lerp(p, 81, 88,  30,160, 50,  50,200, 70);
     pal_lerp(p, 89, 96,  50,200, 70,  80,230, 90);
 
-    /* 97-112: closer -- warm brown, sienna */
+    /* 97-112: warm brown, sienna */
     pal_lerp(p,  97,104, 140, 90, 40, 170,110, 50);
     pal_lerp(p, 105,112, 170,110, 50, 200,130, 60);
 
-    /* 113-128: closest earth -- rich dark brown */
+    /* 113-128: rich dark brown */
     pal_lerp(p, 113,120, 100, 60, 30, 130, 75, 35);
     pal_lerp(p, 121,128, 130, 75, 35, 160, 90, 40);
 
-    /* 129-144: foreground -- bright ochre, orange */
+    /* 129-144: bright ochre, orange */
     pal_lerp(p, 129,136, 200,150, 40, 230,170, 30);
     pal_lerp(p, 137,144, 230,170, 30, 255,190, 20);
 
-    /* 145-160: very front -- deep red, crimson */
+    /* 145-160: deep red, crimson */
     pal_lerp(p, 145,152, 180, 40, 30, 210, 50, 35);
     pal_lerp(p, 153,160, 210, 50, 35, 240, 60, 40);
 
@@ -1725,6 +1753,8 @@ static void demo_benchmark(void)
 
         sprintf(buf, "CPU: %7.1f ms  (%5.1f MB/s)", cpu_ms, cpu_rate);
         cpu_str(40, 60, buf, 251, 2);
+        if (cpu_rate < 100.0)
+            cpu_str(40, 76, "(Run WCINIT.EXE first for ~30x CPU rate)", 249, 1);
 
         sprintf(buf, "GPU: %7.1f ms  (%5.1f MB/s)", gpu_ms, gpu_rate);
         cpu_str(40, 86, buf, 250, 2);
@@ -1811,8 +1841,8 @@ static void demo_flood(void)
         rx = (int)(rnd & 0x3FF) % g_xres;
         ry = (int)((rnd >> 10) & 0x3FF) % g_yres + 14;
         rnd = xorshift();
-        rw = (int)(rnd & 0xFF) + 4;
-        rh = (int)((rnd >> 8) & 0xFF) + 4;
+        rw = (int)(rnd % 200) + 4;          /* 4-203, avg ~102 */
+        rh = (int)((rnd >> 16) % 150) + 4;  /* 4-153, avg ~79 */
         rc = (unsigned char)(rnd >> 16);
 
         if (rx + rw > g_xres) rw = g_xres - rx;
@@ -2295,9 +2325,9 @@ static void gen_dune_layer(int base, int layer_idx)
     srand((unsigned)(layer_idx * 7919 + 3571));
 
     /* Base height and roughness scale with layer index.
-       layer 1 = farthest (short, smooth), layer 15 = closest (tall, jagged) */
-    base_h = g_yres * (5 + layer_idx * 3) / 100;
-    rough  = g_yres * (1 + layer_idx) / 50;
+       layer 1 = farthest (tall, smooth peaks), layer 15 = closest (short, jagged) */
+    base_h = g_yres * (50 - layer_idx * 2) / 100;
+    rough  = g_yres * (2 + layer_idx) / 80;
 
     /* Initialize endpoints */
     for (x = 0; x < g_xres; x++)
@@ -2456,6 +2486,8 @@ static void demo_dune_chase(void)
     int scroll_x;
     int seg_row, seg_col, seg_sx, seg_sy;
 
+    setup_dune_palette();
+
     need = (unsigned long)g_pitch * g_page_stride * 20;
     if (g_vram_mb > 0 && need > g_vram_mb * 1024UL * 1024UL) {
         gpu_fill(0, 0, g_xres, g_yres, 0);
@@ -2463,6 +2495,7 @@ static void demo_dune_chase(void)
         cpu_str_c(g_yres / 2, "Not enough VRAM for dune demo", 251, 2);
         cpu_str_c(g_yres / 2 + 30, "Press any key...", 253, 1);
         getch();
+        setup_palette();
         return;
     }
 
@@ -2640,6 +2673,8 @@ static void demo_dune_chase(void)
     wreg(R_SRC_PITCH_OFFSET, g_default_po);
     wreg(R_SC_BOTTOM_RIGHT,
          ((unsigned long)g_yres << 16) | (unsigned long)g_xres);
+
+    setup_palette();  /* restore standard palette after dune demo */
 }
 
 static void demo_parallax_diag(void)
