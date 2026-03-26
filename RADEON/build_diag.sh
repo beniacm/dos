@@ -9,4 +9,5 @@ echo "Building RDIAG (shared HW layer + hardware diagnostic)..."
 wcc386 -bt=dos -5r -ox -s -zq RADEONHW.C
 wcc386 -bt=dos -5r -ox -s -zq RDIAG.C
 wlink system pmodew name RDIAG file { RDIAG RADEONHW } option quiet
-echo "Done: RDIAG.exe"
+mv RDIAG.exe RDIAG.EXE
+echo "Done: RDIAG.EXE"

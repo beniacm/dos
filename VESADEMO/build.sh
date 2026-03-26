@@ -8,4 +8,5 @@ export INCLUDE=$WATCOM/h
 echo "Building VESADEMO..."
 wcc386 -bt=dos -3r -ox -s -zq VESADEMO.C
 wlink system pmodew name VESADEMO file VESADEMO option quiet
-echo "Done: VESADEMO.exe"
+mv VESADEMO.exe VESADEMO.EXE
+echo "Done: VESADEMO.EXE"

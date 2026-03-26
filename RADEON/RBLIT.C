@@ -402,7 +402,7 @@ static void test_pitch_alignment(void)
 
 static void test_blit_fwd(void)
 {
-    int x, bad;
+    int x;
 
     out("\n========================================\n");
     out("  TEST 3: Screen-to-Screen Blit (Forward)\n");
@@ -496,7 +496,7 @@ static void test_blit_fwd(void)
 
 static void test_color_key(void)
 {
-    int x, r;
+    int x;
     unsigned char key_color = 0x00;
 
     out("\n========================================\n");
@@ -1198,7 +1198,7 @@ static void test_vblank_timing(void)
        → avivo_wait_vblank() in RADEON.C spins forever / never syncs. */
     int i, n, timeout_count = 0;
     unsigned long periods[5];
-    unsigned long t_start, t_now, t_prev;
+    unsigned long t_now;
 
     out("\n========================================\n");
     out("  TEST 12: Vblank Timing (D1CRTC_V_BLANK)\n");
@@ -1216,7 +1216,6 @@ static void test_vblank_timing(void)
     }
 
     /* Now measure rising edges (start of vblank) */
-    t_prev = 0;
     n = 0;
     for (n = 0; n < 5; n++) {
         /* Wait for high (vblank start) */
@@ -2200,9 +2199,11 @@ static void test_po_staging(void)
     if (bad > 0) {
         out("      Display dest:\n");
         { int x; out("      Row 300 [400..431]: ");
-          for (x = 400; x < 432; x++) out("%02X", vram_read(x, 300)); out("\n"); }
+          for (x = 400; x < 432; x++) out("%02X", vram_read(x, 300));
+          out("\n"); }
         { int x; out("      Row 301 [400..431]: ");
-          for (x = 400; x < 432; x++) out("%02X", vram_read(x, 301)); out("\n"); }
+          for (x = 400; x < 432; x++) out("%02X", vram_read(x, 301));
+          out("\n"); }
     }
 
     po_reset();
@@ -2754,7 +2755,7 @@ static void test_po_register_state(void)
 
 int main(void)
 {
-    unsigned long bar0, bar2, bar3;
+    unsigned long bar2, bar3;
     unsigned long lfb_sz;
 
     printf("RBLIT.EXE - Radeon X1300 Pro 2D Blitter Validation\n");
@@ -2785,7 +2786,6 @@ int main(void)
         g_card_name, g_pci_bus, g_pci_dev, g_pci_func, g_pci_did);
 
     /* Map MMIO */
-    bar0 = pci_rd32(g_pci_bus, g_pci_dev, g_pci_func, 0x10);
     bar2 = pci_rd32(g_pci_bus, g_pci_dev, g_pci_func, 0x18);
     g_mmio_phys = bar2 & 0xFFFFFFF0UL;
 

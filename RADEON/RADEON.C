@@ -522,7 +522,12 @@ static void demo_flood(void)
 
     cpu_str_c(4, "GPU Rectangle Flood - press any key to stop", 255, 1);
 
+    /* Read BIOS timer tick at 0x40:0x6C for XOR-shift seed.
+     * Suppress false GCC array-bounds warning from aggressive inlining. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
     g_xor_state = *(volatile unsigned long *)0x46CUL;
+#pragma GCC diagnostic pop
     if (g_xor_state == 0) g_xor_state = 1;
     rdtsc_read(&t0lo, &t0hi);
 

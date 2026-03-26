@@ -17,25 +17,30 @@ wcc386 $CFLAGS PLASMA.C
 wcc386 $CFLAGS VGA.C
 wcc386 $CFLAGS WAVE.C
 wlink system pmodew name PLASMA file PLASMA,VGA,WAVE option quiet
-echo "Done: PLASMA.exe"
+mv PLASMA.exe PLASMA.EXE
+echo "Done: PLASMA.EXE"
 
 echo "Building WATER..."
 wcc386 $CFLAGS WATERDMO.C
 wcc386 $CFLAGS WATER.C
 wlink system pmodew name WATER file WATERDMO,VGA,WAVE,WATER option quiet
-echo "Done: WATER.exe"
+mv WATER.exe WATER.EXE
+echo "Done: WATER.EXE"
 
 echo "Building WATERDRP..."
 wcc386 $CFLAGS WATERDRP.C
 wlink system pmodew name WATERDRP file WATERDRP,VGA option quiet
-echo "Done: WATERDRP.exe"
+mv WATERDRP.exe WATERDRP.EXE
+echo "Done: WATERDRP.EXE"
 
 echo "Building MTRRDIAG..."
 wcc386 $CFLAGS MTRRDIAG.C
 wlink system pmodew name MTRRDIAG file MTRRDIAG option quiet
-echo "Done: MTRRDIAG.exe"
+mv MTRRDIAG.exe MTRRDIAG.EXE
+echo "Done: MTRRDIAG.EXE"
 
 echo "Building WCINIT..."
 wcc386 $CFLAGS WCINIT.C
 wlink system pmodew name WCINIT file WCINIT option quiet
-echo "Done: WCINIT.exe"
+mv WCINIT.exe WCINIT.EXE
+echo "Done: WCINIT.EXE"

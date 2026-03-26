@@ -323,7 +323,6 @@ static void dpmi_unmap_physical(void far *addr)
 
 static VbeInfoBlock  g_vbi;
 static ModeInfoBlock g_mib;
-static unsigned long g_lfb_phys = 0;
 static int           g_lfb_pitch = 0;
 
 /* VBE 3.0 / PMI state */
@@ -1181,9 +1180,7 @@ static void build_ramp(unsigned char *out, int r0, int g0, int b0,
 static void setup_palette(void)
 {
     unsigned char pal[256 * 3];
-    int scale = (g_dac_bits == 8) ? 1 : 4;  /* 6-bit DAC: values 0-63 */
     int m = (g_dac_bits == 8) ? 255 : 63;
-    int i;
 
     memset(pal, 0, sizeof(pal));
 
@@ -1779,7 +1776,7 @@ static void update_ducks(float dt)
     int i;
     for (i = 0; i < g_num_ducks; i++) {
         Duck *d = &g_ducks[i];
-        float nx, ny, spd, len;
+        float nx, ny, len;
         if (!d->alive) {
             if (d->flash_timer > 0) d->flash_timer--;
             continue;
@@ -2535,7 +2532,7 @@ int main(int argc, char *argv[])
     unsigned char *frame_buf = NULL;
     unsigned long lfb_phys, map_size;
     unsigned long total_vram;
-    int no_mtrr = 0, show_mtrrinfo = 0;
+    int no_mtrr = 0;
     int no_pmi = 1;   /* PMI off by default, -pmi enables */
     int no_dblbuf = 0;
     int hw_flip_requested = 0;
@@ -2544,7 +2541,7 @@ int main(int argc, char *argv[])
     int prev_lmb = 0;
     float fps = 0.0f;
     int frame_count = 0;
-    unsigned long fps_lo0, fps_hi0, fps_lo1, fps_hi1;
+    unsigned long fps_lo0, fps_hi0;
     unsigned long frame_lo0, frame_hi0, frame_lo1, frame_hi1;
     float dt = 0.016f;
     int i;
@@ -2552,7 +2549,6 @@ int main(int argc, char *argv[])
     /* Parse args */
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-nomtrr") == 0) no_mtrr = 1;
-        else if (strcmp(argv[i], "-mtrrinfo") == 0) show_mtrrinfo = 1;
         else if (strcmp(argv[i], "-vbe2") == 0) g_force_vbe2 = 1;
         else if (strcmp(argv[i], "-pmi") == 0) no_pmi = 0;
         else if (strcmp(argv[i], "-nopmi") == 0) no_pmi = 1;

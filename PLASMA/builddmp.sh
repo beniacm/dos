@@ -8,4 +8,5 @@ export INCLUDE=$WATCOM/h
 echo "Building VBEDUMP..."
 wcc386 -bt=dos -3r -ox -s -zq VBEDUMP.C
 wlink system pmodew name VBEDUMP file VBEDUMP option quiet
-echo "Done: VBEDUMP.exe"
+mv VBEDUMP.exe VBEDUMP.EXE
+echo "Done: VBEDUMP.EXE"

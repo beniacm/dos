@@ -1186,7 +1186,7 @@ static void test_io_ports(void)
 
     /* Test legacy VGA I/O at 0x3D4/0x3D5 */
     {
-        unsigned char idx, val;
+        unsigned char val;
         outp(0x3D4, 0x00);  /* CRTC index 0 = H Total */
         val = (unsigned char)inp(0x3D5);
         out("  VGA CRTC[0x00] (H Total)   = 0x%02X\n", val);
