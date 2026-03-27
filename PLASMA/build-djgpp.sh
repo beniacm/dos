@@ -4,8 +4,16 @@ set -e
 # DJGPP cross-compiler build script for PLASMA
 # Target: Pentium D (Prescott core) - uses SSE/SSE2/SSE3
 #
-# Uses CWSDPR0.EXE (ring-0 DPMI server) so the program has full access
-# to MTRR/PAT/CR4 — no need for a separate WCINIT helper.
+# Uses PMODETSR.EXE (PMODE/DJ 1.3 TSR, ring-0 DPMI server) instead of
+# CWSDPR0.EXE.  Key advantages for this demo:
+#   - Client CS/DS descriptors are GDT-based with RPL=0, so DPMI function
+#     0008h (Set Segment Limit) works on CS → expand_cs_to_4gb() succeeds
+#     → VBE3 Protected Mode Interface (PMI) is enabled.
+#   - No stack switches on INT/DPMI calls (ring-0 stays ring-0, no TSS swap)
+#     → page-flip via direct PMI call is ~100 MB/s faster than VBE INT 10h.
+#   - Physical address mapping (DPMI 0800h) returns identity linear=physical
+#     → LFB near-pointer calculation with __djgpp_conventional_base is correct.
+#   - Port I/O, RDMSR/WRMSR, CR4 write all available at ring 0.
 DJGPP_ROOT="${DJGPP_ROOT:-/opt/djgpp}"
 
 export PATH="$DJGPP_ROOT/bin:$DJGPP_ROOT/i586-pc-msdosdjgpp/bin:$PATH"
@@ -27,7 +35,7 @@ if [ "$1" = "dosbox" ]; then
     echo "Building PLASMA (DJGPP/GCC - DOSBox-X safe, x87 only)..."
 else
     # Full Pentium D: SSE2/SSE3, all float/double via SSE
-    # Ring 0 via CWSDPR0 for MTRR WC + CR4.OSFXSR
+    # Ring 0 via PMODETSR for MTRR WC + CR4.OSFXSR + PMI
     CFLAGS="-march=prescott -mfpmath=sse $COMMON"
     echo "Building PLASMA (DJGPP/GCC - Pentium D, full SSE2/SSE3)..."
 fi
@@ -37,7 +45,7 @@ echo "  CFLAGS: $CFLAGS"
 
 # --- PLASMA ---
 $CC $CFLAGS -o plasmgcc.exe PLASMA.C VGA.C WAVE.C -lm
-$STUBEDIT plasmgcc.exe dpmi=cwsdpr0.exe
+$STUBEDIT plasmgcc.exe dpmi=PMODETSR.EXE
 $STRIP plasmgcc.exe
 mv plasmgcc.exe PLASMGCC.EXE
 ls -la PLASMGCC.EXE
@@ -47,7 +55,7 @@ echo "Done: PLASMGCC.EXE"
 echo ""
 echo "Building WATER (lit water surface demo)..."
 $CC $CFLAGS -o watrgcc.exe WATERDMO.C VGA.C WAVE.C WATER.C -lm
-$STUBEDIT watrgcc.exe dpmi=cwsdpr0.exe
+$STUBEDIT watrgcc.exe dpmi=PMODETSR.EXE
 $STRIP watrgcc.exe
 mv watrgcc.exe WATRGCC.EXE
 ls -la WATRGCC.EXE
@@ -57,14 +65,15 @@ echo "Done: WATRGCC.EXE"
 echo ""
 echo "Building WATERDRP (water drop ripple demo)..."
 $CC $CFLAGS -o wdrpgcc.exe WATERDRP.C VGA.C -lm
-$STUBEDIT wdrpgcc.exe dpmi=cwsdpr0.exe
+$STUBEDIT wdrpgcc.exe dpmi=PMODETSR.EXE
 $STRIP wdrpgcc.exe
 mv wdrpgcc.exe WDRPGCC.EXE
 ls -la WDRPGCC.EXE
 echo "Done: WDRPGCC.EXE"
 
 echo ""
-echo "Requires CWSDPR0.EXE in the same directory or PATH."
+echo "Requires PMODETSR.EXE in the same directory or PATH."
+echo "PMODETSR is PMODE/DJ v1.3 (C) 1996 CW Sandmann / Thomas Pytel / Matthias Grimrath."
 echo ""
 echo "Usage: $0          # Full Pentium D SSE2/SSE3 (real hardware only)"
 echo "       $0 dosbox   # DOSBox-X safe (x87 only, works in any DOSBox)"

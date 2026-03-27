@@ -257,7 +257,11 @@ int main(int argc, char *argv[])
         if (expand_cs_to_4gb()) {
             printf("[0] CS limit expanded to 4 GB\n");
         } else {
-            printf("Warning: could not expand CS limit (PMI may not work)\n");
+            /* CS expansion failed: PMI calls would jump into BIOS ROM code
+             * at addresses above CS.limit and immediately #GP.  Force PMI
+             * off so the demo falls back to the safe VBE INT 10h path.   */
+            g_no_pmi = 1;
+            printf("Warning: could not expand CS limit -- PMI disabled, using VBE INT 10h\n");
         }
     }
     printf("[0] DJGPP nearptr enabled, SSE init...\n");

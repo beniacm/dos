@@ -338,7 +338,12 @@ unsigned char *get_font(void)
     memset(&rm, 0, sizeof rm);
     rm.eax = 0x1130;  rm.ebx = 0x0300;
     dpmi_rmint(0x10, &rm);
+#ifdef __DJGPP__
+    return (unsigned char *)(((unsigned long)rm.es << 4) + (rm.ebp & 0xFFFF)
+                             + __djgpp_conventional_base);
+#else
     return (unsigned char *)(((unsigned long)rm.es << 4) + (rm.ebp & 0xFFFF));
+#endif
 }
 
 /* =============================================================== */
