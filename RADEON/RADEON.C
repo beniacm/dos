@@ -19,7 +19,7 @@
 /* Hardware-accelerated solid rectangle fill */
 static void gpu_fill(int x, int y, int w, int h, unsigned char color)
 {
-    gpu_wait_fifo(6);
+    gpu_wait_fifo(5);
 
     wreg(R_DP_GUI_MASTER_CNTL,
          GMC_BRUSH_SOLID | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
