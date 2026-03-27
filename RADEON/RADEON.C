@@ -522,19 +522,8 @@ static void demo_flood(void)
 
     cpu_str_c(4, "GPU Rectangle Flood - press any key to stop", 255, 1);
 
-    /* Read BIOS timer tick at 0x40:0x6C for XOR-shift seed.
-     * Under DJGPP DS base=0x400000, so 0x46C as a plain near pointer maps
-     * to physical 0x40046C (inside the program) -- not the BDA.  Use
-     * __djgpp_conventional_base to reach the actual physical address 0x46C.
-     * nearptr was enabled by calibrate_rdtsc() earlier in main(). */
-#ifdef __DJGPP__
-    g_xor_state = *(volatile unsigned long *)(0x46CUL + __djgpp_conventional_base);
-#else
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Warray-bounds"
-    g_xor_state = *(volatile unsigned long *)0x46CUL;
-#pragma GCC diagnostic pop
-#endif
+    /* Seed the XOR-shift RNG from RDTSC — lower 32 bits are noisy enough. */
+    rdtsc_read(&g_xor_state, &t0hi);
     if (g_xor_state == 0) g_xor_state = 1;
     rdtsc_read(&t0lo, &t0hi);
 
