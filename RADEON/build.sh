@@ -10,4 +10,5 @@ wcc386 -bt=dos -5r -ox -s -zq RADEONHW.C
 wcc386 -bt=dos -5r -ox -s -zq RADEON.C
 wlink system pmodew name RADEON file { RADEON RADEONHW } option quiet
 mv RADEON.exe RADEON.EXE
+rm -f RADEON.o RADEONHW.o
 echo "Done: RADEON.EXE"

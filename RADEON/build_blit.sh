@@ -10,4 +10,5 @@ wcc386 -bt=dos -5r -ox -s -zq RADEONHW.C
 wcc386 -bt=dos -5r -ox -s -zq RBLIT.C
 wlink system pmodew name RBLIT file { RBLIT RADEONHW } option quiet
 mv RBLIT.exe RBLIT.EXE
+rm -f RBLIT.o RADEONHW.o
 echo "Done: RBLIT.EXE"

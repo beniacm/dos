@@ -9,4 +9,5 @@ echo "Building VBEDUMP..."
 wcc386 -bt=dos -3r -ox -s -zq VBEDUMP.C
 wlink system pmodew name VBEDUMP file VBEDUMP option quiet
 mv VBEDUMP.exe VBEDUMP.EXE
+rm -f VBEDUMP.o
 echo "Done: VBEDUMP.EXE"

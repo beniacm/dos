@@ -151,16 +151,11 @@ int dpmi_rmint(unsigned char n, RMI *p)
 void *dpmi_map(unsigned long phys, unsigned long sz)
 {
 #ifdef __DJGPP__
-    /* Map physical address range into linear (flat) address space.
-       After __djgpp_nearptr_enable(), a C pointer p accesses linear
-       address (unsigned long)p + __djgpp_conventional_base.
-       So to access linear address L, use pointer (void*)(L - __djgpp_conventional_base). */
     __dpmi_meminfo info;
     info.address = phys;
-    info.size    = sz;
-    if (__dpmi_physical_address_mapping(&info) != 0) return NULL;
-    if (__djgpp_nearptr_enable() == 0) return NULL;
-    return (void *)((unsigned long)info.address - __djgpp_conventional_base);
+    info.size = sz;
+    if (__dpmi_physical_address_mapping(&info) == -1) return NULL;
+    return (void *)((unsigned long)info.address + __djgpp_conventional_base);
 #else
     union REGS r;
     memset(&r, 0, sizeof r);
@@ -177,9 +172,8 @@ void dpmi_unmap(void *p)
 {
 #ifdef __DJGPP__
     __dpmi_meminfo info;
-    /* Reconstruct linear address from the adjusted C pointer */
-    info.address = (unsigned long)p + __djgpp_conventional_base;
-    info.size    = 0;
+    info.address = (unsigned long)p - __djgpp_conventional_base;
+    info.size = 0;
     __dpmi_free_physical_address_mapping(&info);
 #else
     union REGS r;
@@ -269,9 +263,18 @@ next_dev:       if (fn == 0) break;
 /* =============================================================== */
 
 /* Return a pointer to the DOS transfer buffer (real-mode accessible).
-   The buffer address is g_dseg << 4 in linear space. */
+   Physical address is g_dseg << 4.  Under DJGPP the DS base is the program
+   load address (not zero), so we must add __djgpp_conventional_base to turn
+   a physical address into a flat near pointer.  Under DOS4GW DS base == 0
+   so the raw physical address is already the correct near pointer.          */
 unsigned char *dosbuf(void)
-{ return (unsigned char *)((unsigned long)g_dseg << 4); }
+{
+#ifdef __DJGPP__
+    return (unsigned char *)(((unsigned long)g_dseg << 4) + __djgpp_conventional_base);
+#else
+    return (unsigned char *)((unsigned long)g_dseg << 4);
+#endif
+}
 
 /* VBE function 0x4F00: Get SuperVGA Information.
    Writes "VBE2" to request VBE 2.0+ info before the call. */
@@ -1155,7 +1158,13 @@ int find_mode(void)
 
     seg = (vi.mode_ptr >> 16) & 0xFFFF;
     off = vi.mode_ptr & 0xFFFF;
+    /* mode_ptr is a real-mode far pointer; add __djgpp_conventional_base under
+     * DJGPP (DS base != 0) to form the correct flat near pointer.            */
+#ifdef __DJGPP__
+    ml  = (unsigned short *)((seg << 4) + off + __djgpp_conventional_base);
+#else
     ml  = (unsigned short *)((seg << 4) + off);
+#endif
     for (cnt = 0; cnt < 511 && ml[cnt] != 0xFFFF; cnt++)
         modelist[cnt] = ml[cnt];
     modelist[cnt] = 0xFFFF;

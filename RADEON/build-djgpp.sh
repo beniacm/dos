@@ -42,40 +42,45 @@ DIAG_FLAGS="-march=i586 -O2 -fomit-frame-pointer -Wall -Wno-unused-function -mfp
 # Build shared hardware layer once
 echo ""
 echo "Compiling RADEONHW.C..."
-$CC $CFLAGS -c -o RADEONHW.o RADEONHW.C
+$CC $CFLAGS -c -o radeonhw.o RADEONHW.C
 
 # --- RADGCC.EXE: main demo ---
 echo "Compiling RADEON.C..."
-$CC $CFLAGS -c -o RADEON.o RADEON.C
+$CC $CFLAGS -c -o radeon.o RADEON.C
 echo "Linking RADGCC.EXE..."
-$CC $CFLAGS -o RADGCC.EXE RADEON.o RADEONHW.o -lm
-$STUBEDIT RADGCC.EXE dpmi=CWSDPR0
-$STRIP RADGCC.EXE
+$CC $CFLAGS -o radgcc.exe radeon.o radeonhw.o -lm
+$STUBEDIT radgcc.exe dpmi=cwsdpr0.exe
+$STRIP radgcc.exe
+mv radgcc.exe RADGCC.EXE
 ls -la RADGCC.EXE
 echo "Done: RADGCC.EXE"
 
 # --- RBLGCC.EXE: blitter validation ---
 echo ""
 echo "Compiling RBLIT.C..."
-$CC $CFLAGS -c -o RBLIT.o RBLIT.C
+$CC $CFLAGS -c -o rblit.o RBLIT.C
 echo "Linking RBLGCC.EXE..."
-$CC $CFLAGS -o RBLGCC.EXE RBLIT.o RADEONHW.o -lm
-$STUBEDIT RBLGCC.EXE dpmi=CWSDPR0
-$STRIP RBLGCC.EXE
+$CC $CFLAGS -o rblgcc.exe rblit.o radeonhw.o -lm
+$STUBEDIT rblgcc.exe dpmi=cwsdpr0.exe
+$STRIP rblgcc.exe
+mv rblgcc.exe RBLGCC.EXE
 ls -la RBLGCC.EXE
 echo "Done: RBLGCC.EXE"
 
 # --- RDIGCC.EXE: hardware diagnostic ---
 echo ""
 echo "Compiling RDIAG.C (diagnostic flags)..."
-$CC $DIAG_FLAGS -c -o RDIAG.o RDIAG.C
-# RADEONHW.o was compiled with $CFLAGS (higher opt) -- that is fine for linking
+$CC $DIAG_FLAGS -c -o rdiag.o RDIAG.C
+# radeonhw.o was compiled with $CFLAGS (higher opt) -- that is fine for linking
 echo "Linking RDIGCC.EXE..."
-$CC $DIAG_FLAGS -o RDIGCC.EXE RDIAG.o RADEONHW.o -lm
-$STUBEDIT RDIGCC.EXE dpmi=CWSDPR0
-$STRIP RDIGCC.EXE
+$CC $DIAG_FLAGS -o rdigcc.exe rdiag.o radeonhw.o -lm
+$STUBEDIT rdigcc.exe dpmi=cwsdpr0.exe
+$STRIP rdigcc.exe
+mv rdigcc.exe RDIGCC.EXE
 ls -la RDIGCC.EXE
 echo "Done: RDIGCC.EXE"
+
+rm -f radeonhw.o radeon.o rblit.o rdiag.o
 
 echo ""
 echo "Requires CWSDPR0.EXE in the same directory or PATH."

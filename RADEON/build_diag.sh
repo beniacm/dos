@@ -10,4 +10,5 @@ wcc386 -bt=dos -5r -ox -s -zq RADEONHW.C
 wcc386 -bt=dos -5r -ox -s -zq RDIAG.C
 wlink system pmodew name RDIAG file { RDIAG RADEONHW } option quiet
 mv RDIAG.exe RDIAG.EXE
+rm -f RDIAG.o RADEONHW.o
 echo "Done: RDIAG.EXE"

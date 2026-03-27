@@ -44,3 +44,4 @@ wcc386 $CFLAGS WCINIT.C
 wlink system pmodew name WCINIT file WCINIT option quiet
 mv WCINIT.exe WCINIT.EXE
 echo "Done: WCINIT.EXE"
+rm -f PLASMA.o VGA.o WAVE.o WATERDMO.o WATER.o WATERDRP.o MTRRDIAG.o WCINIT.o

@@ -9,4 +9,5 @@ echo "Building DUCKHUNT..."
 wcc386 -bt=dos -5r -fp5 -ox -s -zq DUCKHUNT.C
 wlink system pmodew name DUCKHUNT file DUCKHUNT option quiet
 mv DUCKHUNT.exe DUCKHUNT.EXE
+rm -f DUCKHUNT.o
 echo "Done: DUCKHUNT.EXE"

@@ -30,6 +30,17 @@ static int w_maxd2;    /* icx² + icy²                */
  *  Initialisation                                                           *
  * ======================================================================== */
 
+/* wave_init writes to wave_dx2[] and wave_ddx[] — global BSS arrays whose
+ * addresses may be only 4-byte aligned after COFF link-time merging.
+ * GCC's auto-vectoriser generates movdqa (16-byte aligned store) for these
+ * arrays; if they land on an 8-byte boundary the first movdqa faults with
+ * a General Protection Fault.
+ * Disabling tree-vectorisation for this one-shot init function is safe:
+ * the per-frame wave_fill_row/wave_fill_row_grad paths are unaffected and
+ * those loops operate on stack arrays that are always properly aligned.   */
+#ifdef __GNUC__
+__attribute__((noinline, optimize("O2,no-tree-vectorize")))
+#endif
 void wave_init(void)
 {
     int x;
