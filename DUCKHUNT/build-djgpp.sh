@@ -49,6 +49,22 @@ mv duckgcc.exe DUCKGCC.EXE
 
 ls -la DUCKGCC.EXE
 echo "Done: DUCKGCC.EXE"
+
+# ---- 16bpp highcolor version ----
+echo ""
+if [ "$1" = "dosbox" ]; then
+    echo "Building DUCK16 highcolor (DJGPP/GCC - DOSBox-X safe, x87 only)..."
+else
+    echo "Building DUCK16 highcolor (DJGPP/GCC - Pentium D, full SSE2/SSE3)..."
+fi
+
+$CC $CFLAGS -o duck16gcc.exe DUCKHUNTHC.C -lm
+$STUBEDIT duck16gcc.exe dpmi=cwsdpr0.exe
+$STRIP duck16gcc.exe
+mv duck16gcc.exe DUCK16GCC.EXE
+
+ls -la DUCK16GCC.EXE
+echo "Done: DUCK16GCC.EXE"
 echo ""
 echo "Requires CWSDPR0.EXE in the same directory or PATH."
 echo ""
