@@ -3,8 +3,14 @@
  *
  * Standalone Radeon demo: fractal mountain landscape with 16 depth
  * layers scrolling at exponentially increasing speeds, plus a
- * 128-segment worm bouncing across the scene.  All compositing
- * is GPU-accelerated using per-surface PITCH_OFFSET blits.
+ * 128-segment worm bouncing across the scene.
+ *
+ * Two compositing modes (toggle with SPACE):
+ *   GPU: Radeon 2D engine PITCH_OFFSET blits (~150 blits/frame)
+ *   CPU: Software compositing in system RAM + REP MOVSD final blit
+ *
+ * The CPU% counter shows the load difference between GPU offload
+ * and CPU-based compositing.
  */
 
 #include "RSETUP.H"
@@ -17,8 +23,45 @@
 #define WORM_COLS      10
 #define WORM_HIST     512
 
+/* ---- System RAM buffers for CPU compositing -------------------- */
+static unsigned char *g_ram_layer[DUNE_NLAYERS];
+static unsigned char *g_ram_sprites;
+static unsigned char *g_ram_frame;
+static int g_ram_spr_pitch;
+static int g_ram_spr_rows;
+
+static int sw_alloc(void)
+{
+    int layer_sz = g_xres * g_yres;
+    int spr_rows = ((WORM_NSEGS + WORM_COLS - 1) / WORM_COLS) * WORM_H;
+    int spr_sz   = (WORM_COLS * WORM_W) * spr_rows;
+    int i;
+
+    g_ram_frame = (unsigned char *)malloc(layer_sz);
+    if (!g_ram_frame) return 0;
+
+    for (i = 0; i < DUNE_NLAYERS; i++) {
+        g_ram_layer[i] = (unsigned char *)malloc(layer_sz);
+        if (!g_ram_layer[i]) return 0;
+    }
+
+    g_ram_sprites   = (unsigned char *)malloc(spr_sz);
+    g_ram_spr_pitch = WORM_COLS * WORM_W;
+    g_ram_spr_rows  = spr_rows;
+    return g_ram_sprites != NULL;
+}
+
+static void sw_free(void)
+{
+    int i;
+    if (g_ram_frame)   { free(g_ram_frame);   g_ram_frame = NULL; }
+    for (i = 0; i < DUNE_NLAYERS; i++)
+        if (g_ram_layer[i]) { free(g_ram_layer[i]); g_ram_layer[i] = NULL; }
+    if (g_ram_sprites) { free(g_ram_sprites); g_ram_sprites = NULL; }
+}
+
 /* ---- Generate bright sky gradient (layer 0, opaque) ------------- */
-static void gen_desert_sky(int base)
+static void gen_desert_sky(unsigned char *buf, int pitch)
 {
     int x, y, n, i, half;
 
@@ -32,7 +75,7 @@ static void gen_desert_sky(int base)
             c = (unsigned char)(20 + (y - half) * 12 / half);
             if (c > 32) c = 32;
         }
-        memset(g_lfb + (long)(base + y) * g_pitch, c, g_xres);
+        memset(buf + y * pitch, c, g_xres);
     }
 
     /* Sparse stars in upper quarter */
@@ -41,17 +84,17 @@ static void gen_desert_sky(int base)
     for (i = 0; i < n; i++) {
         x = rand() % g_xres;
         y = rand() % (g_yres / 5);
-        g_lfb[(long)(base + y) * g_pitch + x] = 255;
+        buf[y * pitch + x] = 255;
     }
     for (i = 0; i < n / 3; i++) {
         x = rand() % g_xres;
         y = rand() % (g_yres / 4);
-        g_lfb[(long)(base + y) * g_pitch + x] = 254;
+        buf[y * pitch + x] = 254;
     }
 }
 
 /* ---- Generate a fractal mountain layer (layers 1-15) ------------ */
-static void gen_dune_layer(int base, int layer_idx)
+static void gen_dune_layer(unsigned char *buf, int pitch, int layer_idx)
 {
     int x, y, h, top, step, seg, half, left, right, mid_x;
     int base_h, rough;
@@ -59,7 +102,7 @@ static void gen_dune_layer(int base, int layer_idx)
     static int hmap[832];
 
     for (y = 0; y < g_yres; y++)
-        memset(g_lfb + (long)(base + y) * g_pitch, PLAX_TRANSP, g_xres);
+        memset(buf + y * pitch, PLAX_TRANSP, g_xres);
 
     srand((unsigned)(layer_idx * 7919 + 3571));
 
@@ -125,22 +168,21 @@ static void gen_dune_layer(int base, int layer_idx)
                     (h > 0 ? h : 1);
             if (shade < (int)c_top) shade = (int)c_top;
             if (shade > (int)c_bot) shade = (int)c_bot;
-            g_lfb[(long)(base + y) * g_pitch + x] = (unsigned char)shade;
+            buf[y * pitch + x] = (unsigned char)shade;
         }
     }
 }
 
 /* ---- Generate 128 worm ball sprites ----------------------------- */
-static void gen_worm_sprites(int base)
+static void gen_worm_sprites(unsigned char *buf, int pitch)
 {
     int si, row, col, sx, sy, x, y, cx, cy, r2, dx, dy;
     unsigned char c;
     int rows_needed;
 
     rows_needed = ((WORM_NSEGS + WORM_COLS - 1) / WORM_COLS) * WORM_H;
-    for (y = 0; y < rows_needed && (base + y) < g_page_stride * 20; y++)
-        memset(g_lfb + (long)(base + y) * g_pitch, PLAX_TRANSP,
-               WORM_COLS * WORM_W);
+    for (y = 0; y < rows_needed; y++)
+        memset(buf + y * pitch, PLAX_TRANSP, WORM_COLS * WORM_W);
 
     for (si = 0; si < WORM_NSEGS; si++) {
         row = si / WORM_COLS;
@@ -159,16 +201,16 @@ static void gen_worm_sprites(int base)
                 if (dx * dx + dy * dy <= r2) {
                     if (si == 0) {
                         if ((dx == -2 && dy == -1) || (dx == 2 && dy == -1))
-                            g_lfb[(long)(base + sy + y) * g_pitch + sx + x] = 0;
+                            buf[(sy + y) * pitch + sx + x] = 0;
                         else if (dx * dx + dy * dy <= (r2 * 2 / 3))
-                            g_lfb[(long)(base + sy + y) * g_pitch + sx + x] = 255;
+                            buf[(sy + y) * pitch + sx + x] = 255;
                         else
-                            g_lfb[(long)(base + sy + y) * g_pitch + sx + x] = 254;
+                            buf[(sy + y) * pitch + sx + x] = 254;
                     } else {
                         if (dx * dx + dy * dy <= r2 / 3)
-                            g_lfb[(long)(base + sy + y) * g_pitch + sx + x] = 255;
+                            buf[(sy + y) * pitch + sx + x] = 255;
                         else
-                            g_lfb[(long)(base + sy + y) * g_pitch + sx + x] = c;
+                            buf[(sy + y) * pitch + sx + x] = c;
                     }
                 }
             }
@@ -176,34 +218,107 @@ static void gen_worm_sprites(int base)
     }
 }
 
+/* ---- Copy sys RAM buffer to VRAM staging area ------------------- */
+static void ram_to_vram_stage(const unsigned char *buf, int w, int h)
+{
+    int y;
+    for (y = 0; y < h; y++)
+        memcpy(g_lfb + (long)(g_page_stride + y) * g_pitch, buf + y * w, w);
+}
+
+/* =============================================================== */
+/*  Software (CPU) compositing functions                            */
+/* =============================================================== */
+
+/* Scroll-wrapped layer blit into sys RAM frame buffer */
+static void sw_plax_blit(const unsigned char *layer, int scroll_x,
+                         unsigned char *frame, int use_key)
+{
+    int y, x, sx, w1, w2;
+    sx = scroll_x % g_xres;
+    if (sx < 0) sx += g_xres;
+    w1 = g_xres - sx;
+    w2 = sx;
+
+    for (y = 0; y < g_yres; y++) {
+        unsigned char *dst = frame + y * g_xres;
+        const unsigned char *src = layer + y * g_xres;
+
+        if (!use_key) {
+            memcpy(dst, src + sx, w1);
+            if (w2 > 0)
+                memcpy(dst + w1, src, w2);
+        } else {
+            /* First segment: from sx onward */
+            for (x = 0; x < w1; x++) {
+                unsigned char c = src[sx + x];
+                if (c != PLAX_TRANSP) dst[x] = c;
+            }
+            /* Wrapped segment: from 0 */
+            for (x = 0; x < w2; x++) {
+                unsigned char c = src[x];
+                if (c != PLAX_TRANSP) dst[w1 + x] = c;
+            }
+        }
+    }
+}
+
+/* Keyed sprite blit from sprite sheet to sys RAM frame buffer */
+static void sw_sprite_key(const unsigned char *spr, int spr_pitch,
+                          int sx, int sy,
+                          unsigned char *frame, int dx, int dy,
+                          int w, int h)
+{
+    int y, x;
+    for (y = 0; y < h; y++) {
+        int fy = dy + y;
+        if (fy < 0 || fy >= g_yres) continue;
+        for (x = 0; x < w; x++) {
+            int fx = dx + x;
+            unsigned char c;
+            if (fx < 0 || fx >= g_xres) continue;
+            c = spr[(sy + y) * spr_pitch + sx + x];
+            if (c != PLAX_TRANSP) frame[fy * g_xres + fx] = c;
+        }
+    }
+}
+
+/* Blit completed frame from sys RAM to VRAM back page using WC path */
+static void
+#ifdef __DJGPP__
+__attribute__((noinline, optimize("O2")))
+#endif
+sw_blit_to_vram(const unsigned char *frame, int back_y)
+{
+    int y;
+    for (y = 0; y < g_yres; y++)
+        wc_memcpy(g_lfb + (long)(back_y + y) * g_pitch,
+                  frame + y * g_xres, (unsigned long)g_xres);
+}
+
 /* ================================================================= */
 
 int main(void)
 {
-    int layer_base[DUNE_NLAYERS];
-    unsigned long layer_off[DUNE_NLAYERS];
     unsigned long layer_po[DUNE_NLAYERS];
-    int sprite_base;
-    unsigned long sprite_off;
     unsigned long sprite_po_val;
-    unsigned long stage_off;
     unsigned long stage_po;
     int back_page, back_y, scroll;
     long fps_count;
     clock_t fps_t0, t_render_start, t_render_end, t_frame_end;
     double fps, cpu_pct, cpu_acc;
     long cpu_samples;
-    char buf[120];
+    char buf[160];
     int i;
     unsigned long need;
     int sprite_blit_w, sprite_blit_h;
+    int gpu_mode = 1;
 
     /* Worm state */
     int worm_hx[WORM_HIST], worm_hy[WORM_HIST];
     int worm_head;
     int head_dx, head_dy;
     int scroll_x;
-    int seg_row, seg_col, seg_sx, seg_sy;
 
     /* 20 pages: 2 display + 16 layers + 1 sprite sheet + 1 staging */
     if (radeon_init("RDUNE - Mountain Chase Demo", 20))
@@ -222,21 +337,25 @@ int main(void)
         return 1;
     }
 
-    /* Compute layer offscreen row bases and VRAM byte offsets */
-    for (i = 0; i < DUNE_NLAYERS; i++) {
-        layer_base[i] = g_page_stride * (2 + i);
-        layer_off[i]  = (unsigned long)layer_base[i] * g_pitch;
-        layer_po[i]   = make_pitch_offset(layer_off[i]);
+    /* Allocate system RAM buffers for CPU compositing */
+    if (!sw_alloc()) {
+        gpu_fill(0, 0, g_xres, g_yres, 0);
+        gpu_wait_idle();
+        cpu_str_c(g_yres / 2, "Not enough RAM for SW buffers", 251, 2);
+        getch();
+        radeon_cleanup();
+        return 1;
     }
 
-    /* Sprite sheet at page 18 */
-    sprite_base   = g_page_stride * 18;
-    sprite_off    = (unsigned long)sprite_base * g_pitch;
-    sprite_po_val = make_pitch_offset(sprite_off);
+    /* Compute VRAM offsets and PITCH_OFFSET values for GPU mode */
+    for (i = 0; i < DUNE_NLAYERS; i++)
+        layer_po[i] = make_pitch_offset(
+            (unsigned long)g_page_stride * (2 + i) * g_pitch);
 
-    /* Staging area = page 1 */
-    stage_off = (unsigned long)g_page_stride * g_pitch;
-    stage_po  = make_pitch_offset(stage_off);
+    sprite_po_val = make_pitch_offset(
+        (unsigned long)g_page_stride * 18 * g_pitch);
+    stage_po = make_pitch_offset(
+        (unsigned long)g_page_stride * g_pitch);
 
     /* Widen scissor for offscreen ops */
     gpu_scissor_max();
@@ -248,30 +367,32 @@ int main(void)
     cpu_str_c(g_yres / 2 + 10,
               "Mountain Chase: 16 layers + 128-segment worm", 253, 1);
 
-    /* Layer 0: sky (opaque) */
-    gen_desert_sky(g_page_stride);
+    /* Generate layers into system RAM, copy to VRAM for GPU mode */
+    gen_desert_sky(g_ram_layer[0], g_xres);
+    ram_to_vram_stage(g_ram_layer[0], g_xres, g_yres);
     gpu_blit_po(stage_po, 0, 0, layer_po[0], 0, 0, g_xres, g_yres);
     gpu_wait_idle();
     gpu_flush_2d_cache();
 
-    /* Layers 1-15: fractal mountains */
     for (i = 1; i < DUNE_NLAYERS; i++) {
-        gen_dune_layer(g_page_stride, i);
+        gen_dune_layer(g_ram_layer[i], g_xres, i);
+        ram_to_vram_stage(g_ram_layer[i], g_xres, g_yres);
         gpu_blit_po(stage_po, 0, 0, layer_po[i], 0, 0, g_xres, g_yres);
         gpu_wait_idle();
         gpu_flush_2d_cache();
     }
 
-    /* Worm sprites */
-    gen_worm_sprites(g_page_stride);
-    sprite_blit_w = WORM_COLS * WORM_W;
-    sprite_blit_h = ((WORM_NSEGS + WORM_COLS - 1) / WORM_COLS) * WORM_H;
+    /* Sprites */
+    gen_worm_sprites(g_ram_sprites, g_ram_spr_pitch);
+    sprite_blit_w = g_ram_spr_pitch;
+    sprite_blit_h = g_ram_spr_rows;
+    ram_to_vram_stage(g_ram_sprites, sprite_blit_w, sprite_blit_h);
     gpu_blit_po(stage_po, 0, 0, sprite_po_val, 0, 0,
                 sprite_blit_w, sprite_blit_h);
     gpu_wait_idle();
     gpu_flush_2d_cache();
 
-    /* Reset PITCH_OFFSET to default */
+    /* Reset GPU state */
     gpu_pitch_offset_reset();
 
     /* Initialize worm */
@@ -299,35 +420,66 @@ int main(void)
     cpu_samples = 0;
     fps_t0      = clock();
 
-    while (!kbhit()) {
+    while (1) {
+        /* Check keys: ESC=quit, SPACE=toggle GPU/CPU */
+        if (kbhit()) {
+            int ch = getch();
+            if (ch == 27) break;
+            if (ch == ' ') gpu_mode = !gpu_mode;
+        }
+
         back_y = back_page * g_page_stride;
         t_render_start = clock();
 
-        /* Composite 16 layers with exponential scroll speeds */
-        plax_blit_wrap_po(layer_po[0], scroll / 32,
-                          g_default_po, back_y, g_yres, 0);
-        for (i = 1; i < DUNE_NLAYERS; i++) {
-            scroll_x = (int)((long)scroll * (1 + (long)i * i) / 64);
-            plax_blit_wrap_po(layer_po[i], scroll_x,
-                              g_default_po, back_y, g_yres, 1);
+        if (gpu_mode) {
+            /* ---- GPU compositing ---- */
+            plax_blit_wrap_po(layer_po[0], scroll / 32,
+                              g_default_po, back_y, g_yres, 0);
+            for (i = 1; i < DUNE_NLAYERS; i++) {
+                scroll_x = (int)((long)scroll * (1 + (long)i * i) / 64);
+                plax_blit_wrap_po(layer_po[i], scroll_x,
+                                  g_default_po, back_y, g_yres, 1);
+            }
+
+            for (i = WORM_NSEGS - 1; i >= 0; i--) {
+                int hi, wx, wy, sr, sc;
+                hi = (worm_head - i * 2 + WORM_HIST * 256) % WORM_HIST;
+                wx = worm_hx[hi];
+                wy = worm_hy[hi];
+                sr = i / WORM_COLS;
+                sc = i % WORM_COLS;
+                gpu_blit_po_key(sprite_po_val, sc * WORM_W, sr * WORM_H,
+                                g_default_po, wx, back_y + wy,
+                                WORM_W, WORM_H, PLAX_TRANSP);
+            }
+            gpu_wait_idle();
+
+        } else {
+            /* ---- CPU compositing ---- */
+            /* Composite layers into sys RAM frame buffer */
+            sw_plax_blit(g_ram_layer[0], scroll / 32, g_ram_frame, 0);
+            for (i = 1; i < DUNE_NLAYERS; i++) {
+                scroll_x = (int)((long)scroll * (1 + (long)i * i) / 64);
+                sw_plax_blit(g_ram_layer[i], scroll_x, g_ram_frame, 1);
+            }
+
+            /* Draw worm sprites into sys RAM frame */
+            for (i = WORM_NSEGS - 1; i >= 0; i--) {
+                int hi, wx, wy, sr, sc;
+                hi = (worm_head - i * 2 + WORM_HIST * 256) % WORM_HIST;
+                wx = worm_hx[hi];
+                wy = worm_hy[hi];
+                sr = i / WORM_COLS;
+                sc = i % WORM_COLS;
+                sw_sprite_key(g_ram_sprites, g_ram_spr_pitch,
+                              sc * WORM_W, sr * WORM_H,
+                              g_ram_frame, wx, wy, WORM_W, WORM_H);
+            }
+
+            /* Final blit: sys RAM -> VRAM back page (WC-optimal) */
+            sw_blit_to_vram(g_ram_frame, back_y);
         }
 
-        /* Draw 128 worm segments (tail first) */
-        for (i = WORM_NSEGS - 1; i >= 0; i--) {
-            int hi, wx, wy;
-            hi = (worm_head - i * 2 + WORM_HIST * 256) % WORM_HIST;
-            wx = worm_hx[hi];
-            wy = worm_hy[hi];
-            seg_row = i / WORM_COLS;
-            seg_col = i % WORM_COLS;
-            seg_sx  = seg_col * WORM_W;
-            seg_sy  = seg_row * WORM_H;
-            gpu_blit_po_key(sprite_po_val, seg_sx, seg_sy,
-                            g_default_po, wx, back_y + wy,
-                            WORM_W, WORM_H, PLAX_TRANSP);
-        }
-
-        gpu_wait_idle();
         t_render_end = clock();
 
         /* Advance worm head */
@@ -362,8 +514,9 @@ int main(void)
 
         /* HUD */
         sprintf(buf,
-                "Mountain Chase  16 layers + 128-seg worm  "
-                "%.1f FPS  CPU:%d%%  [ESC quit]",
+                "[%s] Mountain Chase  16L+128seg  "
+                "%.1f FPS  CPU:%d%%  [SPACE=toggle ESC=quit]",
+                gpu_mode ? "GPU" : "CPU",
                 fps, (int)(cpu_pct + 0.5));
         cpu_str(4, back_y + 4, buf, 255, 1);
 
@@ -383,12 +536,12 @@ int main(void)
         scroll += 3;
         if (scroll >= g_xres * 1000) scroll = 0;
     }
-    getch();
 
     flip_restore_page0();
     gpu_pitch_offset_reset();
     gpu_scissor_default();
 
+    sw_free();
     radeon_cleanup();
     return 0;
 }

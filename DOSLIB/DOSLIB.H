@@ -184,4 +184,13 @@ void   calibrate_rdtsc(void);
 
 void wait_vsync(void);
 
+/* ----------------------------------------------------------------
+ * Write-Combine optimal memory copy (REP MOVSD)
+ *
+ * Uses hardware fast-string path for optimal WC writes (1000+ MB/s).
+ * count must be a multiple of 4.
+ * ---------------------------------------------------------------- */
+
+void wc_memcpy(void *dst, const void *src, unsigned long count);
+
 #endif /* DOSLIB_H */

@@ -484,3 +484,37 @@ void wait_vsync(void)
     while (inp(0x3DA) & 0x08) {}
     while (!(inp(0x3DA) & 0x08)) {}
 }
+
+/* =============================================================== */
+/*  Write-Combine optimal memory copy                               */
+/* =============================================================== */
+
+#ifdef __DJGPP__
+/* GCC inline asm: single REP MOVSD triggers the hardware fast-string
+   microcode path on Pentium Pro+ for optimal write-combining throughput.
+   The noinline + O2 attributes prevent GCC from inlining/unrolling the
+   rep movsl, which adds startup overhead that hurts WC throughput. */
+void __attribute__((noinline, optimize("O2")))
+wc_memcpy(void *dst, const void *src, unsigned long count)
+{
+    unsigned long dwords = count >> 2;
+    __asm__ __volatile__ (
+        "rep movsl"
+        : "+D"(dst), "+S"(src), "+c"(dwords)
+        :
+        : "memory"
+    );
+}
+#else
+/* Watcom: #pragma aux emits a naked REP MOVSD with no intrinsic overhead */
+static void wc_rep_movsd(void *dst, const void *src, unsigned long dwords);
+#pragma aux wc_rep_movsd = \
+    "rep movsd" \
+    parm [edi] [esi] [ecx] \
+    modify [ecx edi esi]
+
+void wc_memcpy(void *dst, const void *src, unsigned long count)
+{
+    wc_rep_movsd(dst, src, count >> 2);
+}
+#endif
