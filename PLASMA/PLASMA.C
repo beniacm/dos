@@ -697,6 +697,22 @@ int main(int argc, char *argv[])
     last_ticks  = *bios_ticks;
     fps         = 0.0f;
 
+#ifdef __DJGPP__
+    /* PMODETSR reverts CS.limit to the original program size after every
+     * DPMI real-mode simulation (INT 31h AX=0300h saves/restores the PM
+     * descriptor state on each real-mode switch).  expand_cs_to_4gb()
+     * during startup succeeded, but the last VBE INT 10h call (palette,
+     * mode set, font) reset CS.limit back to 0x17ffff before the loop.
+     * Re-expand now — no more DPMI real-mode calls in the render loop,
+     * so the 4 GB limit stays in effect for all PMI page-flip calls.   */
+    if (g_pmi_ok) {
+        if (!expand_cs_to_4gb()) {
+            g_pmi_ok = 0;
+            printf("PMI: CS limit was reverted by DPMI server; PMI disabled\n");
+        }
+    }
+#endif
+
     while (running) {
 
         /* --- Keyboard --------------------------------------------------- */
