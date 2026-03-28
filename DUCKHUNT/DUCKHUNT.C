@@ -336,6 +336,9 @@ static unsigned short g_pmi_setw_off = 0;
 static unsigned short g_pmi_setds_off = 0;
 static unsigned short g_pmi_setpal_off = 0;
 static unsigned short g_vbe_version = 0;
+#ifdef __DJGPP__
+static unsigned char *g_cs_gdt_ptr;    /* cached CS GDT entry for _pmi_call4 */
+#endif
 
 /* Page flip state */
 static int           g_use_doublebuf = 0;
@@ -533,13 +536,13 @@ static int query_pmi(void)
 
 #ifdef __DJGPP__
 /*
- * PMI call wrappers with inline CS re-expansion.
+ * PMI call wrappers with inline CS re-expansion via direct GDT patching.
  *
  * PMODETSR resets CS.limit after every DPMI real-mode simulation (kbhit,
- * getch, DOS I/O via INT 16h/21h reflection).  We re-expand CS to 4 GB
- * via DPMI 0008h with CLI immediately before "call *%%esi" so no IRQ can
- * trigger another V86 switch in the gap.  noinline because 5 specific-
- * register operands exhaust the x86-32 register file at -O3.
+ * getch, DOS I/O via INT 16h/21h reflection).  We patch the CS descriptor
+ * directly in the GDT (3 byte writes + LRET to reload) with CLI so no IRQ
+ * can trigger a V86 switch in the gap.  ~20x faster than INT 31h DPMI path.
+ * noinline because 5 specific-register operands exhaust x86-32 reg file.
  */
 static unsigned long __attribute__((noinline))
 _pmi_call4(unsigned long entry, unsigned long _eax,
@@ -548,23 +551,18 @@ _pmi_call4(unsigned long entry, unsigned long _eax,
     unsigned long result = _eax;
     __asm__ __volatile__ (
         "cli\n\t"
-        "pushl %%eax\n\t"
-        "pushl %%ebx\n\t"
-        "pushl %%ecx\n\t"
-        "pushl %%edx\n\t"
-        "movw  %%cs,  %%bx\n\t"
-        "movl  $0x0000ffff, %%ecx\n\t"
-        "movl  $0x0000ffff, %%edx\n\t"
-        "movw  $0x0008, %%ax\n\t"
-        "int   $0x31\n\t"
-        "popl  %%edx\n\t"
-        "popl  %%ecx\n\t"
-        "popl  %%ebx\n\t"
-        "popl  %%eax\n\t"
+        "movl  %[gdt], %%edi\n\t"
+        "movw  $0xFFFF, (%%edi)\n\t"
+        "orb   $0x8F, 6(%%edi)\n\t"
+        ".byte 0x0E\n\t"
+        "pushl $1f\n\t"
+        "lret\n\t"
+        "1:\n\t"
         "call  *%%esi\n\t"
         "sti"
         : "+a"(result), "+S"(entry), "+b"(_ebx), "+c"(_ecx), "+d"(_edx)
-        :: "edi", "memory"
+        : [gdt] "m"(g_cs_gdt_ptr)
+        : "edi", "memory"
     );
     return result;
 }
@@ -576,23 +574,18 @@ _pmi_call4_ebx(unsigned long entry, unsigned long _eax,
     unsigned long result = _ebx;
     __asm__ __volatile__ (
         "cli\n\t"
-        "pushl %%eax\n\t"
-        "pushl %%ebx\n\t"
-        "pushl %%ecx\n\t"
-        "pushl %%edx\n\t"
-        "movw  %%cs,  %%bx\n\t"
-        "movl  $0x0000ffff, %%ecx\n\t"
-        "movl  $0x0000ffff, %%edx\n\t"
-        "movw  $0x0008, %%ax\n\t"
-        "int   $0x31\n\t"
-        "popl  %%edx\n\t"
-        "popl  %%ecx\n\t"
-        "popl  %%ebx\n\t"
-        "popl  %%eax\n\t"
+        "movl  %[gdt], %%edi\n\t"
+        "movw  $0xFFFF, (%%edi)\n\t"
+        "orb   $0x8F, 6(%%edi)\n\t"
+        ".byte 0x0E\n\t"
+        "pushl $1f\n\t"
+        "lret\n\t"
+        "1:\n\t"
         "call  *%%esi\n\t"
         "sti"
         : "+b"(result), "+S"(entry), "+a"(_eax), "+c"(_ecx), "+d"(_edx)
-        :: "edi", "memory"
+        : [gdt] "m"(g_cs_gdt_ptr)
+        : "edi", "memory"
     );
     return result;
 }
@@ -2713,7 +2706,8 @@ int main(int argc, char *argv[])
                  * DPMI server doesn't support it, PMI cannot work at all.  */
                 {
                     unsigned long cs_lim;
-                    __dpmi_set_segment_limit(_get_cs(), 0xFFFFFFFFUL);
+                    unsigned short cs_sel = _get_cs();
+                    __dpmi_set_segment_limit(cs_sel, 0xFFFFFFFFUL);
                     __asm__ __volatile__ (
                         "movw %%cs, %%ax\n\t"
                         "lsll %%eax, %0"
@@ -2722,6 +2716,15 @@ int main(int argc, char *argv[])
                         g_pmi_ok = 0;
                         printf("PMI        : CS expand failed (limit=0x%08lX), disabled\n",
                                cs_lim);
+                    } else if (!(cs_sel & 4)) {
+                        /* Cache GDT entry pointer for direct patching */
+                        unsigned char gbuf[8];
+                        unsigned long gbase;
+                        __asm__ __volatile__ ("sgdt %0" : "=m"(gbuf));
+                        gbase = *(unsigned long *)&gbuf[2];
+                        g_cs_gdt_ptr = (unsigned char *)
+                            ((long)gbase + __djgpp_conventional_base)
+                            + (cs_sel >> 3) * 8;
                     }
                 }
 #endif

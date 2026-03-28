@@ -339,6 +339,13 @@ int query_pmi(void)
  */
 #ifdef __DJGPP__
 /*
+ * Cached near pointer to the CS descriptor entry in the GDT.
+ * Set once by expand_cs_to_4gb(); used by _pmi_call4() for fast inline
+ * CS limit patching without DPMI INT 31h overhead.
+ */
+static unsigned char *g_cs_gdt_ptr;
+
+/*
  * _pmi_call4 / _pmi_call4_ebx
  *
  * Execute a PMI (Protected-Mode Interface) BIOS function via a near call to
@@ -347,19 +354,23 @@ int query_pmi(void)
  *
  * Problem: PMODETSR resets CS.limit to the original executable size after
  * EVERY DPMI real-mode simulation (INT 31h AX=0300h), which is triggered by
- * kbhit()/getch() (INT 16h reflection), DOS I/O, etc.  Any call between the
- * pre-loop expand_cs_to_4gb() and the actual PMI call can reset CS.limit.
+ * kbhit()/getch() (INT 16h reflection), DOS I/O, etc.
  *
- * Solution: Re-expand CS to 4 GB via DPMI 0008h inline in the assembly,
- * immediately before "call *%%esi".  We gate with CLI so no hardware IRQ
- * (timer, keyboard) can sneak in and trigger another PMODETSR real-mode
- * simulation between the expansion and the PMI call.
+ * Solution: Patch the CS descriptor directly in the GDT (3 byte writes) and
+ * reload CS via LRET, immediately before "call *%%esi".  CLI/STI gate the
+ * sequence so no IRQ can trigger a V86 switch in the gap.
  *
- * Register discipline:
- *   - EAX/EBX/ECX/EDX are pushed before the DPMI 0008h call (which needs
- *     AX=0008, BX=CS, CX=0xFFFF, DX=0xFFFF) and popped afterwards.
- *   - ESI holds the entry address throughout.
- *   - The "call *%%esi" consumes / modifies EAX..EDX per the VBE/PMI ABI.
+ * This is ~20x faster than the DPMI INT 31h path (a few MOV instructions
+ * vs. a full software interrupt through PMODETSR's DPMI dispatcher).
+ *
+ * GDT descriptor byte layout for limit expansion to 4 GB:
+ *   bytes 0-1: limit[0:15]  = 0xFFFF
+ *   byte  6:   OR 0x8F      = set G=1 (bit 7) + limit[16:19]=0xF (bits 0-3)
+ *              preserves D=1 (bit 6), L=0 (bit 5), AVL (bit 4)
+ *   With G=1 and limit=0xFFFFF: actual limit = (0xFFFFF+1)*4096-1 = 0xFFFFFFFF
+ *
+ * The LRET (push CS + push label + far return) reloads the CS hidden
+ * descriptor cache from the now-modified GDT entry.
  */
 unsigned long __attribute__((noinline))
 _pmi_call4(unsigned long entry, unsigned long _eax,
@@ -367,31 +378,19 @@ _pmi_call4(unsigned long entry, unsigned long _eax,
 {
     unsigned long result = _eax;
     __asm__ __volatile__ (
-        /* Disable interrupts so no IRQ-triggered V86 switch can reset      */
-        /* CS.limit in the window between the DPMI expand and the PMI call. */
         "cli\n\t"
-        /* Save the PMI register arguments; we need the regs for DPMI 0008h */
-        "pushl %%eax\n\t"
-        "pushl %%ebx\n\t"
-        "pushl %%ecx\n\t"
-        "pushl %%edx\n\t"
-        /* DPMI 0008h – Set Segment Limit for CS to 0xFFFFFFFF (4 GB)       */
-        "movw  %%cs,  %%bx\n\t"
-        "movl  $0x0000ffff, %%ecx\n\t"
-        "movl  $0x0000ffff, %%edx\n\t"
-        "movw  $0x0008, %%ax\n\t"
-        "int   $0x31\n\t"
-        /* Restore PMI arguments; DPMI 0008h return values in CX/DX discarded */
-        "popl  %%edx\n\t"
-        "popl  %%ecx\n\t"
-        "popl  %%ebx\n\t"
-        "popl  %%eax\n\t"
-        /* CS.limit is now 4 GB; call the PMI entry point                   */
-        "call  *%%esi\n\t"
-        /* Re-enable interrupts after the PMI call returns                  */
+        "movl  %[gdt], %%edi\n\t"       /* cached GDT entry near ptr      */
+        "movw  $0xFFFF, (%%edi)\n\t"     /* limit[0:15] = 0xFFFF           */
+        "orb   $0x8F, 6(%%edi)\n\t"      /* G=1, limit[16:19]=0xF -> 4 GB  */
+        ".byte 0x0E\n\t"                 /* push cs (32-bit)               */
+        "pushl $1f\n\t"
+        "lret\n\t"                        /* reload CS from patched GDT     */
+        "1:\n\t"
+        "call  *%%esi\n\t"               /* PMI call — CS.limit is 4 GB    */
         "sti"
         : "+a"(result), "+S"(entry), "+b"(_ebx), "+c"(_ecx), "+d"(_edx)
-        :: "edi", "memory"
+        : [gdt] "m"(g_cs_gdt_ptr)
+        : "edi", "memory"
     );
     return result;
 }
@@ -403,23 +402,18 @@ _pmi_call4_ebx(unsigned long entry, unsigned long _eax,
     unsigned long result = _ebx;
     __asm__ __volatile__ (
         "cli\n\t"
-        "pushl %%eax\n\t"
-        "pushl %%ebx\n\t"
-        "pushl %%ecx\n\t"
-        "pushl %%edx\n\t"
-        "movw  %%cs,  %%bx\n\t"
-        "movl  $0x0000ffff, %%ecx\n\t"
-        "movl  $0x0000ffff, %%edx\n\t"
-        "movw  $0x0008, %%ax\n\t"
-        "int   $0x31\n\t"
-        "popl  %%edx\n\t"
-        "popl  %%ecx\n\t"
-        "popl  %%ebx\n\t"
-        "popl  %%eax\n\t"
+        "movl  %[gdt], %%edi\n\t"
+        "movw  $0xFFFF, (%%edi)\n\t"
+        "orb   $0x8F, 6(%%edi)\n\t"
+        ".byte 0x0E\n\t"
+        "pushl $1f\n\t"
+        "lret\n\t"
+        "1:\n\t"
         "call  *%%esi\n\t"
         "sti"
         : "+b"(result), "+S"(entry), "+a"(_eax), "+c"(_ecx), "+d"(_edx)
-        :: "edi", "memory"
+        : [gdt] "m"(g_cs_gdt_ptr)
+        : "edi", "memory"
     );
     return result;
 }
@@ -791,6 +785,15 @@ int expand_cs_to_4gb(void)
     __dpmi_set_segment_limit(_get_cs(), 0xFFFFFFFFUL);
     if (get_cs_limit() == 0xFFFFFFFFUL) {
         printf("  Expanded via DPMI 0008h\n");
+        /* Cache GDT entry pointer for fast inline patching in _pmi_call4 */
+        if (!(cs & 4)) {
+            unsigned char gbuf[8];
+            unsigned long gbase;
+            __asm__ __volatile__ ("sgdt %0" : "=m"(gbuf));
+            gbase = *(unsigned long *)&gbuf[2];
+            g_cs_gdt_ptr = (unsigned char *)
+                ((long)gbase + __djgpp_conventional_base) + (cs >> 3) * 8;
+        }
         return 1;
     }
 
@@ -828,6 +831,9 @@ int expand_cs_to_4gb(void)
         }
 
         entry = table_ptr + idx * 8;
+
+        /* Cache entry pointer for fast inline patching in _pmi_call4 */
+        g_cs_gdt_ptr = entry;
 
         /* Set limit to 0xFFFFF with G=1 (page granularity) -> 4 GB */
         entry[0] = 0xFF;                        /* limit[0:7]   */
