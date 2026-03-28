@@ -266,8 +266,7 @@ static void demo_parallax_diag(void)
     for (i = 0; i < PLAX_NLAYERS; i++)
         layer_base[i] = g_page_stride * (2 + i);
 
-    gpu_wait_fifo(1);
-    wreg(R_SC_BOTTOM_RIGHT, (0x3FFFUL << 16) | (unsigned long)g_xres);
+    gpu_scissor_max();
 
     gpu_fill(0, 0, g_xres, g_yres, 0);
     gpu_wait_idle();
@@ -311,8 +310,7 @@ static void demo_parallax_diag(void)
     gpu_fill(0, 0, g_xres, g_page_stride * 2, 0);
     gpu_wait_idle();
 
-    gpu_wait_fifo(1);
-    wreg(R_CLR_CMP_CNTL, 0);
+    gpu_color_compare_off();
 
     back_page = 1;
     scroll    = 0;
@@ -368,9 +366,7 @@ static void demo_parallax_diag(void)
     getch();
 
     flip_restore_page0();
-    gpu_wait_fifo(1);
-    wreg(R_SC_BOTTOM_RIGHT,
-         ((unsigned long)g_yres << 16) | (unsigned long)g_xres);
+    gpu_scissor_default();
 }
 
 /* =============================================================== */
@@ -402,8 +398,7 @@ static void demo_parallax(void)
     for (i = 0; i < PLAX_NLAYERS; i++)
         layer_base[i] = g_page_stride * (2 + i);
 
-    gpu_wait_fifo(1);
-    wreg(R_SC_BOTTOM_RIGHT, (0x3FFFUL << 16) | (unsigned long)g_xres);
+    gpu_scissor_max();
 
     gpu_fill(0, 0, g_xres, g_yres, 0);
     gpu_wait_idle();
@@ -418,8 +413,7 @@ static void demo_parallax(void)
     gpu_fill(0, 0, g_xres, g_page_stride * 2, 0);
     gpu_wait_idle();
 
-    gpu_wait_fifo(1);
-    wreg(R_CLR_CMP_CNTL, 0);
+    gpu_color_compare_off();
 
     back_page   = 1;
     scroll      = 0;
@@ -487,9 +481,7 @@ static void demo_parallax(void)
     getch();
 
     flip_restore_page0();
-    gpu_wait_fifo(1);
-    wreg(R_SC_BOTTOM_RIGHT,
-         ((unsigned long)g_yres << 16) | (unsigned long)g_xres);
+    gpu_scissor_default();
 }
 
 /* =============================================================== */

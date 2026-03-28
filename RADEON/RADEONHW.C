@@ -899,3 +899,91 @@ void gpu_flush_2d_cache(void)
     wreg(R_DSTCACHE_CTLSTAT, R300_RB2D_DC_FLUSH_ALL);
     wreg(R_WAIT_UNTIL, WAIT_2D_IDLECLEAN | WAIT_DMA_GUI_IDLE);
 }
+
+/* =============================================================== */
+/*  GPU state helpers                                                */
+/* =============================================================== */
+
+/* Widen scissor to maximum for offscreen VRAM operations */
+void gpu_scissor_max(void)
+{
+    gpu_wait_fifo(1);
+    wreg(R_SC_BOTTOM_RIGHT, (0x3FFFUL << 16) | (unsigned long)g_xres);
+}
+
+/* Restore scissor to current display dimensions */
+void gpu_scissor_default(void)
+{
+    gpu_wait_fifo(1);
+    wreg(R_SC_BOTTOM_RIGHT,
+         ((unsigned long)g_yres << 16) | (unsigned long)g_xres);
+}
+
+/* Disable color compare (needed after keyed blits) */
+void gpu_color_compare_off(void)
+{
+    gpu_wait_fifo(1);
+    wreg(R_CLR_CMP_CNTL, 0);
+}
+
+/* Reset DST and SRC PITCH_OFFSET to the default framebuffer */
+void gpu_pitch_offset_reset(void)
+{
+    gpu_wait_fifo(2);
+    wreg(R_DST_PITCH_OFFSET, g_default_po);
+    wreg(R_SRC_PITCH_OFFSET, g_default_po);
+}
+
+/* =============================================================== */
+/*  Batched fill with internal FIFO management                      */
+/* =============================================================== */
+
+/* MMIO array indices for direct register writes */
+#define MMIO_DST_Y_X           (R_DST_Y_X >> 2)
+#define MMIO_DST_HEIGHT_WIDTH  (R_DST_HEIGHT_WIDTH >> 2)
+#define MMIO_DP_BRUSH_FRGD_CLR (R_DP_BRUSH_FRGD_CLR >> 2)
+
+#define BATCH2_SIZE  32   /* max rects per 2-reg batch (64 FIFO entries) */
+#define BATCH3_SIZE  21   /* max rects per 3-reg batch (63 FIFO entries) */
+
+static int g_batch_pending = 0;
+
+/* Batched 2-reg fill (position + size only, color set via gpu_fill_set_color).
+   Call gpu_fill_setup() + gpu_fill_set_color() before the batch loop. */
+void gpu_fill_batch_rect(int x, int y, int w, int h)
+{
+    if (g_batch_pending == 0)
+        gpu_wait_fifo(BATCH2_SIZE * 2);
+    g_mmio[MMIO_DST_Y_X] =
+        ((unsigned long)y << 16) | (unsigned long)x;
+    g_mmio[MMIO_DST_HEIGHT_WIDTH] =
+        ((unsigned long)h << 16) | (unsigned long)w;
+    if (++g_batch_pending >= BATCH2_SIZE) {
+        g_fifo_free = 0;
+        g_batch_pending = 0;
+    }
+}
+
+/* Batched 3-reg fill (color + position + size per rect).
+   Call gpu_fill_setup() before the batch loop. */
+void gpu_fill_batch_color(int x, int y, int w, int h, unsigned char color)
+{
+    if (g_batch_pending == 0)
+        gpu_wait_fifo(BATCH3_SIZE * 3);
+    g_mmio[MMIO_DP_BRUSH_FRGD_CLR] = (unsigned long)color;
+    g_mmio[MMIO_DST_Y_X] =
+        ((unsigned long)y << 16) | (unsigned long)x;
+    g_mmio[MMIO_DST_HEIGHT_WIDTH] =
+        ((unsigned long)h << 16) | (unsigned long)w;
+    if (++g_batch_pending >= BATCH3_SIZE) {
+        g_fifo_free = 0;
+        g_batch_pending = 0;
+    }
+}
+
+/* Flush batch state — call after a batch loop completes */
+void gpu_fill_batch_flush(void)
+{
+    g_fifo_free = 0;
+    g_batch_pending = 0;
+}

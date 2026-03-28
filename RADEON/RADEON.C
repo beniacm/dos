@@ -153,37 +153,23 @@ static void demo_benchmark(void)
         rdtsc_read(&t1lo, &t1hi);
         rect_ms2 = tsc_to_ms(t1lo, t1hi, t0lo, t0hi);
 
-        /* Batched 2-reg path — one FIFO check per 32 rects, direct MMIO */
+        /* Batched 2-reg path */
         gpu_fill_setup();
         gpu_fill_set_color(0xAA);
         rect_iters3 = 0;
-        {
-            unsigned long hw_packed = ((unsigned long)rh << 16) | (unsigned long)rw;
 
-            rdtsc_read(&t0lo, &t0hi);
-            for (pass = 0; pass < 200; pass++) {
-                int rx, ry, pending;
-                pending = 0;
-                for (ry = 0; ry < rows; ry++) {
-                    for (rx = 0; rx < cols; rx++) {
-                        if (pending == 0)
-                            gpu_wait_fifo(FILL_BATCH * 2);
-                        g_mmio[MMIO_DST_Y_X] =
-                            ((unsigned long)(ry * rh) << 16) | (unsigned long)(rx * rw);
-                        g_mmio[MMIO_DST_HEIGHT_WIDTH] = hw_packed;
-                        if (++pending >= FILL_BATCH) {
-                            g_fifo_free = 0;
-                            pending = 0;
-                        }
-                    }
-                }
-                g_fifo_free = 0;
-                rect_iters3 += total_rects;
-            }
-            gpu_wait_idle();
-            rdtsc_read(&t1lo, &t1hi);
-            rect_ms3 = tsc_to_ms(t1lo, t1hi, t0lo, t0hi);
+        rdtsc_read(&t0lo, &t0hi);
+        for (pass = 0; pass < 200; pass++) {
+            int rx, ry;
+            for (ry = 0; ry < rows; ry++)
+                for (rx = 0; rx < cols; rx++)
+                    gpu_fill_batch_rect(rx * rw, ry * rh, rw, rh);
+            gpu_fill_batch_flush();
+            rect_iters3 += total_rects;
         }
+        gpu_wait_idle();
+        rdtsc_read(&t1lo, &t1hi);
+        rect_ms3 = tsc_to_ms(t1lo, t1hi, t0lo, t0hi);
     }
 
     /* Display results */
@@ -276,7 +262,6 @@ static void demo_flood(void)
     long long total_pixels = 0;
     char buf[80];
     int ch, loop_count = 0;
-    int pending;
 
     gpu_fill(0, 0, g_xres, g_yres, 0);
     gpu_wait_idle();
@@ -290,7 +275,6 @@ static void demo_flood(void)
 
     /* Set up 2D engine for batch fills (invariant regs written once) */
     gpu_fill_setup();
-    pending = 0;
 
     while (1) {
         unsigned long rnd;
@@ -309,16 +293,8 @@ static void demo_flood(void)
         if (ry + rh > g_yres) rh = g_yres - ry;
         if (rw < 1 || rh < 1) continue;
 
-        /* Batched FIFO: check once per 21 rects (21×3 = 63 entries) */
-        if (pending == 0)
-            gpu_wait_fifo(63);
-        g_mmio[MMIO_DP_BRUSH_FRGD_CLR] = (unsigned long)rc;
-        g_mmio[MMIO_DST_Y_X] = ((unsigned long)ry << 16) | (unsigned long)rx;
-        g_mmio[MMIO_DST_HEIGHT_WIDTH] = ((unsigned long)rh << 16) | (unsigned long)rw;
-        if (++pending >= 21) {
-            g_fifo_free = 0;
-            pending = 0;
-        }
+        /* Batched fill: color + position + size per rect */
+        gpu_fill_batch_color(rx, ry, rw, rh, rc);
 
         count++;
         fps_count++;
@@ -334,8 +310,7 @@ static void demo_flood(void)
         if (fps_count >= 8000) {
             double elapsed;
             double rps, mpps;
-            g_fifo_free = 0;
-            pending = 0;
+            gpu_fill_batch_flush();
             rdtsc_read(&now_lo, &now_hi);
             elapsed = tsc_to_ms(now_lo, now_hi, t0lo, t0hi) / 1000.0;
             if (elapsed <= 0) elapsed = 0.001;
@@ -351,14 +326,13 @@ static void demo_flood(void)
 
             /* Re-setup fast fill state after gpu_fill in header clear */
             gpu_fill_setup();
-            pending = 0;
 
             fps_count = 0;
         }
     }
     ch = getch();
     (void)ch;
-    g_fifo_free = 0;
+    gpu_fill_batch_flush();
 
     gpu_wait_idle();
     {
@@ -394,8 +368,7 @@ static void demo_blit(void)
     sprite_y = g_page_stride * 2;
 
     /* Widen scissor so GPU fill/blit can reach offscreen rows */
-    gpu_wait_fifo(1);
-    wreg(R_SC_BOTTOM_RIGHT, (0x3FFFUL << 16) | (unsigned long)g_xres);
+    gpu_scissor_max();
 
     /* Generate the rainbow-stripe sprite in offscreen VRAM */
     gpu_fill(0, sprite_y, bw, bh, 0);
@@ -416,8 +389,7 @@ static void demo_blit(void)
     gpu_wait_idle();
 
     /* Ensure color compare is disabled (previous demo may leave state) */
-    gpu_wait_fifo(1);
-    wreg(R_CLR_CMP_CNTL, 0);
+    gpu_color_compare_off();
 
     bx = 0; by = 0; dx = 3; dy = 2;
     back_page = 1;
@@ -468,10 +440,7 @@ static void demo_blit(void)
 
     /* Restore display to page 0, reset scissor */
     flip_restore_page0();
-
-    gpu_wait_fifo(1);
-    wreg(R_SC_BOTTOM_RIGHT,
-         ((unsigned long)g_yres << 16) | (unsigned long)g_xres);
+    gpu_scissor_default();
 }
 
 /* =============================================================== */
@@ -976,8 +945,7 @@ static void demo_dune_chase(void)
     stage_po  = make_pitch_offset(stage_off);
 
     /* Widen scissor for offscreen ops */
-    gpu_wait_fifo(1);
-    wreg(R_SC_BOTTOM_RIGHT, (0x3FFFUL << 16) | (unsigned long)g_xres);
+    gpu_scissor_max();
 
     gpu_fill(0, 0, g_xres, g_yres, 0);
     gpu_wait_idle();
@@ -1008,9 +976,7 @@ static void demo_dune_chase(void)
     gpu_flush_2d_cache();
 
     /* Reset PITCH_OFFSET to default */
-    gpu_wait_fifo(2);
-    wreg(R_DST_PITCH_OFFSET, g_default_po);
-    wreg(R_SRC_PITCH_OFFSET, g_default_po);
+    gpu_pitch_offset_reset();
 
     /* Initialize worm: head starts mid-screen, moving diagonally */
     srand(9999);
@@ -1127,12 +1093,8 @@ static void demo_dune_chase(void)
     getch();
 
     flip_restore_page0();
-
-    gpu_wait_fifo(3);
-    wreg(R_DST_PITCH_OFFSET, g_default_po);
-    wreg(R_SRC_PITCH_OFFSET, g_default_po);
-    wreg(R_SC_BOTTOM_RIGHT,
-         ((unsigned long)g_yres << 16) | (unsigned long)g_xres);
+    gpu_pitch_offset_reset();
+    gpu_scissor_default();
 
     setup_palette();  /* restore standard palette after dune demo */
 }
@@ -1161,8 +1123,7 @@ static void demo_parallax_diag(void)
     for (i = 0; i < PLAX_NLAYERS; i++)
         layer_base[i] = g_page_stride * (2 + i);
 
-    gpu_wait_fifo(1);
-    wreg(R_SC_BOTTOM_RIGHT, (0x3FFFUL << 16) | (unsigned long)g_xres);
+    gpu_scissor_max();
 
     gpu_fill(0, 0, g_xres, g_yres, 0);
     gpu_wait_idle();
@@ -1214,8 +1175,7 @@ static void demo_parallax_diag(void)
     gpu_fill(0, 0, g_xres, g_page_stride * 2, 0);
     gpu_wait_idle();
 
-    gpu_wait_fifo(1);
-    wreg(R_CLR_CMP_CNTL, 0);
+    gpu_color_compare_off();
 
     back_page = 1;
     scroll    = 0;
@@ -1273,10 +1233,7 @@ static void demo_parallax_diag(void)
     getch();
 
     flip_restore_page0();
-
-    gpu_wait_fifo(1);
-    wreg(R_SC_BOTTOM_RIGHT,
-         ((unsigned long)g_yres << 16) | (unsigned long)g_xres);
+    gpu_scissor_default();
 }
 
 static void demo_parallax(void)
@@ -1307,8 +1264,7 @@ static void demo_parallax(void)
         layer_base[i] = g_page_stride * (2 + i);
 
     /* Widen scissor so GPU ops can reach offscreen VRAM */
-    gpu_wait_fifo(1);
-    wreg(R_SC_BOTTOM_RIGHT, (0x3FFFUL << 16) | (unsigned long)g_xres);
+    gpu_scissor_max();
 
     /* Show generation message on current visible page */
     gpu_fill(0, 0, g_xres, g_yres, 0);
@@ -1327,8 +1283,7 @@ static void demo_parallax(void)
     gpu_wait_idle();
 
     /* Reset color compare to clean state before keyed blits */
-    gpu_wait_fifo(1);
-    wreg(R_CLR_CMP_CNTL, 0);
+    gpu_color_compare_off();
 
     back_page   = 1;
     scroll      = 0;
@@ -1406,9 +1361,7 @@ static void demo_parallax(void)
     flip_restore_page0();
 
     /* Restore scissor */
-    gpu_wait_fifo(1);
-    wreg(R_SC_BOTTOM_RIGHT,
-         ((unsigned long)g_yres << 16) | (unsigned long)g_xres);
+    gpu_scissor_default();
 }
 /* =============================================================== */
 

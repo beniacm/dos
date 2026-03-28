@@ -343,10 +343,15 @@ void plax_blit_wrap_po(unsigned long src_po, int scroll_x,
                        unsigned long dst_po, int dst_y,
                        int h, int use_key);
 
-/* FIFO batch constants for tight rect-flood loops */
-#define FILL_BATCH  32
-#define MMIO_DST_Y_X          (R_DST_Y_X >> 2)
-#define MMIO_DST_HEIGHT_WIDTH  (R_DST_HEIGHT_WIDTH >> 2)
-#define MMIO_DP_BRUSH_FRGD_CLR (R_DP_BRUSH_FRGD_CLR >> 2)
+/* ---- GPU state helpers (hide register details from demo code) ---- */
+void gpu_scissor_max(void);        /* widen scissor for offscreen access */
+void gpu_scissor_default(void);    /* restore scissor to display dimensions */
+void gpu_color_compare_off(void);  /* disable color compare */
+void gpu_pitch_offset_reset(void); /* reset DST+SRC pitch/offset to default */
+
+/* ---- Batched fill with internal FIFO management ---- */
+void gpu_fill_batch_rect(int x, int y, int w, int h);
+void gpu_fill_batch_color(int x, int y, int w, int h, unsigned char color);
+void gpu_fill_batch_flush(void);
 
 #endif /* RADEONHW_H */

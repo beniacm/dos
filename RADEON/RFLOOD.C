@@ -24,7 +24,6 @@ int main(void)
     long long total_pixels = 0;
     char buf[80];
     int loop_count = 0;
-    int pending;
 
     if (radeon_init("RFLOOD - GPU Rectangle Flood Demo", 2))
         return 1;
@@ -40,7 +39,6 @@ int main(void)
     rdtsc_read(&t0lo, &t0hi);
 
     gpu_fill_setup();
-    pending = 0;
 
     while (1) {
         unsigned long rnd;
@@ -59,18 +57,8 @@ int main(void)
         if (ry + rh > g_yres) rh = g_yres - ry;
         if (rw < 1 || rh < 1) continue;
 
-        /* Batched FIFO: check once per 21 rects (21x3 = 63 entries) */
-        if (pending == 0)
-            gpu_wait_fifo(63);
-        g_mmio[MMIO_DP_BRUSH_FRGD_CLR] = (unsigned long)rc;
-        g_mmio[MMIO_DST_Y_X] =
-            ((unsigned long)ry << 16) | (unsigned long)rx;
-        g_mmio[MMIO_DST_HEIGHT_WIDTH] =
-            ((unsigned long)rh << 16) | (unsigned long)rw;
-        if (++pending >= 21) {
-            g_fifo_free = 0;
-            pending = 0;
-        }
+        /* Batched FIFO: color + position + size per rect */
+        gpu_fill_batch_color(rx, ry, rw, rh, rc);
 
         count++;
         fps_count++;
@@ -84,8 +72,7 @@ int main(void)
         /* Update counter every ~8000 rects */
         if (fps_count >= 8000) {
             double elapsed, rps, mpps;
-            g_fifo_free = 0;
-            pending = 0;
+            gpu_fill_batch_flush();
             rdtsc_read(&now_lo, &now_hi);
             elapsed = tsc_to_ms(now_lo, now_hi, t0lo, t0hi) / 1000.0;
             if (elapsed <= 0) elapsed = 0.001;
@@ -100,12 +87,11 @@ int main(void)
             cpu_str(4, 4, buf, 254, 1);
 
             gpu_fill_setup();
-            pending = 0;
             fps_count = 0;
         }
     }
     getch();
-    g_fifo_free = 0;
+    gpu_fill_batch_flush();
 
     /* Summary */
     gpu_wait_idle();

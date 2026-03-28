@@ -239,8 +239,7 @@ int main(void)
     stage_po  = make_pitch_offset(stage_off);
 
     /* Widen scissor for offscreen ops */
-    gpu_wait_fifo(1);
-    wreg(R_SC_BOTTOM_RIGHT, (0x3FFFUL << 16) | (unsigned long)g_xres);
+    gpu_scissor_max();
 
     gpu_fill(0, 0, g_xres, g_yres, 0);
     gpu_wait_idle();
@@ -273,9 +272,7 @@ int main(void)
     gpu_flush_2d_cache();
 
     /* Reset PITCH_OFFSET to default */
-    gpu_wait_fifo(2);
-    wreg(R_DST_PITCH_OFFSET, g_default_po);
-    wreg(R_SRC_PITCH_OFFSET, g_default_po);
+    gpu_pitch_offset_reset();
 
     /* Initialize worm */
     srand(9999);
@@ -389,11 +386,8 @@ int main(void)
     getch();
 
     flip_restore_page0();
-    gpu_wait_fifo(3);
-    wreg(R_DST_PITCH_OFFSET, g_default_po);
-    wreg(R_SRC_PITCH_OFFSET, g_default_po);
-    wreg(R_SC_BOTTOM_RIGHT,
-         ((unsigned long)g_yres << 16) | (unsigned long)g_xres);
+    gpu_pitch_offset_reset();
+    gpu_scissor_default();
 
     radeon_cleanup();
     return 0;

@@ -28,8 +28,7 @@ int main(void)
     sprite_y = g_page_stride * 2;
 
     /* Widen scissor for offscreen ops */
-    gpu_wait_fifo(1);
-    wreg(R_SC_BOTTOM_RIGHT, (0x3FFFUL << 16) | (unsigned long)g_xres);
+    gpu_scissor_max();
 
     /* Generate rainbow-stripe sprite in offscreen VRAM */
     gpu_fill(0, sprite_y, bw, bh, 0);
@@ -50,8 +49,7 @@ int main(void)
     gpu_wait_idle();
 
     /* Disable color compare */
-    gpu_wait_fifo(1);
-    wreg(R_CLR_CMP_CNTL, 0);
+    gpu_color_compare_off();
 
     bx = 0; by = 0; dx = 3; dy = 2;
     back_page = 1;
@@ -98,9 +96,7 @@ int main(void)
 
     /* Restore */
     flip_restore_page0();
-    gpu_wait_fifo(1);
-    wreg(R_SC_BOTTOM_RIGHT,
-         ((unsigned long)g_yres << 16) | (unsigned long)g_xres);
+    gpu_scissor_default();
 
     radeon_cleanup();
     return 0;

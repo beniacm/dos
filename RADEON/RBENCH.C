@@ -97,35 +97,19 @@ int main(void)
         gpu_fill_setup();
         gpu_fill_set_color(0xAA);
         rect_iters3 = 0;
-        {
-            unsigned long hw_packed =
-                ((unsigned long)rh << 16) | (unsigned long)rw;
 
-            rdtsc_read(&t0lo, &t0hi);
-            for (pass = 0; pass < 200; pass++) {
-                int rx, ry, pending;
-                pending = 0;
-                for (ry = 0; ry < rows; ry++) {
-                    for (rx = 0; rx < cols; rx++) {
-                        if (pending == 0)
-                            gpu_wait_fifo(FILL_BATCH * 2);
-                        g_mmio[MMIO_DST_Y_X] =
-                            ((unsigned long)(ry * rh) << 16) |
-                            (unsigned long)(rx * rw);
-                        g_mmio[MMIO_DST_HEIGHT_WIDTH] = hw_packed;
-                        if (++pending >= FILL_BATCH) {
-                            g_fifo_free = 0;
-                            pending = 0;
-                        }
-                    }
-                }
-                g_fifo_free = 0;
-                rect_iters3 += total_rects;
-            }
-            gpu_wait_idle();
-            rdtsc_read(&t1lo, &t1hi);
-            rect_ms3 = tsc_to_ms(t1lo, t1hi, t0lo, t0hi);
+        rdtsc_read(&t0lo, &t0hi);
+        for (pass = 0; pass < 200; pass++) {
+            int rx, ry;
+            for (ry = 0; ry < rows; ry++)
+                for (rx = 0; rx < cols; rx++)
+                    gpu_fill_batch_rect(rx * rw, ry * rh, rw, rh);
+            gpu_fill_batch_flush();
+            rect_iters3 += total_rects;
         }
+        gpu_wait_idle();
+        rdtsc_read(&t1lo, &t1hi);
+        rect_ms3 = tsc_to_ms(t1lo, t1hi, t0lo, t0hi);
     }
 
     /* Display results */
