@@ -103,49 +103,9 @@ static void result_expected(int pass, const char *reason, const char *fmt, ...)
 }
 
 /* =============================================================== */
-/*  GPU 2D primitives                                               */
+/*  GPU 2D primitives (use RADEONHW shared versions for gpu_fill,   */
+/*  gpu_blit_fwd, gpu_blit_key; only test-specific helpers below)   */
 /* =============================================================== */
-
-static void gpu_fill(int x, int y, int w, int h, unsigned char color)
-{
-    gpu_wait_fifo(6);
-    wreg(R_DP_GUI_MASTER_CNTL,
-         GMC_BRUSH_SOLID | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
-         ROP3_PATCOPY | GMC_CLR_CMP_DIS | GMC_WR_MSK_DIS);
-    wreg(R_DP_BRUSH_FRGD_CLR, (unsigned long)color);
-    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
-    wreg(R_DST_Y_X, ((unsigned long)y << 16) | (unsigned long)x);
-    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
-}
-
-static void gpu_blit_fwd(int sx, int sy, int dx, int dy, int w, int h)
-{
-    gpu_wait_fifo(5);
-    wreg(R_DP_GUI_MASTER_CNTL,
-         GMC_BRUSH_NONE | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
-         ROP3_SRCCOPY | GMC_DP_SRC_MEMORY | GMC_CLR_CMP_DIS |
-         GMC_WR_MSK_DIS);
-    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
-    wreg(R_SRC_Y_X, ((unsigned long)sy << 16) | (unsigned long)(sx & 0xFFFF));
-    wreg(R_DST_Y_X, ((unsigned long)dy << 16) | (unsigned long)(dx & 0xFFFF));
-    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
-}
-
-static void gpu_blit_key(int sx, int sy, int dx, int dy, int w, int h,
-                         unsigned char key)
-{
-    gpu_wait_fifo(8);
-    wreg(R_CLR_CMP_CLR_SRC, (unsigned long)key);
-    wreg(R_CLR_CMP_MASK,    0x000000FFUL);
-    wreg(R_CLR_CMP_CNTL,    CLR_CMP_SRC_SOURCE | CLR_CMP_FCN_NE);
-    wreg(R_DP_GUI_MASTER_CNTL,
-         GMC_BRUSH_NONE | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
-         ROP3_SRCCOPY | GMC_DP_SRC_MEMORY | GMC_WR_MSK_DIS);
-    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
-    wreg(R_SRC_Y_X, ((unsigned long)sy << 16) | (unsigned long)(sx & 0xFFFF));
-    wreg(R_DST_Y_X, ((unsigned long)dy << 16) | (unsigned long)(dx & 0xFFFF));
-    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
-}
 
 /* Blit with explicit FCN value for testing */
 static void gpu_blit_cmp(int sx, int sy, int dx, int dy, int w, int h,
@@ -1782,14 +1742,6 @@ static void test_gmc_pitch_offset_cntl(void)
 /*  demo: per-blit PITCH_OFFSET with GMC bits, offscreen staging,   */
 /*  Y rebasing, color-key with PO, and consecutive PO switching.    */
 /* =============================================================== */
-
-/* Helper: build PITCH_OFFSET register value */
-static unsigned long make_pitch_offset(unsigned long vram_byte_off)
-{
-    unsigned long pitch64  = (unsigned long)g_pitch / 64;
-    unsigned long gpu_addr = g_fb_location + vram_byte_off;
-    return (pitch64 << 22) | ((gpu_addr >> 10) & 0x003FFFFFUL);
-}
 
 /* Helper: flush 2D dest cache */
 static void gpu_flush_2d(void)

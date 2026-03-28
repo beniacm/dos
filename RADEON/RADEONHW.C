@@ -1,28 +1,21 @@
 /*
  * RADEONHW.C  -  Shared hardware-layer for ATI Radeon RV515/RV516
  *
- * Contains all implementation shared across RADEON.C, RBLIT.C and RDIAG.C:
- *   - DPMI helpers (DOS memory, real-mode interrupt, physical mapping)
- *   - PCI configuration helpers (Mechanism 1 port I/O)
- *   - VBE helpers (get info/mode, set mode, text mode)
- *   - BIOS 8x8 font access
- *   - CPU drawing primitives (text overlay on LFB)
- *   - VGA palette via VBE 4F08h/4F09h
+ * Radeon-specific functionality that builds on DOSLIB:
+ *   - PCI device detection (pci_find_radeon)
  *   - Radeon MMIO register access (rreg/wreg/mc_rreg/pll_*)
  *   - GPU engine control (reset, 2D init, wait, flush)
- *   - RDTSC timer calibration
- *   - Page-flip helpers (AVIVO hardware flip + VGA fallback)
+ *   - AVIVO page-flip / VGA fallback
+ *   - Radeon demo palettes (setup_palette, setup_dune_palette)
+ *   - VESA mode selection wrapper (find_mode → find_vbe_mode)
  *
- * DJGPP compatibility:
- *   The code was originally written for OpenWatcom.  Conditional
- *   compilation blocks handle the differences in DPMI API, port I/O
- *   macros, and inline assembly.
+ * Generic functions (DPMI, VBE, PCI config, palette, font, text,
+ * timing, vsync) are provided by DOSLIB.C.
  *
- * Reference: Linux kernel rv515.c / r100.c, xf86-video-ati RADEONEngine*
+ * DJGPP compatibility handled by DOSLIB.
  */
 
 #include "RADEONHW.H"
-#include <conio.h>
 #include <time.h>
 
 /* =============================================================== */
@@ -45,177 +38,27 @@ const DevEntry g_devtab[] = {
 };
 
 /* =============================================================== */
-/*  Shared global state definitions                                 */
+/*  Radeon-specific global state                                    */
+/*  (DPMI, VBE, font, DAC, timing globals are in DOSLIB.C)         */
 /* =============================================================== */
 
-unsigned short g_dseg = 0, g_dsel = 0;     /* DOS transfer buffer     */
-volatile unsigned long *g_mmio = NULL;      /* mapped MMIO base ptr    */
+volatile unsigned long *g_mmio = NULL;
 unsigned long  g_mmio_phys  = 0;
 unsigned long  g_vram_mb    = 0;
-unsigned char *g_lfb        = NULL;         /* linear framebuffer ptr  */
-unsigned long  g_lfb_phys   = 0;
-unsigned long  g_fb_location = 0;           /* GPU internal FB base    */
-int g_xres = 0, g_yres = 0, g_pitch = 0;
+unsigned long  g_fb_location = 0;
 int g_page_stride = 0;
-unsigned long g_default_po = 0;             /* cached default PITCH_OFFSET */
-unsigned short g_vmode = 0;
-unsigned char *g_font = NULL;
+unsigned long g_default_po = 0;
 int g_fifo_free = 0;
-int g_avivo_flip = 0;                       /* 1=AVIVO flip, 0=VGA fallback */
-double g_rdtsc_mhz = 0.0;
+int g_avivo_flip = 0;
 int g_num_gb_pipes = 1;
-int g_dac_bits = 6;                         /* DAC resolution; upgraded by init_dac() */
 
 int  g_pci_bus = 0, g_pci_dev = 0, g_pci_func = 0;
 unsigned short g_pci_did = 0;
 const char    *g_card_name = "Unknown";
 
 /* =============================================================== */
-/*  DPMI helpers                                                    */
-/*                                                                  */
-/*  OpenWatcom path: uses int386/int386x and union REGS.            */
-/*  DJGPP path: uses __dpmi_* functions from <dpmi.h>.             */
+/*  Radeon PCI device scan                                          */
 /* =============================================================== */
-
-int dpmi_alloc(unsigned short para)
-{
-#ifdef __DJGPP__
-    int seg;
-    seg = __dpmi_allocate_dos_memory(para, (int*)&g_dsel);
-    if (seg == -1) return 0;
-    g_dseg = (unsigned short)seg;
-    return 1;
-#else
-    union REGS r;
-    memset(&r, 0, sizeof r);
-    r.x.eax = 0x0100;  r.x.ebx = para;
-    int386(0x31, &r, &r);
-    if (r.x.cflag) return 0;
-    g_dseg = (unsigned short)r.x.eax;
-    g_dsel = (unsigned short)r.x.edx;
-    return 1;
-#endif
-}
-
-void dpmi_free(void)
-{
-#ifdef __DJGPP__
-    if (!g_dsel) return;
-    __dpmi_free_dos_memory(g_dsel);
-    g_dsel = g_dseg = 0;
-#else
-    union REGS r;
-    if (!g_dsel) return;
-    memset(&r, 0, sizeof r);
-    r.x.eax = 0x0101;  r.x.edx = g_dsel;
-    int386(0x31, &r, &r);
-    g_dsel = g_dseg = 0;
-#endif
-}
-
-int dpmi_rmint(unsigned char n, RMI *p)
-{
-#ifdef __DJGPP__
-    /* DJGPP's __dpmi_regs has a different layout from our RMI struct,
-       so we do a manual field-by-field copy in both directions. */
-    __dpmi_regs r;
-    memset(&r, 0, sizeof r);
-    r.x.di = (unsigned short)(p->edi & 0xFFFF);
-    r.x.si = (unsigned short)(p->esi & 0xFFFF);
-    r.x.bx = (unsigned short)(p->ebx & 0xFFFF);
-    r.x.dx = (unsigned short)(p->edx & 0xFFFF);
-    r.x.cx = (unsigned short)(p->ecx & 0xFFFF);
-    r.x.ax = (unsigned short)(p->eax & 0xFFFF);
-    r.x.es  = p->es;
-    r.x.ds  = p->ds;
-    r.x.flags = p->flags;
-    if (__dpmi_simulate_real_mode_interrupt(n, &r) != 0) return 0;
-    /* Copy results back */
-    p->edi = r.d.edi;  p->esi = r.d.esi;  p->ebp = r.d.ebp;
-    p->ebx = r.d.ebx;  p->edx = r.d.edx;  p->ecx = r.d.ecx;
-    p->eax = r.d.eax;
-    p->flags = r.x.flags;
-    p->es = r.x.es;    p->ds = r.x.ds;
-    return !(r.x.flags & 1);   /* CF=0 means success */
-#else
-    union REGS r;  struct SREGS sr;
-    segread(&sr);
-    memset(&r, 0, sizeof r);
-    r.x.eax = 0x0300;  r.x.ebx = n;  r.x.ecx = 0;
-    r.x.edi = (unsigned int)p;
-    int386x(0x31, &r, &r, &sr);
-    return !(r.x.cflag);
-#endif
-}
-
-void *dpmi_map(unsigned long phys, unsigned long sz)
-{
-#ifdef __DJGPP__
-    __dpmi_meminfo info;
-    info.address = phys;
-    info.size = sz;
-    if (__dpmi_physical_address_mapping(&info) == -1) return NULL;
-    return (void *)((unsigned long)info.address + __djgpp_conventional_base);
-#else
-    union REGS r;
-    memset(&r, 0, sizeof r);
-    r.x.eax = 0x0800;
-    r.x.ebx = (phys >> 16) & 0xFFFF;  r.x.ecx = phys & 0xFFFF;
-    r.x.esi = (sz   >> 16) & 0xFFFF;  r.x.edi = sz   & 0xFFFF;
-    int386(0x31, &r, &r);
-    if (r.x.cflag) return NULL;
-    return (void *)(((r.x.ebx & 0xFFFF) << 16) | (r.x.ecx & 0xFFFF));
-#endif
-}
-
-void dpmi_unmap(void *p)
-{
-#ifdef __DJGPP__
-    __dpmi_meminfo info;
-    info.address = (unsigned long)p - __djgpp_conventional_base;
-    info.size = 0;
-    __dpmi_free_physical_address_mapping(&info);
-#else
-    union REGS r;
-    unsigned long a = (unsigned long)p;
-    if (!p) return;
-    memset(&r, 0, sizeof r);
-    r.x.eax = 0x0801;
-    r.x.ebx = (a >> 16) & 0xFFFF;  r.x.ecx = a & 0xFFFF;
-    int386(0x31, &r, &r);
-#endif
-}
-
-/* =============================================================== */
-/*  PCI configuration via Mechanism 1 (port I/O)                    */
-/*                                                                  */
-/*  All accesses go through ports 0xCF8 (address) + 0xCFC (data).  */
-/*  The address register bit 31 enables config space access.        */
-/* =============================================================== */
-
-unsigned long pci_rd32(int b, int d, int f, int reg)
-{
-    outpd(0xCF8, 0x80000000UL | ((unsigned long)b<<16) |
-          ((unsigned long)d<<11) | ((unsigned long)f<<8) | (reg & 0xFC));
-    return inpd(0xCFC);
-}
-
-void pci_wr32(int b, int d, int f, int reg, unsigned long v)
-{
-    outpd(0xCF8, 0x80000000UL | ((unsigned long)b<<16) |
-          ((unsigned long)d<<11) | ((unsigned long)f<<8) | (reg & 0xFC));
-    outpd(0xCFC, v);
-}
-
-unsigned short pci_rd16(int b, int d, int f, int reg)
-{
-    unsigned long v = pci_rd32(b, d, f, reg & ~3);
-    return (unsigned short)(v >> ((reg & 2) * 8));
-}
-
-/* Scan PCI for an ATI RV515/RV516 device.
-   Iterates all buses/devices/functions, matching VID+DID against g_devtab.
-   Header-type bit 7 is checked to skip multi-function probing when not needed. */
 int pci_find_radeon(void)
 {
     int b, d, fn, i;
@@ -256,216 +99,7 @@ next_dev:       if (fn == 0) break;
 }
 
 /* =============================================================== */
-/*  VBE helpers                                                     */
-/*                                                                  */
-/*  All VBE calls go through dpmi_rmint(0x10, &rm) using the DOS   */
-/*  transfer buffer allocated by dpmi_alloc().                      */
-/* =============================================================== */
-
-/* Return a pointer to the DOS transfer buffer (real-mode accessible).
-   Physical address is g_dseg << 4.  Under DJGPP the DS base is the program
-   load address (not zero), so we must add __djgpp_conventional_base to turn
-   a physical address into a flat near pointer.  Under DOS4GW DS base == 0
-   so the raw physical address is already the correct near pointer.          */
-unsigned char *dosbuf(void)
-{
-#ifdef __DJGPP__
-    return (unsigned char *)(((unsigned long)g_dseg << 4) + __djgpp_conventional_base);
-#else
-    return (unsigned char *)((unsigned long)g_dseg << 4);
-#endif
-}
-
-/* VBE function 0x4F00: Get SuperVGA Information.
-   Writes "VBE2" to request VBE 2.0+ info before the call. */
-int vbe_get_info(VBEInfo *out)
-{
-    RMI rm;
-    memset(&rm, 0, sizeof rm);
-    memset(dosbuf(), 0, 512);
-    memcpy(dosbuf(), "VBE2", 4);   /* signal VBE 2.0+ support desired */
-    rm.eax = 0x4F00;  rm.es = g_dseg;  rm.edi = 0;
-    if (!dpmi_rmint(0x10, &rm)) return 0;
-    if ((rm.eax & 0xFFFF) != 0x004F) return 0;
-    memcpy(out, dosbuf(), sizeof(VBEInfo));
-    return 1;
-}
-
-/* VBE function 0x4F01: Get SuperVGA Mode Information */
-int vbe_get_mode(unsigned short m, VBEMode *out)
-{
-    RMI rm;
-    memset(&rm, 0, sizeof rm);
-    memset(dosbuf(), 0, 256);
-    rm.eax = 0x4F01;  rm.ecx = m;  rm.es = g_dseg;  rm.edi = 0;
-    if (!dpmi_rmint(0x10, &rm)) return 0;
-    if ((rm.eax & 0xFFFF) != 0x004F) return 0;
-    memcpy(out, dosbuf(), sizeof(VBEMode));
-    return 1;
-}
-
-/* VBE function 0x4F02: Set SuperVGA Video Mode.
-   Bit 14 (0x4000) = linear framebuffer mode — always requested. */
-int vbe_set(unsigned short m)
-{
-    RMI rm;
-    memset(&rm, 0, sizeof rm);
-    rm.eax = 0x4F02;  rm.ebx = (unsigned long)m | 0x4000;
-    if (!dpmi_rmint(0x10, &rm)) return 0;
-    return ((rm.eax & 0xFFFF) == 0x004F);
-}
-
-/* BIOS INT 10h AH=0x03: Set 80-column text mode */
-void vbe_text(void)
-{
-    RMI rm;
-    memset(&rm, 0, sizeof rm);
-    rm.eax = 0x0003;
-    dpmi_rmint(0x10, &rm);
-}
-
-/* =============================================================== */
-/*  BIOS 8x8 font                                                   */
-/*                                                                  */
-/*  INT 10h AX=1130h BX=0300h returns ES:BP → 8x8 font table.      */
-/*  The pointer arithmetic converts the real-mode far pointer to    */
-/*  a flat 32-bit linear address.                                   */
-/* =============================================================== */
-
-unsigned char *get_font(void)
-{
-    RMI rm;
-    memset(&rm, 0, sizeof rm);
-    rm.eax = 0x1130;  rm.ebx = 0x0300;
-    dpmi_rmint(0x10, &rm);
-#ifdef __DJGPP__
-    return (unsigned char *)(((unsigned long)rm.es << 4) + (rm.ebp & 0xFFFF)
-                             + __djgpp_conventional_base);
-#else
-    return (unsigned char *)(((unsigned long)rm.es << 4) + (rm.ebp & 0xFFFF));
-#endif
-}
-
-/* =============================================================== */
-/*  CPU drawing primitives (writes directly to g_lfb)              */
-/*  Used for text overlay (FPS counter, labels) on the live LFB.   */
-/* =============================================================== */
-
-/* Draw one 8x8 BIOS character at (x,y) with colour c and scale sc.
-   Each pixel is scaled sc×sc to allow large text on high-res modes. */
-void cpu_char(int x, int y, char ch, unsigned char c, int sc)
-{
-    unsigned char *g = g_font + (unsigned char)ch * 8;
-    int r, cl, sy, sx;
-    for (r = 0; r < 8; r++) {
-        unsigned char b = g[r];
-        for (cl = 0; cl < 8; cl++) {
-            if (b & (0x80 >> cl)) {
-                for (sy = 0; sy < sc; sy++)
-                    for (sx = 0; sx < sc; sx++)
-                        g_lfb[(y+r*sc+sy)*g_pitch + x+cl*sc+sx] = c;
-            }
-        }
-    }
-}
-
-void cpu_str(int x, int y, const char *s, unsigned char c, int sc)
-{
-    for (; *s; s++, x += 8*sc)
-        cpu_char(x, y, *s, c, sc);
-}
-
-/* Centre-justified string at row y */
-void cpu_str_c(int y, const char *s, unsigned char c, int sc)
-{
-    int x = (g_xres - (int)strlen(s) * 8 * sc) / 2;
-    if (x < 0) x = 0;
-    cpu_str(x, y, s, c, sc);
-}
-
-/* =============================================================== */
-/*  VGA palette via VBE 4F08h/4F09h                                */
-/* =============================================================== */
-
-/* VBE 4F08h sub-function 0x01: set DAC width to 8 bits (if supported).
-   Most BIOS implementations cap this at 8 bits; we clamp to [6, 8].  */
-void init_dac(void)
-{
-    RMI rm;
-    int got;
-
-    /* Try to set 8-bit DAC (sub-function 01h in BH) */
-    memset(&rm, 0, sizeof rm);
-    rm.eax = 0x4F08;  rm.ebx = 0x0800;   /* query first */
-    dpmi_rmint(0x10, &rm);
-
-    memset(&rm, 0, sizeof rm);
-    rm.eax = 0x4F08;  rm.ebx = 0x0100;   /* request 8-bit DAC */
-    if (dpmi_rmint(0x10, &rm) && (rm.eax & 0xFFFF) == 0x004F)
-        got = (int)((rm.ebx >> 8) & 0xFF);
-    else
-        got = 6;   /* fall back to standard 6-bit VGA DAC */
-
-    if (got < 6) got = 6;
-    if (got > 8) got = 8;
-    g_dac_bits = got;
-}
-
-/* VBE 4F09h function: set palette entries.
-   p[] has count entries of 4 bytes: R, G, B, pad (8-bit values).
-   Values are right-shifted to the actual DAC width before sending to BIOS,
-   which expects B, G, R, pad ordering. */
-void vbe_set_palette(int start, int count, const unsigned char *p)
-{
-    RMI rm;
-    unsigned char *buf = dosbuf();
-    int i, shift;
-
-    shift = 8 - g_dac_bits;
-    for (i = 0; i < count; i++) {
-        buf[i*4+0] = p[i*4+2] >> shift;   /* B */
-        buf[i*4+1] = p[i*4+1] >> shift;   /* G */
-        buf[i*4+2] = p[i*4+0] >> shift;   /* R */
-        buf[i*4+3] = 0;
-    }
-
-    memset(&rm, 0, sizeof rm);
-    rm.eax = 0x4F09;
-    rm.ebx = 0x0000;                  /* sub-function 00h = set */
-    rm.ecx = (unsigned long)count;
-    rm.edx = (unsigned long)start;
-    rm.es  = g_dseg;
-    rm.edi = 0;
-    dpmi_rmint(0x10, &rm);
-}
-
-void pal_set(unsigned char *p, int idx, int r, int g, int b)
-{
-    p[idx*4+0] = (unsigned char)r;
-    p[idx*4+1] = (unsigned char)g;
-    p[idx*4+2] = (unsigned char)b;
-    p[idx*4+3] = 0;
-}
-
-/* Linear interpolation of palette entries from index i0 to i1 */
-void pal_lerp(unsigned char *p, int i0, int i1,
-              int r0, int g0, int b0, int r1, int g1, int b1)
-{
-    int i, n;
-    n = i1 - i0;
-    if (n <= 0) return;
-    for (i = 0; i <= n; i++) {
-        pal_set(p, i0 + i,
-                r0 + (r1 - r0) * i / n,
-                g0 + (g1 - g0) * i / n,
-                b0 + (b1 - b0) * i / n);
-    }
-}
-
-/* Standard 256-entry palette:
-   - Indices 1-224: seven 32-entry colour ramps (blue, green, red,
-     cyan, yellow, magenta, grey).
-   - Indices 248-255: fixed UI colours (dark grey → white). */
+/*  Radeon MMIO register access                                     */
 void setup_palette(void)
 {
     unsigned char p[256 * 4];
@@ -913,75 +547,6 @@ void gpu_init_2d(void)
 }
 
 /* =============================================================== */
-/*  RDTSC high-resolution timer                                     */
-/*                                                                  */
-/*  OpenWatcom uses __asm {} (Intel syntax).                       */
-/*  DJGPP uses GNU extended asm.                                   */
-/* =============================================================== */
-
-void rdtsc_read(unsigned long *lo, unsigned long *hi)
-{
-#ifdef __DJGPP__
-    unsigned long a, d;
-    __asm__ volatile("rdtsc" : "=a"(a), "=d"(d));
-    *lo = a;
-    *hi = d;
-#else
-    unsigned long a, d;
-    __asm {
-        rdtsc
-        mov [a], eax
-        mov [d], edx
-    }
-    *lo = a;
-    *hi = d;
-#endif
-}
-
-/* Convert RDTSC delta to milliseconds using calibrated g_rdtsc_mhz */
-double tsc_to_ms(unsigned long lo1, unsigned long hi1,
-                 unsigned long lo0, unsigned long hi0)
-{
-    double cycles = (double)hi1 * 4294967296.0 + (double)lo1
-                  - (double)hi0 * 4294967296.0 - (double)lo0;
-    return (g_rdtsc_mhz > 0.0) ? cycles / (g_rdtsc_mhz * 1000.0) : 0.0;
-}
-
-/* Calibrate RDTSC against the BIOS tick counter (18.2065 Hz).
-   Waits for 4 complete ticks (~220 ms) for reasonable accuracy.
-   Must be called before any tsc_to_ms() use.
-   The BIOS tick counter lives at physical address 0x46C in the BDA. */
-void calibrate_rdtsc(void)
-{
-    unsigned long bt0, bt1;
-    unsigned long lo0, hi0, lo1, hi1;
-    double elapsed_s, cycles;
-
-#ifdef __DJGPP__
-    /* Conventional memory access requires near-pointer mode */
-    volatile unsigned long *bios_ticks;
-    __djgpp_nearptr_enable();
-    bios_ticks = (volatile unsigned long *)(0x46CUL + __djgpp_conventional_base);
-#else
-    volatile unsigned long *bios_ticks = (volatile unsigned long *)0x46CUL;
-#endif
-
-    /* Synchronise to a tick boundary first to avoid partial-tick error */
-    bt0 = *bios_ticks;
-    while (*bios_ticks == bt0) {}
-
-    rdtsc_read(&lo0, &hi0);
-    bt0 = *bios_ticks;
-    while ((bt1 = *bios_ticks) - bt0 < 4) {}   /* wait 4 ticks */
-    rdtsc_read(&lo1, &hi1);
-
-    elapsed_s = (double)(bt1 - bt0) / 18.2065;
-    cycles    = (double)hi1 * 4294967296.0 + (double)lo1
-              - (double)hi0 * 4294967296.0 - (double)lo0;
-    g_rdtsc_mhz = (elapsed_s > 0.0) ? cycles / elapsed_s / 1.0e6 : 0.0;
-}
-
-/* =============================================================== */
 /*  Page-flip helpers                                               */
 /*                                                                  */
 /*  AVIVO path: hardware D1GRPH surface-address update with vsync   */
@@ -1093,14 +658,15 @@ void hw_page_flip(unsigned long surface_addr)
     }
 }
 
-/* VGA retrace wait via Input Status Register 1 (port 0x3DA).
-   First wait for retrace to end (if already in it), then wait for next. */
-void wait_vsync(void)
-{
-    while (inp(0x3DA) & 0x08) {}   /* wait for retrace to end */
-    while (!(inp(0x3DA) & 0x08)) {} /* wait for retrace to start */
-}
+/* =============================================================== */
+/*  VESA mode selection: find best 8bpp LFB mode ≤ 1024×768        */
+/*  Thin wrapper around DOSLIB's find_vbe_mode().                   */
+/* =============================================================== */
 
+int find_mode(void)
+{
+    return find_vbe_mode(800, 600, 8, 1024, 768);
+}
 /* Unified page flip: selects AVIVO or VGA path based on g_avivo_flip.
    back_page = 0 or 1 (double-buffer index). */
 void flip_page(int back_page)
@@ -1139,72 +705,197 @@ void flip_restore_page0(void)
 }
 
 /* =============================================================== */
-/*  VESA mode selection: find best 8bpp LFB mode ≤ 1024×768        */
-/*                                                                  */
-/*  Prefers 800×600; falls back to the highest-resolution mode     */
-/*  that fits. Fills g_vmode, g_xres, g_yres, g_pitch, g_lfb_phys. */
+/*  GPU 2D drawing primitives                                       */
 /* =============================================================== */
 
-unsigned long g_vesa_mem_kb = 0;  /* total adapter memory reported by VBE (KB) */
-
-int find_mode(void)
+/* Hardware-accelerated solid rectangle fill */
+void gpu_fill(int x, int y, int w, int h, unsigned char color)
 {
-    VBEInfo vi;
-    VBEMode mi;
-    unsigned short *ml, modelist[512];
-    unsigned long seg, off;
-    int i, cnt;
-    unsigned long best_pixels = 0;
-
-    if (!vbe_get_info(&vi)) return 0;
-    if (vi.ver < 0x0200) return 0;   /* need VBE 2.0 for LFB support */
-
-    g_vesa_mem_kb = (unsigned long)vi.tot_mem * 64;  /* tot_mem is in 64KB units */
-
-    seg = (vi.mode_ptr >> 16) & 0xFFFF;
-    off = vi.mode_ptr & 0xFFFF;
-    /* mode_ptr is a real-mode far pointer; add __djgpp_conventional_base under
-     * DJGPP (DS base != 0) to form the correct flat near pointer.            */
-#ifdef __DJGPP__
-    ml  = (unsigned short *)((seg << 4) + off + __djgpp_conventional_base);
-#else
-    ml  = (unsigned short *)((seg << 4) + off);
-#endif
-    for (cnt = 0; cnt < 511 && ml[cnt] != 0xFFFF; cnt++)
-        modelist[cnt] = ml[cnt];
-    modelist[cnt] = 0xFFFF;
-
-    g_vmode = 0;
-    for (i = 0; i < cnt; i++) {
-        unsigned long px;
-        if (!vbe_get_mode(modelist[i], &mi)) continue;
-        if (mi.bpp != 8)         continue;   /* 8bpp packed-pixel only */
-        if (!(mi.attr & 0x01))   continue;   /* mode must be supported  */
-        if (!(mi.attr & 0x10))   continue;   /* must be graphics        */
-        if (!(mi.attr & 0x80))   continue;   /* must have LFB           */
-        if (mi.model != 4)       continue;   /* packed-pixel memory model */
-        if (mi.lfb_phys == 0)    continue;
-        if (mi.xres > 1024 || mi.yres > 768) continue;
-
-        px = (unsigned long)mi.xres * mi.yres;
-        /* Hard-prefer 800×600: balanced resolution for the GPU demos */
-        if (mi.xres == 800 && mi.yres == 600) {
-            g_vmode    = modelist[i];
-            g_xres     = mi.xres;
-            g_yres     = mi.yres;
-            g_pitch    = mi.pitch;
-            g_lfb_phys = mi.lfb_phys;
-            break;
-        }
-        if (px > best_pixels) {
-            best_pixels = px;
-            g_vmode     = modelist[i];
-            g_xres      = mi.xres;
-            g_yres      = mi.yres;
-            g_pitch     = mi.pitch;
-            g_lfb_phys  = mi.lfb_phys;
-        }
-    }
-    return g_vmode != 0;
+    gpu_wait_fifo(5);
+    wreg(R_DP_GUI_MASTER_CNTL,
+         GMC_BRUSH_SOLID | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_PATCOPY | GMC_CLR_CMP_DIS | GMC_WR_MSK_DIS);
+    wreg(R_DP_BRUSH_FRGD_CLR, (unsigned long)color);
+    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+    wreg(R_DST_Y_X, ((unsigned long)y << 16) | (unsigned long)x);
+    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
 }
 
+/* Set up 2D engine state for a batch of solid fills.
+   Call once before a sequence of gpu_fill_fast() calls. */
+void gpu_fill_setup(void)
+{
+    gpu_wait_fifo(3);
+    wreg(R_DP_GUI_MASTER_CNTL,
+         GMC_BRUSH_SOLID | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_PATCOPY | GMC_CLR_CMP_DIS | GMC_WR_MSK_DIS);
+    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+    wreg(R_CLR_CMP_CNTL, 0);
+}
+
+/* Fast solid fill — only 3 register writes (assumes gpu_fill_setup). */
+void gpu_fill_fast(int x, int y, int w, int h, unsigned char color)
+{
+    gpu_wait_fifo(3);
+    wreg(R_DP_BRUSH_FRGD_CLR, (unsigned long)color);
+    wreg(R_DST_Y_X, ((unsigned long)y << 16) | (unsigned long)x);
+    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
+}
+
+/* Ultra-fast fill — 2 register writes, same color as previous fill. */
+void gpu_fill_rect(int x, int y, int w, int h)
+{
+    gpu_wait_fifo(2);
+    wreg(R_DST_Y_X, ((unsigned long)y << 16) | (unsigned long)x);
+    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
+}
+
+/* Set fill color once for a batch of gpu_fill_rect() calls. */
+void gpu_fill_set_color(unsigned char color)
+{
+    gpu_wait_fifo(1);
+    wreg(R_DP_BRUSH_FRGD_CLR, (unsigned long)color);
+}
+
+/* Hardware-accelerated screen-to-screen blit */
+void gpu_blit(int sx, int sy, int dx, int dy, int w, int h)
+{
+    unsigned long dp = 0;
+    if (sx <= dx) { sx += w - 1; dx += w - 1; }
+    else          { dp |= DST_X_LEFT_TO_RIGHT; }
+    if (sy <= dy) { sy += h - 1; dy += h - 1; }
+    else          { dp |= DST_Y_TOP_TO_BOTTOM; }
+
+    gpu_wait_fifo(6);
+    wreg(R_DP_GUI_MASTER_CNTL,
+         GMC_BRUSH_NONE | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_SRCCOPY | GMC_DP_SRC_MEMORY | GMC_CLR_CMP_DIS |
+         GMC_WR_MSK_DIS);
+    wreg(R_DP_CNTL, dp);
+    wreg(R_SRC_Y_X, ((unsigned long)sy << 16) | (unsigned long)(sx & 0xFFFF));
+    wreg(R_DST_Y_X, ((unsigned long)dy << 16) | (unsigned long)(dx & 0xFFFF));
+    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
+}
+
+/* Forward blit (no overlap detection) */
+void gpu_blit_fwd(int sx, int sy, int dx, int dy, int w, int h)
+{
+    gpu_wait_fifo(5);
+    wreg(R_DP_GUI_MASTER_CNTL,
+         GMC_BRUSH_NONE | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_SRCCOPY | GMC_DP_SRC_MEMORY | GMC_CLR_CMP_DIS |
+         GMC_WR_MSK_DIS);
+    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+    wreg(R_SRC_Y_X, ((unsigned long)sy << 16) | (unsigned long)(sx & 0xFFFF));
+    wreg(R_DST_Y_X, ((unsigned long)dy << 16) | (unsigned long)(dx & 0xFFFF));
+    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
+}
+
+/* Forward blit with source color-key transparency */
+void gpu_blit_key(int sx, int sy, int dx, int dy, int w, int h,
+                  unsigned char key)
+{
+    gpu_wait_fifo(8);
+    wreg(R_CLR_CMP_CLR_SRC, (unsigned long)key);
+    wreg(R_CLR_CMP_MASK,    0x000000FFUL);
+    wreg(R_CLR_CMP_CNTL,    CLR_CMP_SRC_SOURCE | CLR_CMP_FCN_NE);
+    wreg(R_DP_GUI_MASTER_CNTL,
+         GMC_BRUSH_NONE | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_SRCCOPY | GMC_DP_SRC_MEMORY | GMC_WR_MSK_DIS);
+    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+    wreg(R_SRC_Y_X, ((unsigned long)sy << 16) | (unsigned long)(sx & 0xFFFF));
+    wreg(R_DST_Y_X, ((unsigned long)dy << 16) | (unsigned long)(dx & 0xFFFF));
+    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
+}
+
+/* Hardware-accelerated line drawing */
+void gpu_line(int x1, int y1, int x2, int y2, unsigned char color)
+{
+    gpu_wait_fifo(5);
+    wreg(R_DP_GUI_MASTER_CNTL,
+         GMC_BRUSH_SOLID | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_PATCOPY | GMC_CLR_CMP_DIS | GMC_WR_MSK_DIS);
+    wreg(R_DP_BRUSH_FRGD_CLR, (unsigned long)color);
+    wreg(R_DST_LINE_START,
+         ((unsigned long)y1 << 16) | ((unsigned long)x1 & 0xFFFF));
+    wreg(R_DST_LINE_END,
+         ((unsigned long)y2 << 16) | ((unsigned long)x2 & 0xFFFF));
+    wreg(R_DST_LINE_PATCOUNT, 0x55UL << 16);
+}
+
+/* Build a PITCH_OFFSET register value for a given VRAM byte offset */
+unsigned long make_pitch_offset(unsigned long vram_byte_off)
+{
+    unsigned long pitch64  = (unsigned long)g_pitch / 64;
+    unsigned long gpu_addr = g_fb_location + vram_byte_off;
+    return (pitch64 << 22) | ((gpu_addr >> 10) & 0x003FFFFFUL);
+}
+
+/* Forward blit with explicit per-surface PITCH_OFFSET values */
+void gpu_blit_po(unsigned long src_po, int sx, int sy,
+                 unsigned long dst_po, int dx, int dy, int w, int h)
+{
+    gpu_wait_fifo(7);
+    wreg(R_DST_PITCH_OFFSET, dst_po);
+    wreg(R_SRC_PITCH_OFFSET, src_po);
+    wreg(R_DP_GUI_MASTER_CNTL,
+         GMC_DST_PITCH_OFFSET_CNTL | GMC_SRC_PITCH_OFFSET_CNTL |
+         GMC_BRUSH_NONE | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_SRCCOPY | GMC_DP_SRC_MEMORY | GMC_CLR_CMP_DIS |
+         GMC_WR_MSK_DIS);
+    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+    wreg(R_SRC_Y_X, ((unsigned long)sy << 16) | (unsigned long)(sx & 0xFFFF));
+    wreg(R_DST_Y_X, ((unsigned long)dy << 16) | (unsigned long)(dx & 0xFFFF));
+    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
+}
+
+/* Keyed blit with explicit per-surface PITCH_OFFSET values */
+void gpu_blit_po_key(unsigned long src_po, int sx, int sy,
+                     unsigned long dst_po, int dx, int dy,
+                     int w, int h, unsigned char key)
+{
+    gpu_wait_fifo(10);
+    wreg(R_CLR_CMP_CLR_SRC, (unsigned long)key);
+    wreg(R_CLR_CMP_MASK,    0x000000FFUL);
+    wreg(R_CLR_CMP_CNTL,    CLR_CMP_SRC_SOURCE | CLR_CMP_FCN_NE);
+    wreg(R_DST_PITCH_OFFSET, dst_po);
+    wreg(R_SRC_PITCH_OFFSET, src_po);
+    wreg(R_DP_GUI_MASTER_CNTL,
+         GMC_DST_PITCH_OFFSET_CNTL | GMC_SRC_PITCH_OFFSET_CNTL |
+         GMC_BRUSH_NONE | GMC_DST_8BPP | GMC_SRC_DATATYPE_COLOR |
+         ROP3_SRCCOPY | GMC_DP_SRC_MEMORY | GMC_WR_MSK_DIS);
+    wreg(R_DP_CNTL, DST_X_LEFT_TO_RIGHT | DST_Y_TOP_TO_BOTTOM);
+    wreg(R_SRC_Y_X, ((unsigned long)sy << 16) | (unsigned long)(sx & 0xFFFF));
+    wreg(R_DST_Y_X, ((unsigned long)dy << 16) | (unsigned long)(dx & 0xFFFF));
+    wreg(R_DST_HEIGHT_WIDTH, ((unsigned long)h << 16) | (unsigned long)w);
+}
+
+/* Parallax blit with scroll wrapping */
+void plax_blit_wrap_po(unsigned long src_po, int scroll_x,
+                       unsigned long dst_po, int dst_y,
+                       int h, int use_key)
+{
+    int sx, w1, w2;
+    sx = scroll_x % g_xres;
+    if (sx < 0) sx += g_xres;
+    w1 = g_xres - sx;
+    w2 = sx;
+
+    if (use_key) {
+        gpu_blit_po_key(src_po, sx, 0, dst_po, 0, dst_y, w1, h, PLAX_TRANSP);
+        if (w2 > 0)
+            gpu_blit_po_key(src_po, 0, 0, dst_po, w1, dst_y, w2, h, PLAX_TRANSP);
+    } else {
+        gpu_blit_po(src_po, sx, 0, dst_po, 0, dst_y, w1, h);
+        if (w2 > 0)
+            gpu_blit_po(src_po, 0, 0, dst_po, w1, dst_y, w2, h);
+    }
+}
+
+/* Flush 2D destination cache */
+void gpu_flush_2d_cache(void)
+{
+    gpu_wait_fifo(2);
+    wreg(R_DSTCACHE_CTLSTAT, R300_RB2D_DC_FLUSH_ALL);
+    wreg(R_WAIT_UNTIL, WAIT_2D_IDLECLEAN | WAIT_DMA_GUI_IDLE);
+}

@@ -1,83 +1,19 @@
 /*
  * RADEONHW.H  -  Shared hardware-layer declarations for ATI Radeon RV515/RV516
  *
- * Consolidates register definitions, packed structs, device table, shared
- * global externs and function prototypes used by RADEON.C, RBLIT.C and
- * RDIAG.C.  Mirrors the VGA.H pattern used in the PLASMA project.
+ * Builds on top of DOSLIB (DPMI, VBE, PCI, palette, font, timing).
+ * This header adds Radeon-specific register definitions, MMIO access,
+ * GPU 2D engine control, AVIVO page-flip, and PCI device detection.
  *
- * Include guard prevents multiple-inclusion problems when transitional
- * unit tests or future files include this header more than once.
+ * Used by RADEON demo programs (RPATTERN, RBENCH, RFLOOD, RSPRITE,
+ * RPLAX, RDUNE) and the existing RBLIT / RDIAG utilities.
  */
 
 #ifndef RADEONHW_H
 #define RADEONHW_H
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-/* ---------------------------------------------------------------
- * Compiler-specific includes and port I/O compatibility
- * --------------------------------------------------------------- */
-
-#ifdef __DJGPP__
-#  include <dpmi.h>
-#  include <pc.h>
-#  include <go32.h>
-#  include <sys/nearptr.h>
-   /* Map OpenWatcom port-I/O names to DJGPP equivalents */
-#  define inp(p)      inportb(p)
-#  define outp(p,v)   outportb((p),(v))
-#  define inpd(p)     inportl(p)
-#  define outpd(p,v)  outportl((p),(v))
-#else
-#  include <i86.h>
-#endif
-
-/* =============================================================== */
-/*  Packed structures (shared by all three programs)               */
-/* =============================================================== */
-
-#pragma pack(1)
-
-/* RDIAG's more complete VBEInfo includes OEM string data fields */
-typedef struct {
-    char           sig[4];
-    unsigned short ver;
-    unsigned long  oem_str;
-    unsigned long  caps;
-    unsigned long  mode_ptr;
-    unsigned short tot_mem;
-    unsigned short oem_soft_rev;
-    unsigned long  oem_vendor;
-    unsigned long  oem_product;
-    unsigned long  oem_rev;
-    unsigned char  _pad[222];
-    unsigned char  oem_data[256];
-} VBEInfo;
-
-typedef struct {
-    unsigned short attr;
-    unsigned char  wina, winb;
-    unsigned short gran, winsz, sega, segb;
-    unsigned long  winfn;
-    unsigned short pitch;
-    unsigned short xres, yres;
-    unsigned char  xch, ych, planes, bpp, banks, model, bksz, pages, r1;
-    unsigned char  rmsk, rpos, gmsk, gpos, bmsk, bpos, amsk, apos, dcm;
-    unsigned long  lfb_phys;
-    unsigned char  _pad[212];
-} VBEMode;
-
-/* Real-Mode Interrupt call block (DPMI function 0x0300) */
-typedef struct {
-    unsigned long  edi, esi, ebp, _rz;
-    unsigned long  ebx, edx, ecx, eax;
-    unsigned short flags, es, ds, fs, gs;
-    unsigned short ip, cs, sp, ss;
-} RMI;
-
-#pragma pack()
+#include "../DOSLIB/DOSLIB.H"
+#include <conio.h>
 
 /* Device-ID table entry */
 typedef struct { unsigned short did; const char *name; } DevEntry;
@@ -327,73 +263,35 @@ extern const DevEntry g_devtab[];
 
 /* =============================================================== */
 /*  Shared global state (defined in RADEONHW.C)                    */
+/*  (DPMI, VBE, font, DAC, timing globals are in DOSLIB)           */
 /* =============================================================== */
 
-extern unsigned short g_dseg;             /* DOS real-mode segment for transfer buffer */
-extern unsigned short g_dsel;             /* DPMI selector for the same buffer         */
 extern volatile unsigned long *g_mmio;    /* mapped MMIO register window               */
 extern unsigned long  g_mmio_phys;        /* physical address of MMIO BAR              */
 extern unsigned long  g_vram_mb;          /* GPU VRAM size in MB                       */
-extern unsigned char *g_lfb;             /* linear framebuffer pointer                 */
-extern unsigned long  g_lfb_phys;        /* physical address of LFB                   */
 extern unsigned long  g_fb_location;     /* GPU internal FB base (from HDP_FB_LOCATION)*/
-extern int g_xres, g_yres, g_pitch;      /* display geometry                          */
 extern int g_page_stride;                /* rows per page (4KB-aligned stride)        */
 extern unsigned long g_default_po;       /* cached default PITCH_OFFSET (gpu_init_2d) */
-extern unsigned short g_vmode;           /* active VESA mode number                   */
-extern unsigned char *g_font;            /* pointer to BIOS 8x8 font data             */
 extern int g_fifo_free;                  /* tracked free FIFO entries                 */
 extern int g_avivo_flip;                 /* 1=AVIVO D1GRPH flip, 0=VBE+port 0x3DA    */
-extern double g_rdtsc_mhz;              /* calibrated CPU MHz (RDTSC)                */
 extern int g_num_gb_pipes;              /* number of GPU geometry back-end pipes      */
-extern int g_dac_bits;                  /* DAC bits (6 or 8), set by init_dac()       */
-extern unsigned long g_vesa_mem_kb;     /* VESA total video memory in KB               */
 
 extern int  g_pci_bus, g_pci_dev, g_pci_func;
 extern unsigned short g_pci_did;
 extern const char    *g_card_name;
 
 /* =============================================================== */
-/*  Function prototypes                                             */
+/*  Function prototypes (Radeon-specific; DPMI/VBE/PCI/palette/    */
+/*  font/text/timing/vsync prototypes are in DOSLIB.H)             */
 /* =============================================================== */
 
-/* ---- DPMI helpers ---- */
-int   dpmi_alloc(unsigned short para);
-void  dpmi_free(void);
-int   dpmi_rmint(unsigned char n, RMI *p);
-void *dpmi_map(unsigned long phys, unsigned long sz);
-void  dpmi_unmap(void *p);
-
-/* ---- PCI configuration (Mechanism 1) ---- */
-unsigned long  pci_rd32(int b, int d, int f, int reg);
-void           pci_wr32(int b, int d, int f, int reg, unsigned long v);
-unsigned short pci_rd16(int b, int d, int f, int reg);
+/* ---- Radeon PCI device scan ---- */
 int            pci_find_radeon(void);
 
-/* ---- VESA mode enumeration ---- */
+/* ---- VESA mode enumeration (800x600 8bpp default) ---- */
 int find_mode(void);
 
-/* ---- VBE helpers ---- */
-unsigned char *dosbuf(void);
-int   vbe_get_info(VBEInfo *out);
-int   vbe_get_mode(unsigned short m, VBEMode *out);
-int   vbe_set(unsigned short m);
-void  vbe_text(void);
-
-/* ---- BIOS 8x8 font ---- */
-unsigned char *get_font(void);
-
-/* ---- CPU drawing primitives (writes directly to g_lfb) ---- */
-void cpu_char(int x, int y, char ch, unsigned char c, int sc);
-void cpu_str(int x, int y, const char *s, unsigned char c, int sc);
-void cpu_str_c(int y, const char *s, unsigned char c, int sc);
-
-/* ---- VGA palette via VBE 4F08h/4F09h ---- */
-void init_dac(void);
-void vbe_set_palette(int start, int count, const unsigned char *p);
-void pal_set(unsigned char *p, int idx, int r, int g, int b);
-void pal_lerp(unsigned char *p, int i0, int i1,
-              int r0, int g0, int b0, int r1, int g1, int b1);
+/* ---- Radeon demo palettes ---- */
 void setup_palette(void);
 void setup_dune_palette(void);
 
@@ -413,18 +311,42 @@ void gpu_wait_idle(void);
 void gpu_engine_reset(void);
 void gpu_init_2d(void);
 
-/* ---- RDTSC high-resolution timer ---- */
-void   rdtsc_read(unsigned long *lo, unsigned long *hi);
-double tsc_to_ms(unsigned long lo1, unsigned long hi1,
-                 unsigned long lo0, unsigned long hi0);
-void   calibrate_rdtsc(void);
-
 /* ---- Page-flip helpers ---- */
 void detect_flip_mode(void);
 void avivo_wait_vblank(void);
 void hw_page_flip(unsigned long surface_addr);
-void wait_vsync(void);
 void flip_page(int back_page);
 void flip_restore_page0(void);
+
+/* ---- GPU 2D drawing primitives ---- */
+void gpu_fill(int x, int y, int w, int h, unsigned char color);
+void gpu_fill_setup(void);
+void gpu_fill_fast(int x, int y, int w, int h, unsigned char color);
+void gpu_fill_rect(int x, int y, int w, int h);
+void gpu_fill_set_color(unsigned char color);
+void gpu_blit(int sx, int sy, int dx, int dy, int w, int h);
+void gpu_blit_fwd(int sx, int sy, int dx, int dy, int w, int h);
+void gpu_blit_key(int sx, int sy, int dx, int dy, int w, int h,
+                  unsigned char key);
+void gpu_line(int x1, int y1, int x2, int y2, unsigned char color);
+unsigned long make_pitch_offset(unsigned long vram_byte_off);
+void gpu_blit_po(unsigned long src_po, int sx, int sy,
+                 unsigned long dst_po, int dx, int dy, int w, int h);
+void gpu_blit_po_key(unsigned long src_po, int sx, int sy,
+                     unsigned long dst_po, int dx, int dy,
+                     int w, int h, unsigned char key);
+void gpu_flush_2d_cache(void);
+
+/* Parallax blit with scroll wrapping (uses per-surface PITCH_OFFSET) */
+#define PLAX_TRANSP 0
+void plax_blit_wrap_po(unsigned long src_po, int scroll_x,
+                       unsigned long dst_po, int dst_y,
+                       int h, int use_key);
+
+/* FIFO batch constants for tight rect-flood loops */
+#define FILL_BATCH  32
+#define MMIO_DST_Y_X          (R_DST_Y_X >> 2)
+#define MMIO_DST_HEIGHT_WIDTH  (R_DST_HEIGHT_WIDTH >> 2)
+#define MMIO_DP_BRUSH_FRGD_CLR (R_DP_BRUSH_FRGD_CLR >> 2)
 
 #endif /* RADEONHW_H */
