@@ -338,13 +338,58 @@ int query_pmi(void)
  * Requires ring 0 (PMODE/W) for the direct port I/O in the PMI code.
  */
 #ifdef __DJGPP__
+/*
+ * _pmi_call4 / _pmi_call4_ebx
+ *
+ * Execute a PMI (Protected-Mode Interface) BIOS function via a near call to
+ * the PMI entry point in BIOS ROM.  The PMI entry lives at a physical address
+ * above 0xA0000, so CS must have a 4 GB limit.
+ *
+ * Problem: PMODETSR resets CS.limit to the original executable size after
+ * EVERY DPMI real-mode simulation (INT 31h AX=0300h), which is triggered by
+ * kbhit()/getch() (INT 16h reflection), DOS I/O, etc.  Any call between the
+ * pre-loop expand_cs_to_4gb() and the actual PMI call can reset CS.limit.
+ *
+ * Solution: Re-expand CS to 4 GB via DPMI 0008h inline in the assembly,
+ * immediately before "call *%%esi".  We gate with CLI so no hardware IRQ
+ * (timer, keyboard) can sneak in and trigger another PMODETSR real-mode
+ * simulation between the expansion and the PMI call.
+ *
+ * Register discipline:
+ *   - EAX/EBX/ECX/EDX are pushed before the DPMI 0008h call (which needs
+ *     AX=0008, BX=CS, CX=0xFFFF, DX=0xFFFF) and popped afterwards.
+ *   - ESI holds the entry address throughout.
+ *   - The "call *%%esi" consumes / modifies EAX..EDX per the VBE/PMI ABI.
+ */
 unsigned long __attribute__((noinline))
 _pmi_call4(unsigned long entry, unsigned long _eax,
            unsigned long _ebx, unsigned long _ecx, unsigned long _edx)
 {
     unsigned long result = _eax;
     __asm__ __volatile__ (
-        "call *%%esi"
+        /* Disable interrupts so no IRQ-triggered V86 switch can reset      */
+        /* CS.limit in the window between the DPMI expand and the PMI call. */
+        "cli\n\t"
+        /* Save the PMI register arguments; we need the regs for DPMI 0008h */
+        "pushl %%eax\n\t"
+        "pushl %%ebx\n\t"
+        "pushl %%ecx\n\t"
+        "pushl %%edx\n\t"
+        /* DPMI 0008h – Set Segment Limit for CS to 0xFFFFFFFF (4 GB)       */
+        "movw  %%cs,  %%bx\n\t"
+        "movl  $0x0000ffff, %%ecx\n\t"
+        "movl  $0x0000ffff, %%edx\n\t"
+        "movw  $0x0008, %%ax\n\t"
+        "int   $0x31\n\t"
+        /* Restore PMI arguments; DPMI 0008h return values in CX/DX discarded */
+        "popl  %%edx\n\t"
+        "popl  %%ecx\n\t"
+        "popl  %%ebx\n\t"
+        "popl  %%eax\n\t"
+        /* CS.limit is now 4 GB; call the PMI entry point                   */
+        "call  *%%esi\n\t"
+        /* Re-enable interrupts after the PMI call returns                  */
+        "sti"
         : "+a"(result), "+S"(entry), "+b"(_ebx), "+c"(_ecx), "+d"(_edx)
         :: "edi", "memory"
     );
@@ -357,7 +402,22 @@ _pmi_call4_ebx(unsigned long entry, unsigned long _eax,
 {
     unsigned long result = _ebx;
     __asm__ __volatile__ (
-        "call *%%esi"
+        "cli\n\t"
+        "pushl %%eax\n\t"
+        "pushl %%ebx\n\t"
+        "pushl %%ecx\n\t"
+        "pushl %%edx\n\t"
+        "movw  %%cs,  %%bx\n\t"
+        "movl  $0x0000ffff, %%ecx\n\t"
+        "movl  $0x0000ffff, %%edx\n\t"
+        "movw  $0x0008, %%ax\n\t"
+        "int   $0x31\n\t"
+        "popl  %%edx\n\t"
+        "popl  %%ecx\n\t"
+        "popl  %%ebx\n\t"
+        "popl  %%eax\n\t"
+        "call  *%%esi\n\t"
+        "sti"
         : "+b"(result), "+S"(entry), "+a"(_eax), "+c"(_ecx), "+d"(_edx)
         :: "edi", "memory"
     );

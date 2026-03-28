@@ -430,14 +430,37 @@ static int query_pmi(void)
 }
 
 #ifdef __DJGPP__
-/* noinline: 5 specific-register operands exhaust x86-32 register file at -O3 */
+/*
+ * PMI call wrappers with inline CS re-expansion.
+ *
+ * PMODETSR resets CS.limit after every DPMI real-mode simulation (kbhit,
+ * getch, DOS I/O via INT 16h/21h reflection).  We re-expand CS to 4 GB
+ * via DPMI 0008h with CLI immediately before "call *%%esi" so no IRQ can
+ * trigger another V86 switch in the gap.  noinline because 5 specific-
+ * register operands exhaust the x86-32 register file at -O3.
+ */
 static unsigned long __attribute__((noinline))
 _pmi_call4(unsigned long entry, unsigned long _eax,
            unsigned long _ebx, unsigned long _ecx, unsigned long _edx)
 {
     unsigned long result = _eax;
     __asm__ __volatile__ (
-        "call *%%esi"
+        "cli\n\t"
+        "pushl %%eax\n\t"
+        "pushl %%ebx\n\t"
+        "pushl %%ecx\n\t"
+        "pushl %%edx\n\t"
+        "movw  %%cs,  %%bx\n\t"
+        "movl  $0x0000ffff, %%ecx\n\t"
+        "movl  $0x0000ffff, %%edx\n\t"
+        "movw  $0x0008, %%ax\n\t"
+        "int   $0x31\n\t"
+        "popl  %%edx\n\t"
+        "popl  %%ecx\n\t"
+        "popl  %%ebx\n\t"
+        "popl  %%eax\n\t"
+        "call  *%%esi\n\t"
+        "sti"
         : "+a"(result), "+S"(entry), "+b"(_ebx), "+c"(_ecx), "+d"(_edx)
         :: "edi", "memory"
     );
@@ -450,7 +473,22 @@ _pmi_call4_ebx(unsigned long entry, unsigned long _eax,
 {
     unsigned long result = _ebx;
     __asm__ __volatile__ (
-        "call *%%esi"
+        "cli\n\t"
+        "pushl %%eax\n\t"
+        "pushl %%ebx\n\t"
+        "pushl %%ecx\n\t"
+        "pushl %%edx\n\t"
+        "movw  %%cs,  %%bx\n\t"
+        "movl  $0x0000ffff, %%ecx\n\t"
+        "movl  $0x0000ffff, %%edx\n\t"
+        "movw  $0x0008, %%ax\n\t"
+        "int   $0x31\n\t"
+        "popl  %%edx\n\t"
+        "popl  %%ecx\n\t"
+        "popl  %%ebx\n\t"
+        "popl  %%eax\n\t"
+        "call  *%%esi\n\t"
+        "sti"
         : "+b"(result), "+S"(entry), "+a"(_eax), "+c"(_ecx), "+d"(_edx)
         :: "edi", "memory"
     );
@@ -2406,7 +2444,7 @@ static void render_gun_flash(unsigned short *buf)
             if (dx * dx + dy * dy < r * r) {
                 int sh = 7 - (dx * dx + dy * dy) * 7 / (r * r);
                 if (sh > 0)
-                    buf[y * WIDTH + x] = darken565(HC_YELLOW, 32 + sh * 32);
+                    buf[y * WIDTH + x] = darken565(HC_YELLOW, sh * 36 + 4);
             }
         }
     }
@@ -2437,6 +2475,28 @@ static void draw_title(void)
     printf("==========================================\n");
 }
 
+static unsigned short find_mode_16bpp(void)
+{
+    unsigned short *ml;
+    unsigned short m;
+    /* Try standard mode first */
+    if (vbe_get_mode_info(0x111) &&
+        g_mib.x_res == 640 && g_mib.y_res == 480 &&
+        g_mib.bpp == 16 && (g_mib.mode_attr & 0x80))
+        return 0x111;
+    /* Scan mode list */
+    ml = (unsigned short *)RM_TO_PTR(
+            ((unsigned long)(g_vbi.mode_list >> 16) << 4)
+            + (g_vbi.mode_list & 0xFFFF));
+    while ((m = *ml++) != 0xFFFF) {
+        if (!vbe_get_mode_info(m)) continue;
+        if (g_mib.x_res == 640 && g_mib.y_res == 480 &&
+            g_mib.bpp == 16 && (g_mib.mode_attr & 0x80))
+            return m;
+    }
+    return 0xFFFF;
+}
+
 /* ========================================================================
  *  MAIN
  * ======================================================================== */
@@ -2460,6 +2520,7 @@ int main(int argc, char *argv[])
     unsigned long frame_lo0, frame_hi0, frame_lo1, frame_hi1;
     float dt = 0.016f;
     int i;
+    unsigned short hc_mode;
 
     /* Parse args */
     for (i = 1; i < argc; i++) {
@@ -2515,21 +2576,26 @@ int main(int argc, char *argv[])
     if (hw_flip_requested) g_hw_flip = 1;
 
     printf("[4] Mode info...\n");
-    if (!vbe_get_mode_info(TARGET_MODE)) {
+    hc_mode = find_mode_16bpp();
+    if (hc_mode == 0xFFFF) {
         dpmi_free_dos();
-        printf("Mode 0x%03X not supported\n", TARGET_MODE);
+        printf("No 640x480x16bpp LFB mode found\n");
         return 1;
     }
-
+    if (!vbe_get_mode_info(hc_mode)) {
+        dpmi_free_dos();
+        printf("Mode 0x%03X not supported\n", hc_mode);
+        return 1;
+    }
     if (!(g_mib.mode_attr & 0x80)) {
         dpmi_free_dos();
-        printf("Mode 0x%03X has no LFB support\n", TARGET_MODE);
+        printf("Mode 0x%03X has no LFB support\n", hc_mode);
         return 1;
     }
 
     lfb_phys = g_mib.phys_base;
     g_lfb_pitch = g_mib.bytes_per_line;
-    if (g_lfb_pitch == 0) g_lfb_pitch = WIDTH;
+    if (g_lfb_pitch == 0) g_lfb_pitch = WIDTH * 2;
     g_page_size = (unsigned long)g_lfb_pitch * HEIGHT;
     total_vram = (unsigned long)g_vbi.total_memory * 65536UL;
     if (total_vram >= g_page_size * 2UL && !no_dblbuf)
@@ -2581,6 +2647,27 @@ int main(int argc, char *argv[])
                 unsigned long entry = (unsigned long)g_pmi_rm_seg * 16
                                     + g_pmi_rm_off + g_pmi_setds_off;
                 printf("PMI        : available (entry 0x%08lX)\n", entry);
+#ifdef __DJGPP__
+                /* Under DJGPP, PMI entry lives in BIOS ROM (phys > 0xA0000)
+                 * which is above the default CS.limit.  Test whether DPMI
+                 * 0008h can expand CS to 4 GB — fails under CWSDPR0 (LDT
+                 * selectors) but works under PMODETSR (GDT selectors).
+                 * _pmi_call4 does this inline before every call, but if the
+                 * DPMI server doesn't support it, PMI cannot work at all.  */
+                {
+                    unsigned long cs_lim;
+                    __dpmi_set_segment_limit(_get_cs(), 0xFFFFFFFFUL);
+                    __asm__ __volatile__ (
+                        "movw %%cs, %%ax\n\t"
+                        "lsll %%eax, %0"
+                        : "=r"(cs_lim) :: "eax");
+                    if (cs_lim != 0xFFFFFFFFUL) {
+                        g_pmi_ok = 0;
+                        printf("PMI        : CS expand failed (limit=0x%08lX), disabled\n",
+                               cs_lim);
+                    }
+                }
+#endif
             } else {
                 printf("PMI        : not available\n");
             }
@@ -2604,6 +2691,7 @@ int main(int argc, char *argv[])
 
     /* Generate assets */
     printf("[11] textures...\n");
+    build_pal16();
     generate_textures();
     generate_duck_sprites();
 
@@ -2622,7 +2710,7 @@ int main(int argc, char *argv[])
 
     /* Set VBE mode */
     printf("[14] Set mode...");
-    if (!vbe_set_mode(TARGET_MODE)) {
+    if (!vbe_set_mode(hc_mode)) {
         free(frame_buf);
         dpmi_unmap_physical(lfb);
         dpmi_free_dos();
@@ -2675,10 +2763,6 @@ int main(int argc, char *argv[])
     } else {
         g_hw_flip = 0;
     }
-
-    /* Try 8-bit DAC */
-
-    /* Set palette */
 
     /* Set initial display start for double buffering */
     if (g_use_doublebuf) {
@@ -2826,7 +2910,7 @@ int main(int argc, char *argv[])
     __djgpp_nearptr_disable();
 #endif
 
-    printf("QUACK HUNT done. Score: %d  Round: %d  Shots: %d\n",
+    printf("QUACK HUNT HC done. Score: %d  Round: %d  Shots: %d\n",
            g_score, g_round, g_shots_fired);
     printf("  WC:%s PAT:%s PMI:%s HWF:%s DBLBUF:%s SCHED:%s VSYNC:%s\n",
            g_mtrr_wc ? "ON" : "OFF",
