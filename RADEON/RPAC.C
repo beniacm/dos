@@ -1326,6 +1326,7 @@ static void draw_playfield(int back_y)
         int stage_y;
         stage_y = PAGE_STAGE * g_page_stride;
         copy_viewport_to_stage_or_frame(g_lfb + (long)stage_y * g_pitch, g_pitch, cam_x, cam_y);
+        gpu_flush_2d_cache();
         gpu_blit_po(g_stage_po, 0, 0, g_default_po, 0, back_y, g_xres, g_play_h);
         gpu_fill(0, back_y + g_play_h, g_xres, HUD_H, 0);
         draw_entities_gpu(cam_x, cam_y, back_y);
