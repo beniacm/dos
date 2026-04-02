@@ -160,6 +160,7 @@ C:\> PLASMA          (VGA plasma/water effects)
 - **CPU vs GPU Benchmark**: Full-screen fill comparison with RDTSC timing
 - **Rectangle Flood**: Maximum GPU throughput test (batched FIFO, XORshift PRNG)
 - **Dune Chase**: 16-layer fractal mountain parallax + 128-segment rainbow worm
+- **RPAC**: scrolling Pac-Man with centred camera and GPU/CPU compositing toggle
 - **Diagnostic Parallax**: Colored grid layers for debugging GPU blit issues
 - **Scenic Parallax**: Multi-layer landscape scrolling with CPU utilization HUD
 

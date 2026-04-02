@@ -143,6 +143,43 @@ void setup_palette(void)
      145-160: deep red / crimson
      200-215: worm body (cycling 16-colour rainbow, wraps via (si%16))
      248-255: fixed UI colours */
+void setup_pac_palette(void)
+{
+    unsigned char p[256 * 4];
+
+    init_dac();
+    memset(p, 0, sizeof p);
+
+    pal_lerp(p,  1,  5,   0,  0, 40,   0, 40,140);
+    pal_lerp(p,  6, 10,   0, 40,140,  20,110,255);
+    pal_lerp(p, 11, 15,  20,110,255, 180,220,255);
+
+    pal_lerp(p, 16, 19, 180,180,180, 255,255,255);
+    pal_lerp(p, 20, 23, 180,150,  0, 255,255, 80);
+
+    pal_lerp(p, 24, 27, 120,  0,  0, 255, 80, 80);
+    pal_lerp(p, 28, 31, 120, 40, 80, 255,160,220);
+    pal_lerp(p, 32, 35,   0, 90,120, 120,255,255);
+    pal_lerp(p, 36, 39, 150, 70,  0, 255,180, 60);
+
+    pal_lerp(p, 40, 43,  20, 40,110, 120,180,255);
+    pal_lerp(p, 44, 47, 220,220,255, 255,255,255);
+
+    pal_lerp(p, 48, 51, 180,  0,  0, 255,120,120);
+    pal_lerp(p, 52, 55,  0,140,  0, 180,255,120);
+
+    pal_set(p, 248,  40,  40,  40);
+    pal_set(p, 249,  90,  90,  90);
+    pal_set(p, 250,   0, 255,   0);
+    pal_set(p, 251, 255,   0,   0);
+    pal_set(p, 252,  70,  70,  70);
+    pal_set(p, 253,   0, 255, 255);
+    pal_set(p, 254, 255, 255,   0);
+    pal_set(p, 255, 255, 255, 255);
+
+    vbe_set_palette(0, 256, p);
+}
+
 void setup_dune_palette(void)
 {
     unsigned char p[256 * 4];

@@ -11,6 +11,7 @@ set -e
 #   RSPRGCC.EXE  - sprite demo        (RSPRITE.C  + ...)
 #   RDUNGCC.EXE  - dune chase demo    (RDUNE.C    + ...)
 #   RPLXGCC.EXE  - parallax demo      (RPLAX.C    + ...)
+#   RPACGCC.EXE  - scrolling Pac-Man  (RPAC.C    + RSETUP + RADEONHW + DOSLIB)
 #   RBLGCC.EXE   - blitter tests      (RBLIT.C   + RADEONHW + DOSLIB)
 #   RDIGCC.EXE   - HW diagnostic      (RDIAG.C   + RADEONHW + DOSLIB)
 
@@ -74,7 +75,7 @@ $CC $CFLAGS -c -o radeon.o RADEON.C
 build_exe radeon RADGCC.EXE radeon.o $LIB_O
 
 # --- Individual standalone demos ---
-for SPEC in "RPATTERN:RPATGCC" "RBENCH:RBENGCC" "RFLOOD:RFLOGCC" "RSPRITE:RSPRGCC" "RDUNE:RDUNGCC" "RPLAX:RPLXGCC"; do
+for SPEC in "RPATTERN:RPATGCC" "RBENCH:RBENGCC" "RFLOOD:RFLOGCC" "RSPRITE:RSPRGCC" "RDUNE:RDUNGCC" "RPLAX:RPLXGCC" "RPAC:RPACGCC"; do
     SRC="${SPEC%%:*}"
     OUT="${SPEC##*:}"
     echo ""

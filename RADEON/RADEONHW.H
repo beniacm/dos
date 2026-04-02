@@ -294,6 +294,7 @@ int find_mode(void);
 /* ---- Radeon demo palettes ---- */
 void setup_palette(void);
 void setup_dune_palette(void);
+void setup_pac_palette(void);
 
 /* ---- Radeon MMIO register access ---- */
 unsigned long rreg(unsigned long off);

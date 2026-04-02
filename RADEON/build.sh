@@ -28,7 +28,7 @@ mv RADEON.exe RADEON.EXE
 echo "  -> RADEON.EXE"
 
 # --- Individual demos ---
-for DEMO in RPATTERN RBENCH RFLOOD RSPRITE RDUNE RPLAX; do
+for DEMO in RPATTERN RBENCH RFLOOD RSPRITE RDUNE RPLAX RPAC; do
     echo "  ${DEMO}.C..."
     $WCC ${DEMO}.C
     wlink system pmodew name $DEMO file { $DEMO $SETUP_OBJ } option quiet
@@ -51,4 +51,4 @@ mv RDIAG.exe RDIAG.EXE
 echo "  -> RDIAG.EXE"
 
 rm -f *.obj 2>/dev/null
-echo "Done: 9 executables built."
+echo "Done: 10 executables built."
